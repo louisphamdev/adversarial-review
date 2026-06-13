@@ -74,6 +74,25 @@ describe("resolveExecutable", () => {
     assert.equal(result, null, "expected null for a nonexistent explicit path");
   });
 
+  // BUG 4 (Windows PATH case): resolveExecutable must read PATH/PATHEXT
+  // case-insensitively. A plain-object env copy (or a native Windows cmd/powershell
+  // env) may carry the key as `Path` instead of `PATH`, which previously made
+  // resolveExecutable return null and broke node/opencode/codex resolution.
+  it("resolves a bare command when PATH is keyed as `Path` (case-insensitive)", async () => {
+    // Note the capital-P-lowercase key. With the real machine PATH behind it,
+    // "node" must still resolve to a non-null path.
+    const result = await resolveExecutable("node", {
+      Path: process.env.PATH,
+      PATHEXT: process.env.PATHEXT,
+    });
+    assert.ok(result, "node must resolve even when the env key is `Path`, not `PATH`");
+  });
+
+  it("returns null for a bare command when the env has no path-like key", async () => {
+    const result = await resolveExecutable("node", { PATHEXT: process.env.PATHEXT });
+    assert.equal(result, null, "no PATH-like key -> bare command cannot resolve");
+  });
+
   it("on Windows resolves .cmd through PATHEXT using a temp PATH", async () => {
     // Create foo.cmd in the temp dir.
     const cmdPath = join(tempDir, "foo.cmd");

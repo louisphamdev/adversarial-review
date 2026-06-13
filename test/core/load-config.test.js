@@ -148,6 +148,52 @@ describe("loadEffectiveConfig with user-level config", () => {
     const cfg = await loadEffectiveConfig(cwd, { env: { HOME: home } });
     assert.equal(cfg.hosts["claude-code"].reviewer, "opencode");
   });
+
+  // BUG 1 (trust boundary): a PROJECT config must not be able to self-grant a
+  // custom reviewer's trust nor inject its command/args. Trust and the custom
+  // command/args/type must come from USER-level config only.
+  it("project config cannot self-grant a custom reviewer trust + inject a command", async () => {
+    // NO user config. Project tries to declare a trusted, read-only custom
+    // reviewer running an arbitrary command.
+    await writeJson(join(cwd, CONFIG_REL), {
+      reviewers: {
+        x: { type: "custom", command: "evil", args: ["--pwn"], trusted: true, readOnlyConfig: true },
+      },
+    });
+
+    const cfg = await loadEffectiveConfig(cwd, io());
+    // Trust stripped (a project layer can never grant trust).
+    assert.equal(cfg.reviewers.x.trusted, false, "project-granted trust must be forced false");
+    // Command/args stripped (user config did not define this custom reviewer).
+    assert.equal(cfg.reviewers.x.command, undefined, "project-injected command must be stripped");
+    assert.equal(cfg.reviewers.x.args, undefined, "project-injected args must be stripped");
+  });
+
+  it("a USER-defined trusted custom reviewer keeps its trust+command; project cannot override the command", async () => {
+    // User config defines the trusted custom reviewer with a safe command.
+    await writeJson(join(home, CONFIG_REL), {
+      reviewers: { x: { type: "custom", command: "safe", trusted: true } },
+    });
+    // Project config tries to override the command to "evil".
+    await writeJson(join(cwd, CONFIG_REL), {
+      reviewers: { x: { type: "custom", command: "evil" } },
+    });
+
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.equal(cfg.reviewers.x.trusted, true, "user-granted trust survives");
+    assert.equal(cfg.reviewers.x.command, "safe", "project must not override the user-set command");
+  });
+
+  it("opencode readOnlyConfig set by a project config is preserved (not stripped)", async () => {
+    // opencode isolation is bound to the bundled read-only agent in enforced/strict,
+    // so a project-set readOnlyConfig is safe and must survive the trust floor.
+    await writeJson(join(cwd, CONFIG_REL), {
+      reviewers: { opencode: { readOnlyConfig: true } },
+    });
+
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.equal(cfg.reviewers.opencode.readOnlyConfig, true, "opencode readOnlyConfig must be preserved");
+  });
 });
 
 describe("resolveStateDir honors ADVERSARIAL_REVIEW_HOME", () => {

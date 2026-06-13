@@ -304,10 +304,15 @@ function baseNameOf(canonical) {
 // changed file. Returns null when coverage is acceptable, or an error reason.
 //
 // Both the verdict's `coverage.files_examined` citations and the reviewable
-// changed-file paths are CANONICALIZED before comparison (see canonicalizePath),
-// and a changed file is considered covered if EITHER its full canonical path OR
-// its basename appears in the examined set. This prevents a real PASS from
-// BLOCKing merely because the reviewer cited a different path FORM.
+// changed-file paths are CANONICALIZED before comparison (see canonicalizePath).
+// A changed file is considered covered if its full canonical path appears in the
+// examined set, OR its basename appears AND that basename is UNIQUE among the
+// reviewable changed files. A basename shared by multiple reviewable files is
+// AMBIGUOUS (e.g. src/a/index.js and test/b/index.js both basename "index.js"),
+// so a bare-basename citation cannot prove which file was examined — for those we
+// require the full-path match. This both tolerates differing path FORMS for an
+// unambiguous file and prevents one ambiguous basename from "covering" several
+// distinct files.
 function coverageFailure(verdict, reviewablePaths) {
   const coverage = verdict.coverage || {};
   const examined = Array.isArray(coverage.files_examined) ? coverage.files_examined : [];
@@ -321,6 +326,13 @@ function coverageFailure(verdict, reviewablePaths) {
   if (reviewablePaths.length > COVERAGE_FILE_CAP) {
     return null;
   }
+  // Count how often each basename occurs among the canonicalized reviewable
+  // changed files so we can tell unique basenames from ambiguous ones.
+  const baseCounts = new Map();
+  for (const path of reviewablePaths) {
+    const base = baseNameOf(canonicalizePath(path));
+    baseCounts.set(base, (baseCounts.get(base) || 0) + 1);
+  }
   // Build canonical full-path and basename lookup sets from the citations.
   const examinedFull = new Set();
   const examinedBase = new Set();
@@ -333,7 +345,11 @@ function coverageFailure(verdict, reviewablePaths) {
   for (const path of reviewablePaths) {
     const canon = canonicalizePath(path);
     const base = baseNameOf(canon);
-    if (examinedFull.has(canon) || examinedBase.has(base)) continue;
+    // Full-path citation always counts. A basename citation only counts when that
+    // basename is UNIQUE among the reviewable changed files; an ambiguous basename
+    // (occurs >1) requires the full-path match.
+    if (examinedFull.has(canon)) continue;
+    if (baseCounts.get(base) === 1 && examinedBase.has(base)) continue;
     return `missing_coverage:${canon}`;
   }
   return null;

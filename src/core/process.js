@@ -4,6 +4,36 @@ import { constants } from "node:fs";
 import { spawn } from "node:child_process";
 
 /**
+ * Read an env value by a case-insensitive key name.
+ *
+ * `process.env` is case-insensitive on win32, but a PLAIN-OBJECT env copy
+ * (e.g. `{ ...process.env }`, or an env coming from a native Windows
+ * cmd/powershell shell) may carry the key in a different case — e.g. `Path`
+ * instead of `PATH`. Reading `env.PATH` directly would then miss it and
+ * resolveExecutable would wrongly return null. This helper returns the value for
+ * the first key matching `name` case-insensitively, preferring an EXACT-case
+ * match (so behavior is unchanged when the uppercase key exists).
+ *
+ * @param {object} env   - environment object
+ * @param {string} name  - canonical key name (e.g. "PATH", "PATHEXT")
+ * @returns {string|undefined}
+ */
+function getEnvCaseInsensitive(env, name) {
+  if (!env || typeof env !== "object") return undefined;
+  // Prefer the exact key first to keep existing behavior identical.
+  if (Object.prototype.hasOwnProperty.call(env, name) && env[name] != null) {
+    return env[name];
+  }
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === lower && env[key] != null) {
+      return env[key];
+    }
+  }
+  return undefined;
+}
+
+/**
  * Resolve a command name or path to an absolute executable path.
  * On Windows, walks PATHEXT extensions (e.g. .COM .EXE .BAT .CMD).
  * Returns null if nothing is found.
@@ -28,10 +58,14 @@ export async function resolveExecutable(command, env = process.env) {
     return path.resolve(command);
   }
 
-  const pathEntries = String(env.PATH || "").split(path.delimiter).filter(Boolean);
+  // Read PATH / PATHEXT case-insensitively: a plain-object env copy (or a native
+  // Windows shell env) may carry these keys as `Path`/`PathExt`, etc.
+  const pathValue = getEnvCaseInsensitive(env, "PATH");
+  const pathExtValue = getEnvCaseInsensitive(env, "PATHEXT");
+  const pathEntries = String(pathValue || "").split(path.delimiter).filter(Boolean);
   const extensions =
     process.platform === "win32"
-      ? String(env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";")
+      ? String(pathExtValue || ".COM;.EXE;.BAT;.CMD").split(";")
       : [""];
 
   for (const dir of pathEntries) {

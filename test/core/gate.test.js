@@ -641,6 +641,81 @@ describe("evaluateGate external reviewer", () => {
     assert.equal(decision.reviewerError, "empty_coverage");
   });
 
+  // BUG 3 (ambiguous basename): a bare-basename citation may only "cover" a
+  // changed file when that basename is UNIQUE among the reviewable changed files.
+
+  // (a) A single changed file cited by its (unique) basename is still allowed.
+  it("single changed file cited by its unique basename is allowed (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["x.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow", "unique basename still covers");
+    assert.equal(decision.reason, "external_pass");
+  });
+
+  // (b) Two distinct files sharing the basename "index.js": a single "index.js"
+  // citation is AMBIGUOUS and must NOT cover both → coverage fails → blocks.
+  it("ambiguous basename citation fails coverage for two distinct files (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/a/index.js": "const a = 1;\n", "test/b/index.js": "const b = 2;\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["index.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/a/index.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "ambiguous basename must not cover distinct files");
+    assert.match(decision.reviewerError, /missing_coverage/);
+  });
+
+  // (c) The same two files cited by FULL path are allowed.
+  it("two distinct same-basename files cited by full path are allowed (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/a/index.js": "const a = 1;\n", "test/b/index.js": "const b = 2;\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, {
+        coverage: { files_examined: ["b/src/a/index.js", "b/test/b/index.js"] },
+      }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/a/index.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow", "full-path citations cover both files");
+    assert.equal(decision.reason, "external_pass");
+  });
+
   it("valid pass with full coverage allows and caches (second call hits cache)", async () => {
     const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
     track(cwd);

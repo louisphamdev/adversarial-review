@@ -127,11 +127,26 @@ export async function runWithTimeout(child, { timeoutMs, captureStderr = false }
     : [collectOutput(child), waitForExit(child)];
 
   const processPromise = Promise.all(collectors);
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve(TIMEOUT_SENTINEL), timeoutMs)
-  );
+  // Capture the timer id so it can be cleared once the race settles. Without the
+  // clearTimeout below, a pending setTimeout keeps the Node event loop alive for
+  // up to timeoutMs after the process already completed, hanging the CLI/hook.
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), timeoutMs);
+    // unref() is a secondary measure so the timer alone never blocks exit; the
+    // clearTimeout below is the primary fix.
+    if (timer && typeof timer.unref === "function") timer.unref();
+  });
 
-  const raceResult = await Promise.race([processPromise, timeoutPromise]);
+  let raceResult;
+  try {
+    raceResult = await Promise.race([processPromise, timeoutPromise]);
+  } finally {
+    // Always clear the pending timeout timer — on BOTH the timeout branch and the
+    // normal completion branch — so the event loop is not held open.
+    clearTimeout(timer);
+  }
+
   if (raceResult === TIMEOUT_SENTINEL) {
     forceKill(child);
     return TIMEOUT_SENTINEL;

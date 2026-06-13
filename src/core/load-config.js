@@ -96,8 +96,90 @@ export async function loadEffectiveConfig(cwd, io = {}) {
   deepAssign(merged, sanitizeProjectConfig(userConfig));
   deepAssign(merged, sanitizeProjectConfig(projectConfig));
 
+  // Reviewer trust floor: a PROJECT layer can never grant a reviewer trust nor
+  // supply the command/args/type of a custom reviewer. Those must come from
+  // USER-level config only (the threat model treats the repo's project config as
+  // untrusted). Applied AFTER the merge so it strips anything a project injected.
+  applyReviewerTrustFloor(merged, userConfig);
+
   // Apply the user policy floor LAST so it can only tighten, never loosen.
   return applyPolicyFloor(merged, userPolicyFloor);
+}
+
+/**
+ * Enforce the reviewer trust floor on a fully-merged config using the RAW user
+ * config as the sole source of truth for trust and custom-reviewer definitions.
+ *
+ * Rules (all fail-closed; a project layer can only LOSE privileges here):
+ *  - For every reviewer id: if merged.reviewers[id].trusted === true but the user
+ *    config did NOT set trusted === true for that id, force trusted = false. A
+ *    project config can never grant trust.
+ *  - For any reviewer that is custom (merged type OR user-declared type is
+ *    "custom"): take `type`, `command`, and `args` ONLY from the user config for
+ *    that id, dropping any project-supplied values. If the user config did not
+ *    define this custom reviewer, the result has no command and is rejected at
+ *    runtime (fail closed).
+ *  - opencode's `readOnlyConfig` is intentionally NOT touched here: opencode
+ *    isolation is bound to the bundled read-only agent in enforced/strict, so a
+ *    project-set readOnlyConfig is safe.
+ *
+ * Tolerant of missing/non-object reviewer maps and entries.
+ *
+ * @param {object} merged      - fully-merged effective config (mutated in place)
+ * @param {object} userConfig  - raw user-level config (trusted source)
+ * @returns {object} merged
+ */
+function applyReviewerTrustFloor(merged, userConfig) {
+  const reviewers = merged.reviewers;
+  if (!reviewers || typeof reviewers !== "object" || Array.isArray(reviewers)) {
+    return merged;
+  }
+  const userReviewers =
+    userConfig && typeof userConfig.reviewers === "object" && !Array.isArray(userConfig.reviewers)
+      ? userConfig.reviewers
+      : {};
+
+  for (const id of Object.keys(reviewers)) {
+    const entry = reviewers[id];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const userEntry =
+      userReviewers[id] && typeof userReviewers[id] === "object" && !Array.isArray(userReviewers[id])
+        ? userReviewers[id]
+        : null;
+
+    // Trust floor: only the user config can grant trust.
+    if (entry.trusted === true && userEntry?.trusted !== true) {
+      entry.trusted = false;
+    }
+
+    // Custom-reviewer floor: command/args/type come from the user config only.
+    const isCustom = entry.type === "custom" || userEntry?.type === "custom";
+    if (isCustom) {
+      if (userEntry && userEntry.type === "custom") {
+        // Take the type/command/args from the trusted user config, dropping any
+        // project-supplied values.
+        entry.type = "custom";
+        if ("command" in userEntry) {
+          entry.command = userEntry.command;
+        } else {
+          delete entry.command;
+        }
+        if ("args" in userEntry) {
+          entry.args = structuredClone(userEntry.args);
+        } else {
+          delete entry.args;
+        }
+      } else {
+        // The user config did not define this custom reviewer. Strip any
+        // project-supplied command/args so it fails closed (no command -> rejected
+        // at runtime). Keep type so the custom adapter still recognizes the entry
+        // and refuses it via the missing-command / untrusted checks.
+        delete entry.command;
+        delete entry.args;
+      }
+    }
+  }
+  return merged;
 }
 
 /**
