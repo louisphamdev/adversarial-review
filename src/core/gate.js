@@ -266,19 +266,84 @@ function cacheKeyFor(job, config) {
 // Coverage enforcement (deferred check 2)
 // ---------------------------------------------------------------------------
 
+// Above this many reviewable changed files we stop requiring per-file coverage.
+// A reviewer cannot reliably enumerate 40+ paths, so demanding an exact match of
+// every one turns real PASSes into spurious BLOCKs. Over the cap we accept any
+// non-empty coverage and record a coverage limitation instead of hard-failing.
+const COVERAGE_FILE_CAP = 40;
+
+// Canonicalize a path citation so coverage comparison is robust to the many FORMS
+// a reviewer may use for the same file. Lower-risk normalizations only:
+//   - POSIX slashes (backslash -> slash);
+//   - trim surrounding whitespace;
+//   - strip a leading "a/" or "b/" git-diff prefix;
+//   - strip a leading "./";
+//   - strip a trailing ":<digits>" line-number suffix (e.g. "src/x.js:42").
+// Returns "" for empty/non-string input.
+function canonicalizePath(p) {
+  let s = String(p == null ? "" : p)
+    .replace(/\\/g, "/")
+    .trim();
+  if (!s) return "";
+  // Strip a trailing ":<digits>" line/column suffix before anything else.
+  s = s.replace(/:\d+$/, "");
+  // Strip git-diff prefixes "a/" or "b/".
+  if (s.startsWith("a/") || s.startsWith("b/")) s = s.slice(2);
+  // Strip a leading "./".
+  while (s.startsWith("./")) s = s.slice(2);
+  return s;
+}
+
+// The basename (last POSIX path segment) of an already-canonicalized path.
+function baseNameOf(canonical) {
+  const idx = canonical.lastIndexOf("/");
+  return idx >= 0 ? canonical.slice(idx + 1) : canonical;
+}
+
 // In enforced/strict, a pass must demonstrate coverage of every reviewable
 // changed file. Returns null when coverage is acceptable, or an error reason.
+//
+// Both the verdict's `coverage.files_examined` citations and the reviewable
+// changed-file paths are CANONICALIZED before comparison (see canonicalizePath),
+// and a changed file is considered covered if EITHER its full canonical path OR
+// its basename appears in the examined set. This prevents a real PASS from
+// BLOCKing merely because the reviewer cited a different path FORM.
 function coverageFailure(verdict, reviewablePaths) {
   const coverage = verdict.coverage || {};
   const examined = Array.isArray(coverage.files_examined) ? coverage.files_examined : [];
+  // Empty coverage on a non-empty reviewable diff is still an operational failure.
   if (reviewablePaths.length > 0 && examined.length === 0) {
     return "empty_coverage";
   }
-  const examinedSet = new Set(examined.map((p) => String(p).replace(/\\/g, "/")));
+  // Per-file cap: with too many changed files, accept any non-empty coverage
+  // rather than demanding an exact per-file enumeration that no reviewer can
+  // reliably produce. The non-empty check above already handled the empty case.
+  if (reviewablePaths.length > COVERAGE_FILE_CAP) {
+    return null;
+  }
+  // Build canonical full-path and basename lookup sets from the citations.
+  const examinedFull = new Set();
+  const examinedBase = new Set();
+  for (const raw of examined) {
+    const canon = canonicalizePath(raw);
+    if (!canon) continue;
+    examinedFull.add(canon);
+    examinedBase.add(baseNameOf(canon));
+  }
   for (const path of reviewablePaths) {
-    if (!examinedSet.has(path)) return `missing_coverage:${path}`;
+    const canon = canonicalizePath(path);
+    const base = baseNameOf(canon);
+    if (examinedFull.has(canon) || examinedBase.has(base)) continue;
+    return `missing_coverage:${canon}`;
   }
   return null;
+}
+
+// True when the reviewable changed-file count exceeds the per-file cap, i.e. when
+// coverageFailure relaxed the per-file requirement. Used to annotate the allow
+// decision with a coverage limitation note (informational only).
+function coverageLimited(reviewablePaths) {
+  return reviewablePaths.length > COVERAGE_FILE_CAP;
 }
 
 // The enforced/strict DEFERRED CHECKS applied to any accepted pass, shared by
@@ -311,16 +376,14 @@ function deferredCheckFailure(verdict, job, reviewablePaths) {
 //     (payload_hash match + non-empty coverage of every reviewable changed file).
 // For the debate level the verdict's level must also be "debate".
 //
-// A no-op Task carrying only the sentinel token cannot satisfy any of these, so
-// substring forgery is closed. The bare GATE_SENTINEL substring is never trusted
-// for acceptance; only the verdict block's own sentinel + a valid parse counts.
+// Acceptance is decided solely by parseVerdict against `selfJob`: the verdict
+// block's own sentinel (<<<ADVERSARIAL-REVIEW-VERDICT>>>) gates parsing, and a
+// no-op Task that cannot produce a valid, matching verdict block is rejected.
 function selfReviewSatisfied(entries, lastEditKey, selfJob, reviewablePaths, enforced) {
   if (lastEditKey <= 0) return false;
   const outputs = collectReviewOutputs(entries, lastEditKey);
   for (const output of outputs) {
-    // parseVerdict is the sole authority for acceptance. The verdict block's own
-    // sentinel (<<<ADVERSARIAL-REVIEW-VERDICT>>>) gates parsing, so the bare
-    // GATE_SENTINEL substring is never trusted on its own.
+    // parseVerdict is the sole authority for acceptance.
     const parsed = parseVerdict(output, selfJob);
     if (!parsed.ok) continue;
     const verdict = parsed.verdict;
@@ -398,8 +461,8 @@ export async function evaluateGate(input) {
   }
 
   const entries = parseJsonl(transcript || "");
-  // Note: lastReviewKey/lastDebateKey (timestamp-based review detection) are no
-  // longer used for acceptance — native self-review is now verdict-based below.
+  // scanKeys reports only edit evidence; acceptance of a prior review is
+  // verdict-based (collectReviewOutputs + parseVerdict), handled below.
   const { lastEditKey, editedPaths } = scanKeys(entries);
 
   // (3) Build review scope from the authoritative filesystem/git diff.
@@ -492,7 +555,16 @@ export async function evaluateGate(input) {
   };
 
   if (selfReviewSatisfied(entries, lastEditKey, selfJob, reviewablePaths, enforced)) {
-    return allow({ reason: "already_reviewed", level });
+    const passExtra = { reason: "already_reviewed", level };
+    // Mirror the external path: record a coverage limitation when the change has
+    // more reviewable files than the per-file coverage cap.
+    if (enforced && coverageLimited(reviewablePaths)) {
+      passExtra.coverageLimited = true;
+      passExtra.coverageNote =
+        `Coverage limitation: ${reviewablePaths.length} reviewable files exceed the ` +
+        `per-file coverage cap (${COVERAGE_FILE_CAP}); accepted on non-empty coverage.`;
+    }
+    return allow(passExtra);
   }
 
   // Emit the "self-review required" BLOCK for the current level. This is the
@@ -714,6 +786,14 @@ export async function evaluateGate(input) {
     await writeSessionState(stateDir, sessionId, { ...state, cache: nextCache });
   }
   const passExtra = { reason: "external_pass", level, cached: false };
+  // When the change has more reviewable files than the per-file coverage cap, the
+  // gate accepted non-empty (not exhaustive) coverage; record that limitation.
+  if (enforced && coverageLimited(reviewablePaths)) {
+    passExtra.coverageLimited = true;
+    passExtra.coverageNote =
+      `Coverage limitation: ${reviewablePaths.length} reviewable files exceed the ` +
+      `per-file coverage cap (${COVERAGE_FILE_CAP}); accepted on non-empty coverage.`;
+  }
   if (secretWarning) passExtra.systemMessage = secretWarning;
   return allow(passExtra);
 }

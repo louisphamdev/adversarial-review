@@ -30,15 +30,18 @@ Ask the user which **host(s)** they code in and which **reviewer** each should u
   or `none` (self-review orchestration — the host runs the bundled adversarial
   reviewer subagent itself). A host may not review itself unless via `none`.
 
-Install (interactive, or with flags):
+Install (`--hosts` and `--reviewer` are required — there is no interactive
+wizard yet):
 ```
-npx adversarial-review install \
+npx adversarial-review-gate install \
   --hosts claude-code,codex \
   --reviewer claude-code=opencode \
   --reviewer codex=opencode
 ```
 Add `--dry-run` first to preview every file it would write. The installer refuses
-to map a host to itself and refuses an unavailable reviewer (unless `none`).
+to map a host to itself and refuses an unavailable reviewer (unless `none`). Use
+`--global` (alias `--user`) to install machine-wide (writes
+`~/.adversarial-review/config.json` and merges hooks into `~/.claude/settings.json`).
 
 ## 3. Pick a policy mode
 - `soft` — developer-friendly, fail-open. Reviewer errors don't block; small
@@ -51,28 +54,38 @@ Set per project in `.adversarial-review/config.json`, or machine-wide in
 `~/.adversarial-review/config.json` (merged DEFAULT < user < project, then the
 user policy floor in `~/.adversarial-review/policy.json` which can only tighten).
 
-## 4. If the reviewer is **opencode**, set up a read-only agent (REQUIRED)
-opencode review only works with a dedicated read-only agent. Common gotchas:
-- Create the agent at `~/.config/opencode/agent/adversarial-reviewer.md`.
-- It MUST be `mode: primary` — `opencode run --agent` rejects a *subagent* and
-  silently falls back to the full-permission default agent (the gate detects that
-  fallback and rejects the review).
-- Make it read-only: `permission: { edit: deny, bash: deny, webfetch: deny,
-  websearch: deny }` and turn tools off (`write/edit/patch/bash: false`). With
-  `reviewers.opencode.readOnlyConfig: true` in config, the gate's enforced
-  isolation check (readOnly && noEdit) then passes.
-- The agent body must include the verdict-block format the gate parses (the brief
-  delivered on stdin carries the per-job `job_id`/`diff_hash` to echo).
-- Verify: `opencode agent list` shows `adversarial-reviewer`, and a test review
-  prints a `<<<ADVERSARIAL-REVIEW-VERDICT>>> … <<<END>>>` block.
+## 4. If the reviewer is **opencode**, VERIFY the read-only agent
+The installer does this for you: when a host maps to `--reviewer <host>=opencode`,
+it creates the read-only agent at `~/.config/opencode/agent/adversarial-reviewer.md`
+(idempotent — skipped if the file already exists) AND writes
+`reviewers.opencode.readOnlyConfig: true` into the project config. You only need
+to **verify** it:
+- `opencode agent list` shows `adversarial-reviewer`.
+- `node ./bin/adversarial-review.js doctor` reports the opencode reviewer with
+  capabilities `{readOnly:true,noEdit:true}` (no `reviewer_agent_missing`).
 
-## 5. Wire the hosts
-- **Claude Code (native):** add a `SessionStart` hook (records the baseline) AND a
-  `Stop` hook (applies the gate) to settings.json. For a local (non-marketplace)
-  install the command needs an ABSOLUTE path to `bin/adversarial-review.js`
-  (`${CLAUDE_PLUGIN_ROOT}` only resolves inside a marketplace plugin). A Stop hook
-  with edit evidence but no recorded SessionStart baseline fails closed in
-  enforced — so the SessionStart hook is required.
+The bundled agent guarantees the three invariants the gate enforces (explain
+these only if the user wants to customize the agent — the installer never
+overwrites an existing file):
+- `mode: primary` — `opencode run --agent` rejects a *subagent* and silently
+  falls back to the full-permission default agent (the gate detects that fallback
+  and rejects the review).
+- Read-only: `permission: { edit: deny, bash: deny, webfetch: deny, websearch:
+  deny }` and tools off. With `reviewers.opencode.readOnlyConfig: true` the gate's
+  enforced isolation check (readOnly && noEdit) passes.
+- The agent body includes the verdict-block format the gate parses (the brief on
+  stdin carries the per-job `job_id`/`diff_hash` to echo).
+
+## 5. VERIFY the host wiring (the installer wrote it)
+- **Claude Code (native):** the installer already merged a `SessionStart` hook
+  (records the baseline) AND a `Stop` hook (applies the gate, 300s timeout) into
+  `.claude/settings.json` — or `~/.claude/settings.json` with `--global`. Verify
+  with `node ./bin/adversarial-review.js doctor`, then **restart Claude Code** so
+  it re-reads settings.json. (A Stop hook with edit evidence but no recorded
+  SessionStart baseline fails closed in enforced — both hooks are required, and
+  the installer writes both. For a local non-marketplace checkout not on PATH,
+  the hook command needs an ABSOLUTE path to `bin/adversarial-review.js`;
+  `${CLAUDE_PLUGIN_ROOT}` only resolves inside a marketplace plugin.)
 - **Wrapper hosts (codex/opencode/…):** the user must launch the tool THROUGH the
   wrapper, e.g. `adversarial-review run --host codex -- codex exec "…"`. A
   convenience launcher (`codex-reviewed`) on PATH helps. Plain `codex` bypasses

@@ -6,6 +6,26 @@ import { tmpdir } from "node:os";
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolveExecutable, spawnResolved, expandArgs, ALLOWED_PLACEHOLDERS } from "../../src/core/process.js";
+import * as processModule from "../../src/core/process.js";
+
+// ---------------------------------------------------------------------------
+// Dead-export removal: spawnSafe was superseded by spawnResolved and had zero
+// callers. It must no longer be exported from the module.
+// ---------------------------------------------------------------------------
+
+describe("process module exports", () => {
+  it("no longer exports the dead spawnSafe()", () => {
+    assert.equal(
+      processModule.spawnSafe,
+      undefined,
+      "spawnSafe must be removed (zero callers; superseded by spawnResolved)"
+    );
+  });
+
+  it("still exports spawnResolved", () => {
+    assert.equal(typeof processModule.spawnResolved, "function");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // resolveExecutable

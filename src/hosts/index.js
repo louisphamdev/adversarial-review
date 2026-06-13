@@ -20,7 +20,8 @@ export const HOSTS = {
   "claude-code": {
     id: "claude-code",
     enforcement: "native-enforced",
-    supportsBaseline: false,
+    // claude-code has a SessionStart baseline hook where we capture a baseline.
+    supportsBaseline: true,
     supportsSelfReview: true,
     supportsNativeBlock: true,
     supportsExternalReview: true,

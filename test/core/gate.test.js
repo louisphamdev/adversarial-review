@@ -549,6 +549,98 @@ describe("evaluateGate external reviewer", () => {
     assert.match(decision.reviewerError, /missing_coverage/);
   });
 
+  // FIX A: coverage comparison must be robust to the path FORM the reviewer cites.
+  // A real PASS for a changed file `src/x.js` must be ALLOWED when files_examined
+  // uses a git "b/" prefix, the bare basename, a "./" prefix, or a ":<line>" suffix.
+  for (const [label, examined] of [
+    ["b/<path> git-diff prefix", ["b/src/x.js"]],
+    ["a/<path> git-diff prefix", ["a/src/x.js"]],
+    ["bare basename", ["x.js"]],
+    ["./ leading prefix", ["./src/x.js"]],
+    [":<line> suffix", ["src/x.js:42"]],
+    ["backslash + whitespace", ["  src\\x.js  "]],
+  ]) {
+    it(`coverage with ${label} still ALLOWS for changed file src/x.js (enforced)`, async () => {
+      const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+      track(cwd);
+      const runner = capturingRunner((job) => ({
+        ok: true,
+        verdict: makeVerdict(job, { coverage: { files_examined: examined } }),
+      }));
+      const decision = await evaluateGate({
+        config: mergeConfig(), // enforced
+        cwd,
+        baseline,
+        transcript: editTranscript("src/x.js"),
+        host: { reviewerMapping: "codex" },
+        reviewerRunner: runner,
+        stateDir: await tmpStateDir(),
+      });
+      assert.equal(decision.action, "allow", `expected allow for ${label}`);
+      assert.equal(decision.reason, "external_pass");
+    });
+  }
+
+  // FIX A: with more reviewable files than the per-file coverage cap, the gate
+  // accepts a PASS on NON-EMPTY (not exhaustive) coverage and records a coverage
+  // limitation rather than hard-failing on a missing per-file enumeration.
+  it("more than the cap reviewable files + partial coverage allows with a limitation note", async () => {
+    const CAP = 40;
+    const after = {};
+    for (let i = 0; i < CAP + 5; i++) {
+      after[`src/f${i}.js`] = `const v${i} = ${i};\n`;
+    }
+    const { cwd, baseline } = await makeWorkspace({}, after);
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      // Examine only a handful of the 45 reviewable files (non-empty, partial).
+      verdict: makeVerdict(job, {
+        coverage: { files_examined: ["src/f0.js", "src/f1.js", "src/f2.js"] },
+      }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/f0.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "external_pass");
+    assert.equal(decision.coverageLimited, true);
+    assert.match(decision.coverageNote, /coverage limitation/i);
+  });
+
+  // FIX A: empty coverage on a non-empty reviewable diff is STILL an operational
+  // failure, even when the file count exceeds the per-file cap.
+  it("more than the cap reviewable files + EMPTY coverage still blocks (enforced)", async () => {
+    const CAP = 40;
+    const after = {};
+    for (let i = 0; i < CAP + 5; i++) {
+      after[`src/f${i}.js`] = `const v${i} = ${i};\n`;
+    }
+    const { cwd, baseline } = await makeWorkspace({}, after);
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: [] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/f0.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block");
+    assert.equal(decision.reviewerError, "empty_coverage");
+  });
+
   it("valid pass with full coverage allows and caches (second call hits cache)", async () => {
     const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
     track(cwd);

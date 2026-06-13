@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review-gate",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "description": "NodeJS multi-tool adversarial review gate for coding agents.",
   "type": "module",
   "bin": {
@@ -10,13 +10,18 @@
   "scripts": {
     "test": "node --test",
     "doctor": "node ./bin/adversarial-review.js doctor --dry-run",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "prepublishOnly": "npm test && npm run pack:dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin/",
     "src/",
     ".claude-plugin/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {

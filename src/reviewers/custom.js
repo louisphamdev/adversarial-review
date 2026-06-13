@@ -8,78 +8,13 @@
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import { resolveExecutable, spawnResolved, expandArgs } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
-
-// Default timeout in seconds when neither config nor job specifies one.
-const DEFAULT_TIMEOUT_SEC = 120;
-
-// Maximum stdout bytes captured from the reviewer process.
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-
-/**
- * Collect stdout from a child process up to MAX_OUTPUT_BYTES, then resolve.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<string>}
- */
-function collectOutput(child) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalBytes = 0;
-    let truncated = false;
-
-    child.stdout.on("data", (chunk) => {
-      if (truncated) return;
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_OUTPUT_BYTES) {
-        truncated = true;
-        chunks.push(chunk.slice(0, chunk.length - (totalBytes - MAX_OUTPUT_BYTES)));
-      } else {
-        chunks.push(chunk);
-      }
-    });
-
-    child.on("error", reject);
-    child.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
-}
-
-/**
- * Wait for a child process to exit and return its exit code.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<number|null>}
- */
-function waitForExit(child) {
-  return new Promise((resolve) => {
-    child.on("close", (code) => resolve(code));
-    child.on("error", () => resolve(null));
-  });
-}
-
-/**
- * Kill a child process tree as forcefully as possible.
- * On Windows, use taskkill /F /T to terminate the entire process tree.
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function forceKill(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } else {
-      child.kill("SIGTERM");
-    }
-  } catch { /* ignore */ }
-}
-
-// Sentinel value returned by the timeout race arm.
-const TIMEOUT_SENTINEL = Symbol("timeout");
+import {
+  runWithTimeout,
+  TIMEOUT_SENTINEL,
+  DEFAULT_TIMEOUT_SEC,
+} from "./_shared.js";
 
 /**
  * Build the brief text written to the briefPath temp file.
@@ -114,7 +49,7 @@ function buildBrief(job) {
  *
  * @param {object} config      - full effective config
  * @param {string} reviewerId  - the reviewer id as it appears in config.reviewers
- * @returns {{ id: string, verify(env): Promise, run(job, io): Promise }}
+ * @returns {{ id: string, verify(env, options?): Promise, run(job, io): Promise }}
  */
 export function createAdapter(config, reviewerId) {
   const reviewerConfig = config?.reviewers?.[reviewerId] || {};
@@ -123,6 +58,16 @@ export function createAdapter(config, reviewerId) {
   if (reviewerConfig.type !== "custom") {
     throw new Error(`Custom adapter requires type:"custom" in reviewer config for "${reviewerId}"`);
   }
+
+  // ISOLATION: a custom reviewer's isolation cannot be probed (it is an opaque
+  // user command), so it is surfaced from config the same way opencode surfaces
+  // its bundled read-only config: `readOnlyConfig === true` declares that the
+  // operator has wired this command to run read-only. Only when that flag is set
+  // does the adapter assert readOnly/noEdit — which is what lets a TRUSTED custom
+  // reviewer be used in enforced / strict-ci. Without it, capabilities stay false
+  // and the gate refuses the reviewer in those modes (soft-only). The trust flag
+  // (handled in verify/run) is a separate, independent gate.
+  const isolated = reviewerConfig.readOnlyConfig === true;
 
   return {
     id: reviewerId,
@@ -158,7 +103,10 @@ export function createAdapter(config, reviewerId) {
         ok: true,
         resolvedPath,
         version: "",
-        capabilities: { readOnly: false, noEdit: false, ephemeral: false },
+        // readOnly/noEdit are config-driven (readOnlyConfig:true) so a trusted
+        // custom reviewer wired to run read-only can satisfy the enforced gate.
+        // Default (flag absent) keeps them false -> soft-only.
+        capabilities: { readOnly: isolated, noEdit: isolated, ephemeral: false },
       };
     },
 
@@ -225,7 +173,10 @@ export function createAdapter(config, reviewerId) {
         }
 
         // spawnResolved fails closed on cmd-metacharacter args for batch wrappers;
-        // convert that throw into an operational failure so the gate blocks.
+        // convert that throw into an operational failure so the gate blocks. stdio
+        // defaults to ["ignore","pipe","pipe"], so no stdin is piped to the child
+        // — the brief reaches it via the {briefPath} file placeholder, not stdin,
+        // so there is no EPIPE-on-early-exit hazard here.
         let child;
         try {
           child = spawnResolved(resolvedPath, expandedArgs, { cwd, env });
@@ -233,37 +184,43 @@ export function createAdapter(config, reviewerId) {
           return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
         }
 
-        // Race the process completion against the timeout.
-        const processPromise = Promise.all([collectOutput(child), waitForExit(child)]);
-        const timeoutPromise = new Promise((resolve) =>
-          setTimeout(() => resolve(TIMEOUT_SENTINEL), effectiveTimeout)
-        );
-
-        const raceResult = await Promise.race([processPromise, timeoutPromise]);
+        // Race the process completion against the timeout. On timeout, the child
+        // process tree is force-killed inside runWithTimeout.
+        const raceResult = await runWithTimeout(child, {
+          timeoutMs: effectiveTimeout,
+        });
 
         if (raceResult === TIMEOUT_SENTINEL) {
-          forceKill(child);
           return { ok: false, error: "timeout" };
         }
 
-        const [stdout, exitCode] = raceResult;
+        const { stdout, exitCode } = raceResult;
 
-        if (exitCode !== 0) {
-          return { ok: false, error: `nonzero_exit:${exitCode}` };
-        }
-
-        if (!stdout) {
-          return { ok: false, error: "empty_output" };
-        }
-
-        // Parse the verdict from stdout.
-        const parsed = parseVerdict(stdout, job);
-        if (!parsed.ok) {
+        // ROBUSTNESS: PARSE stdout for a valid verdict BEFORE consulting the exit
+        // code. Real CLIs frequently print a perfectly valid verdict block and
+        // STILL exit nonzero (review found issues, telemetry/cleanup hiccup, etc).
+        // Returning nonzero_exit first would drop that valid verdict. So: if a
+        // valid verdict is present, honor it regardless of exit code; only return
+        // nonzero_exit / empty_output when NO valid verdict was produced.
+        if (stdout) {
+          const parsed = parseVerdict(stdout, job);
+          if (parsed.ok) {
+            // A valid fail verdict is NOT an operational failure.
+            return { ok: true, verdict: parsed.verdict };
+          }
+          // No valid verdict: surface the exit code first (more actionable than a
+          // parse error), else the parse failure reason.
+          if (exitCode !== 0) {
+            return { ok: false, error: `nonzero_exit:${exitCode}` };
+          }
           return { ok: false, error: parsed.error };
         }
 
-        // A valid fail verdict is NOT an operational failure.
-        return { ok: true, verdict: parsed.verdict };
+        // No stdout at all.
+        if (exitCode !== 0) {
+          return { ok: false, error: `nonzero_exit:${exitCode}` };
+        }
+        return { ok: false, error: "empty_output" };
       } finally {
         if (tempDir) {
           try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }

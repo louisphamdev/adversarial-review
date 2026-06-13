@@ -18,18 +18,21 @@
 // In dry-run mode: print every planned write path and its note, then exit 0
 // WITHOUT writing any files.
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { mergeConfig, applyPolicyFloor, DEFAULT_CONFIG } from "../core/config.js";
 import { HOSTS } from "../hosts/index.js";
-import { plannedClaudeCodeWrites } from "../hosts/claude-code.js";
+import {
+  plannedClaudeCodeWrites,
+  claudeCodeSettingsPath,
+} from "../hosts/claude-code.js";
 import { wrapperInstructions } from "../hosts/wrapper.js";
 import { createReviewer } from "../reviewers/index.js";
 import { resolveExecutable } from "../core/process.js";
+import { resolveHomeDir } from "../core/load-config.js";
 
 // Path constants (relative to cwd / home).
 const PROJECT_CONFIG_REL = path.join(".adversarial-review", "config.json");
@@ -66,18 +69,23 @@ const OPENCODE_REVIEWER_DEFAULTS = Object.freeze({
  * Parse the install command's argv array into structured options.
  *
  * @param {string[]} argv
- * @returns {{ hosts: string[], reviewerMap: Map<string,string>, dryRun: boolean, projectConfigPath: string|null }}
+ * @returns {{ hosts: string[], reviewerMap: Map<string,string>, dryRun: boolean, projectConfigPath: string|null, userScope: boolean }}
  */
 function parseArgs(argv) {
   const hosts = [];
   const reviewerMap = new Map();
   let dryRun = false;
   let projectConfigPath = null;
+  let userScope = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--dry-run") {
       dryRun = true;
+    } else if (arg === "--user" || arg === "--global") {
+      // Machine-wide install: write to <home>/.adversarial-review/config.json
+      // and merge hooks into <home>/.claude/settings.json instead of cwd.
+      userScope = true;
     } else if (arg === "--hosts" && argv[i + 1]) {
       // Accept either `--hosts a,b` or `--hosts a --hosts b`.
       argv[i + 1].split(",").forEach((h) => hosts.push(h.trim()));
@@ -97,7 +105,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { hosts, reviewerMap, dryRun, projectConfigPath };
+  return { hosts, reviewerMap, dryRun, projectConfigPath, userScope };
 }
 
 // ---------------------------------------------------------------------------
@@ -117,20 +125,73 @@ async function readJsonTolerant(filePath) {
 }
 
 /**
- * Resolve the user's home directory, honoring an injected env so tests can
- * redirect home-based writes (registry, opencode agent) without touching the
- * real home dir. This MUST match load-config.js's homeDir() resolution so the
- * installer writes to the SAME user-level base the gate later reads. Priority:
- *   1. ADVERSARIAL_REVIEW_HOME — dedicated override for the user-level base;
- *   2. HOME / USERPROFILE — standard OS home env vars;
- *   3. os.homedir() — the real home dir.
+ * Read an existing Claude Code settings.json for merging. Distinguishes
+ * three cases so the caller can decide whether to back up the original:
+ *   - missing/unreadable: { settings: {}, corrupt: false } — nothing to back up.
+ *   - present but invalid JSON: { settings: {}, corrupt: true } — back up first.
+ *   - present + valid object: { settings: <obj>, corrupt: false }.
+ *
+ * @param {string} filePath
+ * @returns {Promise<{ settings: object, corrupt: boolean }>}
  */
-function homeDir(env) {
-  if (env) {
-    const fromEnv = env.ADVERSARIAL_REVIEW_HOME || env.HOME || env.USERPROFILE;
-    if (fromEnv) return fromEnv;
+async function readSettingsForMerge(filePath) {
+  let raw;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch {
+    return { settings: {}, corrupt: false }; // Missing: nothing to back up.
   }
-  return os.homedir();
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { settings: parsed, corrupt: false };
+    }
+    // Valid JSON but not an object (e.g. an array or scalar) — treat as corrupt
+    // so we preserve the original via backup rather than silently dropping it.
+    return { settings: {}, corrupt: true };
+  } catch {
+    return { settings: {}, corrupt: true };
+  }
+}
+
+/**
+ * Back up a corrupt settings.json to settings.json.bak before it is overwritten
+ * by the merged (from-scratch) result. Best-effort; never throws.
+ *
+ * @param {string} filePath
+ * @param {object} io  - { stdout }
+ */
+async function backupCorruptSettings(filePath, io) {
+  const bakPath = `${filePath}.bak`;
+  try {
+    await copyFile(filePath, bakPath);
+    io.stdout.write(
+      `  NOTE: ${filePath} was not valid JSON; backed it up to ${bakPath} before merging.\n`
+    );
+  } catch {
+    // If the backup itself fails we still proceed — but note it.
+    io.stdout.write(
+      `  WARNING: ${filePath} was not valid JSON and could not be backed up; merging from scratch.\n`
+    );
+  }
+}
+
+/**
+ * Normalize a directory path into a STABLE install-registry key so the same
+ * project never produces duplicate registry entries. We path.resolve() to an
+ * absolute, normalized form and, on win32, lowercase a leading drive letter
+ * (`D:\` and `d:\` denote the same path). Other path casing is left intact
+ * because POSIX filesystems are case-sensitive.
+ *
+ * @param {string} dir
+ * @returns {string}
+ */
+function normalizeRegistryKey(dir) {
+  let resolved = path.resolve(dir);
+  if (process.platform === "win32" && /^[a-zA-Z]:/.test(resolved)) {
+    resolved = resolved[0].toLowerCase() + resolved.slice(1);
+  }
+  return resolved;
 }
 
 /**
@@ -249,14 +310,20 @@ async function checkReviewerAvailability(reviewerId, config, env) {
  * Writes atomically by writing to a temp file and renaming (best-effort on
  * Windows where rename semantics differ; we do a two-step write+rename).
  *
+ * The file mode is parameterized PER FILE: team-shared/committed files
+ * (project config, .claude/settings.json) are written 0o644 so collaborators
+ * can read them, while user-level secrets-adjacent files (user config, registry,
+ * state) stay 0o600. Defaults to 0o600 (the safe default).
+ *
  * @param {string} filePath
  * @param {string} content
+ * @param {number} [mode=0o600]
  */
-async function atomicWrite(filePath, content) {
+async function atomicWrite(filePath, content, mode = 0o600) {
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
   const tmp = `${filePath}.tmp${Date.now()}`;
-  await writeFile(tmp, content, { encoding: "utf8", mode: 0o600 });
+  await writeFile(tmp, content, { encoding: "utf8", mode });
   // node:fs rename is atomic on POSIX; on Windows it will overwrite on Node 14+.
   const { rename } = await import("node:fs/promises");
   await rename(tmp, filePath);
@@ -273,9 +340,15 @@ async function atomicWrite(filePath, content) {
 export async function installCommand(argv, io) {
   const cwd = io.cwd || process.cwd();
   const env = io.env || process.env;
-  const home = homeDir(env);
+  const home = resolveHomeDir(env);
 
-  const { hosts, reviewerMap, dryRun, projectConfigPath } = parseArgs(argv);
+  const { hosts, reviewerMap, dryRun, projectConfigPath, userScope } = parseArgs(argv);
+
+  // Scope base: the directory whose .adversarial-review/config.json and
+  // .claude/settings.json we write. User scope targets <home>; default targets
+  // the project <cwd>. The install registry + opencode agent always live under
+  // <home> regardless of scope.
+  const scopeBase = userScope ? home : cwd;
 
   // --- Require at least one host ---
   if (!hosts.length) {
@@ -291,8 +364,12 @@ export async function installCommand(argv, io) {
   const userPolicyPath = path.join(home, USER_POLICY_REL);
   const userPolicyFloor = await readJsonTolerant(userPolicyPath);
 
-  // --- Load existing project config (from explicit path or default location) ---
-  const projectConfigPath2 = projectConfigPath || path.join(cwd, PROJECT_CONFIG_REL);
+  // --- Load existing config to layer onto (scope-aware) ---
+  // For project scope this is <cwd>/.adversarial-review/config.json; for user
+  // scope it is <home>/.adversarial-review/config.json. An explicit
+  // --project-config path always wins.
+  const projectConfigPath2 =
+    projectConfigPath || path.join(scopeBase, PROJECT_CONFIG_REL);
   const existingProjectConfig = await readJsonTolerant(projectConfigPath2);
 
   // --- Read legacy config and merge ---
@@ -448,41 +525,57 @@ export async function installCommand(argv, io) {
   // Merge with DEFAULT_CONFIG and enforce policy floor.
   const resolvedConfig = mergeConfig(newProjectConfig, userPolicyFloor);
 
-  // Serialize the project-level config (strip runtime defaults that came from
-  // DEFAULT_CONFIG; keep only what was explicitly set or migrated).
-  const configToWrite = buildProjectConfigToWrite(newProjectConfig, resolvedConfig);
+  // Serialize the config. For USER scope we write the full machine-wide config
+  // (always include policy.mode and the reviewers block) so the user-level
+  // defaults are explicit; for project scope we keep only what was explicitly
+  // set or migrated (no DEFAULT_CONFIG boilerplate).
+  const configToWrite = buildProjectConfigToWrite(
+    newProjectConfig,
+    resolvedConfig,
+    userScope
+  );
   const configJson = JSON.stringify(configToWrite, null, 2);
 
   // --- Collect planned writes ---
 
   const plannedWrites = [];
 
-  // 1. Project config.
-  const projectConfigOutPath = path.join(cwd, PROJECT_CONFIG_REL);
+  // 1. Config (scope-aware). Project scope -> <cwd>/.adversarial-review/...;
+  //    user scope -> <home>/.adversarial-review/... — a team-shared/committed
+  //    file in either case, so mode 0o644.
+  const projectConfigOutPath = path.join(scopeBase, PROJECT_CONFIG_REL);
   plannedWrites.push({
     path: projectConfigOutPath,
     content: configJson,
-    note: "Project config (.adversarial-review/config.json)",
+    note: userScope
+      ? "User config (machine-wide defaults: ~/.adversarial-review/config.json)"
+      : "Project config (.adversarial-review/config.json)",
     type: "project-config",
+    mode: 0o644,
   });
 
-  // 2. User-level install registry.
+  // 2. User-level install registry. Keyed by a NORMALIZED path so the same
+  //    project never produces duplicate entries. User-level + secrets-adjacent:
+  //    mode 0o600.
   const installRegistryPath = path.join(home, USER_INSTALL_REL);
   const existingRegistry = await readJsonTolerant(installRegistryPath);
   const registryEntry = {
     installedAt: new Date().toISOString(),
+    scope: userScope ? "user" : "project",
     hosts,
     reviewers: Object.fromEntries(reviewerMap),
   };
+  const registryKey = normalizeRegistryKey(userScope ? home : cwd);
   const updatedRegistry = {
     ...existingRegistry,
-    [cwd]: registryEntry,
+    [registryKey]: registryEntry,
   };
   plannedWrites.push({
     path: installRegistryPath,
     content: JSON.stringify(updatedRegistry, null, 2),
     note: "User-level install registry (~/.adversarial-review/install.json)",
     type: "install-registry",
+    mode: 0o600,
   });
 
   // FIX 3: pick the hook/wrapper command once. Prefer the direct bin name when
@@ -497,13 +590,33 @@ export async function installCommand(argv, io) {
     if (hostInfo.enforcement === "native-enforced") {
       // Native host: compute planned file writes.
       if (host === "claude-code") {
-        const nativeWrites = plannedClaudeCodeWrites({ cwd, binPath: hookBin.command });
+        // CRITICAL: read the existing settings.json so we DEEP-MERGE rather than
+        // clobber. If the file is corrupt, back it up to settings.json.bak before
+        // we overwrite it with the merged result (which starts from {}). The
+        // settings.json is a team-shared/committed file -> mode 0o644.
+        const settingsPath = claudeCodeSettingsPath(scopeBase);
+        const { settings: existingSettings, corrupt } =
+          await readSettingsForMerge(settingsPath);
+        if (corrupt && !dryRun) {
+          await backupCorruptSettings(settingsPath, io);
+        } else if (corrupt && dryRun) {
+          io.stdout.write(
+            `  NOTE: ${settingsPath} is not valid JSON; a real install would back ` +
+              `it up to settings.json.bak and start fresh.\n`
+          );
+        }
+        const nativeWrites = plannedClaudeCodeWrites({
+          baseDir: scopeBase,
+          binPath: hookBin.command,
+          existingSettings,
+        });
         for (const w of nativeWrites) {
           plannedWrites.push({
             path: w.path,
             content: w.content,
             note: w.note,
             type: "native-hook",
+            mode: 0o644,
           });
         }
       }
@@ -540,6 +653,8 @@ export async function installCommand(argv, io) {
         ? "opencode read-only agent (adversarial-reviewer.md) — already present, will be kept"
         : "opencode read-only agent (adversarial-reviewer.md) — mode:primary, read-only",
       type: "opencode-agent",
+      // User-level shared agent: a normal-readable file -> 0o644.
+      mode: 0o644,
       // Idempotency marker: when true the real-mode writer skips this entry.
       skipExisting: agentAlreadyPresent,
     });
@@ -581,7 +696,7 @@ export async function installCommand(argv, io) {
       continue;
     }
     io.stdout.write(`Writing ${w.path} ...\n`);
-    await atomicWrite(w.path, w.content);
+    await atomicWrite(w.path, w.content, w.mode);
     io.stdout.write(`  OK: ${w.note}\n`);
   }
 
@@ -613,16 +728,19 @@ export async function installCommand(argv, io) {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the project config object to write.  We include only the keys that
- * are meaningful for a project config (not DEFAULT_CONFIG boilerplate), plus
- * the computed hosts/reviewers from the install run.  We always run through
+ * Build the config object to write.  For PROJECT scope we include only the keys
+ * that are meaningful for a project config (not DEFAULT_CONFIG boilerplate),
+ * plus the computed hosts/reviewers from the install run.  For USER scope
+ * (fullMachineConfig=true) we always emit policy.mode and the reviewers block so
+ * the machine-wide config is explicit and self-describing. We always run through
  * applyPolicyFloor to ensure we never loosen the user floor.
  *
  * @param {object} newProjectConfig  - merged project + legacy + install config
  * @param {object} resolvedConfig    - fully resolved config (post applyPolicyFloor)
+ * @param {boolean} [fullMachineConfig=false] - emit the full machine-wide config
  * @returns {object}
  */
-function buildProjectConfigToWrite(newProjectConfig, resolvedConfig) {
+function buildProjectConfigToWrite(newProjectConfig, resolvedConfig, fullMachineConfig = false) {
   // Start from the project-level config (not DEFAULT_CONFIG) so we don't
   // flood the project file with defaults.
   const out = {
@@ -637,6 +755,14 @@ function buildProjectConfigToWrite(newProjectConfig, resolvedConfig) {
   if (newProjectConfig.privacy) out.privacy = resolvedConfig.privacy;
   if (newProjectConfig.reviewers) out.reviewers = resolvedConfig.reviewers;
   if (newProjectConfig.sensitivity) out.sensitivity = resolvedConfig.sensitivity;
+
+  // USER scope: the machine-wide config must be self-describing. Always emit
+  // policy.mode and the reviewers block even when no explicit override was given.
+  if (fullMachineConfig) {
+    if (!out.policy) out.policy = {};
+    if (out.policy.mode === undefined) out.policy.mode = resolvedConfig.policy.mode;
+    if (!out.reviewers) out.reviewers = resolvedConfig.reviewers || {};
+  }
 
   return out;
 }

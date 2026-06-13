@@ -14,51 +14,19 @@ import { join } from "node:path";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createAdapter } from "../../src/reviewers/opencode.js";
-import { createStubs, makeJob, buildVerdictOutput } from "./stub-helper.js";
+import { createStubs, makeJob, buildVerdictOutput, createToolShim } from "./stub-helper.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Create an "opencode" shim in a temp dir that runs a specific stub script.
- * On Windows: opencode.cmd; elsewhere: a POSIX shell script named opencode.
- * The shim forwards all command-line args to the stub so the stub can dispatch
- * on subcommand (--version / agent list / run).
+ * Create an "opencode" shim that runs a specific stub script and FORWARDS the
+ * adapter's CLI args so the stub can dispatch on subcommand (--version /
+ * agent list / run). Delegates to the shared createToolShim helper.
  */
-async function createOpencodeShim(stubPath) {
-  const shimDir = await mkdtemp(join(tmpdir(), "ar-oc-shim-"));
-
-  if (process.platform === "win32") {
-    const shimFile = join(shimDir, "opencode.cmd");
-    // %* forwards every argument that cmd.exe received to the stub.
-    await writeFile(shimFile, `@"${process.execPath}" "${stubPath}" %*\r\n`);
-  } else {
-    const shimFile = join(shimDir, "opencode");
-    await writeFile(shimFile, `#!/bin/sh\nexec "${process.execPath}" "${stubPath}" "$@"\n`, { mode: 0o755 });
-  }
-
-  // DETERMINISM: prepend this test's UNIQUE shim dir to PATH so
-  // resolveExecutable("opencode") resolves THIS test's shim first — never the
-  // real `opencode` on the machine PATH nor another test's shim, even under
-  // parallel `node --test`. PATHEXT is narrowed to .CMD (the shim's extension)
-  // so the lookup matches the shim's opencode.cmd and cannot fall through to a
-  // real opencode.exe; the system PATH is kept AFTER the shim dir only so the
-  // cmd.exe wrapper for .cmd shims still resolves.
-  const env = {
-    ...process.env,
-    PATH: shimDir + (process.env.PATH ? (process.platform === "win32" ? ";" : ":") + process.env.PATH : ""),
-    PATHEXT: process.platform === "win32" ? ".CMD" : undefined,
-  };
-  for (const k of Object.keys(env)) {
-    if (env[k] === undefined) delete env[k];
-  }
-
-  return {
-    dir: shimDir,
-    env,
-    cleanup: () => rm(shimDir, { recursive: true, force: true }),
-  };
+function createOpencodeShim(stubPath) {
+  return createToolShim("opencode", stubPath, { forwardArgs: true });
 }
 
 /**
@@ -305,6 +273,88 @@ describe("opencode adapter", () => {
     } finally {
       await shim.cleanup();
       await stub.cleanup();
+    }
+  });
+
+  // --- SECURITY (Task A): enforced mode IGNORES a project-supplied agent name ---
+
+  // A malicious project config can set reviewers.opencode = { readOnlyConfig:true,
+  // agent:"evil" } where "evil" is a WRITABLE opencode agent. The old adapter
+  // would (a) verify against and (b) run "evil" while still reporting readOnly/
+  // noEdit true, so the enforced isolation gate would pass yet a writable agent
+  // would actually run. In enforced/strict-ci the adapter MUST ignore the project
+  // agent and use the bundled "adversarial-reviewer" — in BOTH verify()'s agent
+  // existence check AND run()'s --agent — and only report isolated for it.
+  it("enforced mode ignores a project-supplied agent and uses the bundled read-only agent", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-evil-"));
+    const recArgs = join(recDir, "args.json");
+    // agent list includes ONLY the bundled agent, NOT "evil": if the adapter
+    // verified against "evil" it would report reviewer_agent_missing and fail.
+    const stub = await writeOpencodeStub(job, {
+      verdict: "pass",
+      agents: ["adversarial-reviewer", "build"],
+      recordArgsPath: recArgs,
+    });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = {
+        policy: { mode: "enforced" },
+        reviewers: { opencode: { readOnlyConfig: true, agent: "evil", timeoutSec: 10 } },
+      };
+      const adapter = createAdapter(config);
+
+      // verify(): asserts against the bundled agent (present) and reports isolated,
+      // proving a doctor/runtime caller cannot be redirected to the project agent.
+      const verifyResult = await adapter.verify(shim.env);
+      assert.equal(verifyResult.ok, true, `verify failed: ${verifyResult.reason}`);
+      assert.equal(verifyResult.capabilities.readOnly, true, "must still report isolated");
+      assert.equal(verifyResult.capabilities.noEdit, true, "must still report isolated");
+
+      // run(): must pass --agent adversarial-reviewer, NEVER "evil".
+      const runResult = await adapter.run(job, { env: shim.env });
+      assert.equal(runResult.ok, true, `Expected ok:true but got error: ${runResult.error}`);
+      const args = JSON.parse(await readFile(recArgs, "utf8"));
+      assert.deepEqual(
+        args.slice(0, 4),
+        ["run", "--pure", "--agent", "adversarial-reviewer"],
+        `enforced run must use the bundled agent, got: ${JSON.stringify(args)}`
+      );
+      assert.ok(!args.includes("evil"), `project agent "evil" must never reach run(): ${JSON.stringify(args)}`);
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  // Companion: in SOFT mode a custom agent name MAY be honored (no enforced gate).
+  // verify() then checks the custom agent's existence and run() passes it.
+  it("soft mode honors a project-supplied custom agent name", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-soft-"));
+    const recArgs = join(recDir, "args.json");
+    const stub = await writeOpencodeStub(job, {
+      verdict: "pass",
+      agents: ["my-readonly-agent"],
+      recordArgsPath: recArgs,
+    });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = {
+        policy: { mode: "soft" },
+        reviewers: { opencode: { agent: "my-readonly-agent", timeoutSec: 10 } },
+      };
+      const adapter = createAdapter(config);
+      const verifyResult = await adapter.verify(shim.env);
+      assert.equal(verifyResult.ok, true, `verify failed: ${verifyResult.reason}`);
+
+      const runResult = await adapter.run(job, { env: shim.env });
+      assert.equal(runResult.ok, true, `Expected ok:true but got error: ${runResult.error}`);
+      const args = JSON.parse(await readFile(recArgs, "utf8"));
+      assert.deepEqual(args.slice(0, 4), ["run", "--pure", "--agent", "my-readonly-agent"]);
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
     }
   });
 

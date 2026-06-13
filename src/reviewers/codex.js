@@ -7,15 +7,15 @@
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import { resolveExecutable, spawnResolved } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
-
-// Default timeout in seconds when neither config nor job specifies one.
-const DEFAULT_TIMEOUT_SEC = 120;
-
-// Maximum stdout bytes captured from the reviewer process.
-const MAX_OUTPUT_BYTES = 1024 * 1024;
+import {
+  collectOutput,
+  waitForExit,
+  runWithTimeout,
+  TIMEOUT_SENTINEL,
+  DEFAULT_TIMEOUT_SEC,
+} from "./_shared.js";
 
 /**
  * Build the hardened prompt text for the Codex reviewer.
@@ -77,75 +77,10 @@ function buildPrompt(job, diffPath) {
 }
 
 /**
- * Collect stdout from a child process up to MAX_OUTPUT_BYTES, then resolve.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<string>}
- */
-function collectOutput(child) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalBytes = 0;
-    let truncated = false;
-
-    child.stdout.on("data", (chunk) => {
-      if (truncated) return;
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_OUTPUT_BYTES) {
-        truncated = true;
-        chunks.push(chunk.slice(0, chunk.length - (totalBytes - MAX_OUTPUT_BYTES)));
-      } else {
-        chunks.push(chunk);
-      }
-    });
-
-    child.on("error", reject);
-    child.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
-}
-
-/**
- * Wait for a child process to exit and return its exit code.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<number|null>}
- */
-function waitForExit(child) {
-  return new Promise((resolve) => {
-    child.on("close", (code) => resolve(code));
-    child.on("error", () => resolve(null));
-  });
-}
-
-/**
- * Kill a child process tree as forcefully as possible.
- * On Windows, cmd.exe /c wrappers spawn node as a child; killing only the
- * cmd.exe parent leaves the node child running. Use taskkill /F /T to
- * terminate the entire tree.
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function forceKill(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } else {
-      child.kill("SIGTERM");
-    }
-  } catch { /* ignore */ }
-}
-
-// Sentinel value returned by the timeout race arm.
-const TIMEOUT_SENTINEL = Symbol("timeout");
-
-/**
  * Create a Codex reviewer adapter.
  *
  * @param {object} config  - full effective config
- * @returns {{ id: string, verify(env): Promise, run(job, io): Promise }}
+ * @returns {{ id: string, verify(env, options?): Promise, run(job, io): Promise }}
  */
 export function createAdapter(config) {
   const reviewerConfig = config?.reviewers?.codex || {};
@@ -185,6 +120,12 @@ export function createAdapter(config) {
         return { ok: false, reason: "version_check_error" };
       }
 
+      // ISOLATION: codex asserts readOnly/noEdit from the --version check alone.
+      // This is sound because the isolation is NOT a property of the binary's
+      // existence but of the sandbox flags run() passes on every invocation:
+      // `codex exec --sandbox read-only --ask-for-approval never` runs the model
+      // in a real read-only sandbox that cannot edit files. The --version probe
+      // only confirms the binary is the genuine codex CLI that honors those flags.
       return {
         ok: true,
         resolvedPath,
@@ -231,6 +172,10 @@ export function createAdapter(config) {
         // the child's STDIN instead (`codex exec -`). The only args handed to
         // spawnResolved are now flags, enums, or an mkdtemp path — none free-text.
         //
+        // ISOLATION: --sandbox read-only --ask-for-approval never is what actually
+        // delivers the readOnly/noEdit capability verify() asserts; codex runs the
+        // model in a real read-only sandbox that cannot edit files.
+        //
         // Command: codex exec --sandbox read-only --ask-for-approval never
         //          --ephemeral -C <cwd>  (prompt delivered via stdin "-")
         const args = [
@@ -256,43 +201,52 @@ export function createAdapter(config) {
           return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
         }
         if (child.stdin) {
+          // ROBUSTNESS: a child that exits early closes its stdin, so the
+          // subsequent end(prompt) write triggers an EPIPE 'error' event. Without
+          // a listener that error is unhandled and crashes the gate process.
+          // Attach a no-op handler so an early-exit child is handled gracefully.
+          child.stdin.on("error", () => { /* ignore EPIPE on early child exit */ });
           child.stdin.end(prompt);
         }
 
-        // Race the process completion against the timeout. On timeout, kill the
-        // entire process tree immediately — do NOT await the lingering child since
-        // on Windows cmd.exe /c wrappers can linger after taskkill.
-        const processPromise = Promise.all([collectOutput(child), waitForExit(child)]);
-        const timeoutPromise = new Promise((resolve) =>
-          setTimeout(() => resolve(TIMEOUT_SENTINEL), effectiveTimeout)
-        );
-
-        const raceResult = await Promise.race([processPromise, timeoutPromise]);
+        // Race the process completion against the timeout. On timeout, the child
+        // process tree is force-killed inside runWithTimeout.
+        const raceResult = await runWithTimeout(child, {
+          timeoutMs: effectiveTimeout,
+        });
 
         if (raceResult === TIMEOUT_SENTINEL) {
-          forceKill(child);
           return { ok: false, error: "timeout" };
         }
 
-        const [stdout, exitCode] = raceResult;
+        const { stdout, exitCode } = raceResult;
 
-        if (exitCode !== 0) {
-          return { ok: false, error: `nonzero_exit:${exitCode}` };
-        }
-
-        if (!stdout) {
-          return { ok: false, error: "empty_output" };
-        }
-
-        // Parse the verdict from stdout.
-        const parsed = parseVerdict(stdout, job);
-        if (!parsed.ok) {
+        // ROBUSTNESS: PARSE stdout for a valid verdict BEFORE consulting the exit
+        // code. Real CLIs frequently print a perfectly valid verdict block and
+        // STILL exit nonzero (review found issues, telemetry/cleanup hiccup, etc).
+        // Returning nonzero_exit first would drop that valid verdict. So: if a
+        // valid verdict is present, honor it regardless of exit code; only return
+        // nonzero_exit / empty_output when NO valid verdict was produced.
+        if (stdout) {
+          const parsed = parseVerdict(stdout, job);
+          if (parsed.ok) {
+            // A valid fail verdict is NOT an operational failure — return ok:true so
+            // the gate can apply policy (block with findings).
+            return { ok: true, verdict: parsed.verdict };
+          }
+          // No valid verdict: surface the exit code first (more actionable than a
+          // parse error), else the parse failure reason.
+          if (exitCode !== 0) {
+            return { ok: false, error: `nonzero_exit:${exitCode}` };
+          }
           return { ok: false, error: parsed.error };
         }
 
-        // A valid fail verdict is NOT an operational failure — return ok:true so
-        // the gate can apply policy (block with findings).
-        return { ok: true, verdict: parsed.verdict };
+        // No stdout at all.
+        if (exitCode !== 0) {
+          return { ok: false, error: `nonzero_exit:${exitCode}` };
+        }
+        return { ok: false, error: "empty_output" };
       } finally {
         if (tempDir) {
           try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }

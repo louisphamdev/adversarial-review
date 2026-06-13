@@ -161,6 +161,38 @@ describe("doctor command", () => {
           },
         })
       );
+      // A genuinely clean setup also has the native hooks registered — otherwise
+      // doctor (correctly) warns the gate would never fire. Register both events.
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event session-start",
+                  },
+                ],
+              },
+            ],
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event stop",
+                  },
+                ],
+              },
+            ],
+          },
+        })
+      );
 
       const { io, out, err } = makeIo(cwd, home);
       process.exitCode = 0;
@@ -172,6 +204,10 @@ describe("doctor command", () => {
       const parsed = JSON.parse(out.join(""));
       assert.equal(parsed.warnings.length, 0, "expected no warnings for native-enforced host");
       assert.equal(parsed.effectiveEnforcement, "native-enforced");
+      // The host report must surface that our native hooks are registered.
+      const cc = parsed.hosts.find((h) => h.id === "claude-code");
+      assert.ok(cc.hooks, "claude-code host report must include hooks status");
+      assert.equal(cc.hooks.registered, true, "hooks must be reported as registered");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

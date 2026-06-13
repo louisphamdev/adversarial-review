@@ -117,6 +117,60 @@ process.exit(0);
 }
 
 /**
+ * Create a tool shim in a fresh temp dir that runs `process.execPath <targetPath>`
+ * and prepend that dir to PATH so resolveExecutable(toolName) finds THIS shim.
+ *
+ * This is the single, parameterized replacement for the per-test
+ * createCodexShim / createOpencodeShim PATH-building helpers (removes the
+ * flaky-by-copy risk of N near-identical helpers drifting apart).
+ *
+ * DETERMINISM: the shim dir is UNIQUE (mkdtemp) and prepended to PATH so the
+ * lookup resolves THIS test's shim first — never a real tool on the machine PATH
+ * nor another test's shim, even under parallel `node --test`. On Windows PATHEXT
+ * is narrowed to .CMD (the shim's extension) so the lookup matches the shim's
+ * <tool>.cmd and cannot fall through to a real <tool>.exe; the system PATH is
+ * kept AFTER the shim dir only so the cmd.exe wrapper for .cmd shims resolves.
+ *
+ * @param {string} toolName       - bare command name the adapter resolves (e.g. "codex")
+ * @param {string} targetPath     - absolute path to the Node script the shim runs
+ * @param {object} [opts]
+ * @param {boolean} [opts.forwardArgs=false] - when true, forward the adapter's
+ *        CLI args to the target (needed by multi-subcommand tools like opencode
+ *        that dispatch on argv); when false, ignore them (codex-style).
+ * @returns {Promise<{ dir: string, env: object, cleanup: Function }>}
+ */
+export async function createToolShim(toolName, targetPath, opts = {}) {
+  const forwardArgs = opts.forwardArgs === true;
+  const shimDir = await mkdtemp(join(tmpdir(), `ar-shim-${toolName}-`));
+
+  if (process.platform === "win32") {
+    const shimFile = join(shimDir, `${toolName}.cmd`);
+    // %* forwards every argument cmd.exe received to the target; omit it to ignore args.
+    const tail = forwardArgs ? " %*" : "";
+    await writeFile(shimFile, `@"${process.execPath}" "${targetPath}"${tail}\r\n`);
+  } else {
+    const shimFile = join(shimDir, toolName);
+    const tail = forwardArgs ? ' "$@"' : "";
+    await writeFile(shimFile, `#!/bin/sh\nexec "${process.execPath}" "${targetPath}"${tail}\n`, { mode: 0o755 });
+  }
+
+  const env = {
+    ...process.env,
+    PATH: shimDir + (process.env.PATH ? (process.platform === "win32" ? ";" : ":") + process.env.PATH : ""),
+    PATHEXT: process.platform === "win32" ? ".CMD" : undefined,
+  };
+  for (const k of Object.keys(env)) {
+    if (env[k] === undefined) delete env[k];
+  }
+
+  return {
+    dir: shimDir,
+    env,
+    cleanup: () => rm(shimDir, { recursive: true, force: true }),
+  };
+}
+
+/**
  * Build a minimal job descriptor that satisfies parseVerdict.
  *
  * @param {object} [overrides]

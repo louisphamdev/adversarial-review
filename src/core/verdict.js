@@ -1,6 +1,22 @@
 const START = "<<<ADVERSARIAL-REVIEW-VERDICT>>>";
 const END = "<<<END>>>";
+const START_LOWER = START.toLowerCase();
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+
+// Count non-overlapping occurrences of `needle` in `haystack`. Used to detect
+// multiple verdict-block markers case-insensitively (both operands lowercased).
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const idx = haystack.indexOf(needle, from);
+    if (idx < 0) break;
+    count += 1;
+    from = idx + needle.length;
+  }
+  return count;
+}
 
 export function parseVerdict(output, job, options = {}) {
   // FIX 3: compute text once to avoid TOCTOU gap with non-idempotent toString objects
@@ -13,8 +29,15 @@ export function parseVerdict(output, job, options = {}) {
   const start = text.indexOf(START);
   if (start < 0) return { ok: false, error: "missing_verdict_start" };
 
-  // FIX 1: reject inputs that contain more than one verdict block (prompt-injection defence)
-  if (text.indexOf(START) !== text.lastIndexOf(START)) {
+  // FIX 1: reject inputs that contain more than one verdict block (prompt-injection defence).
+  // Detect markers case-INSENSITIVELY: a SECOND verdict block authored with a
+  // different-case START marker (e.g. <<<adversarial-review-verdict>>>) must not
+  // slip past an exact-case indexOf/lastIndexOf check. A second verdict block
+  // always carries its own START sentinel, so 2+ START markers is the rejection
+  // signal. END markers are NOT counted here: the trailing-content relaxation
+  // (prose, and even a stray END, after the first block's END) must be preserved.
+  const lower = text.toLowerCase();
+  if (countOccurrences(lower, START_LOWER) > 1) {
     return { ok: false, error: "multiple_verdict_blocks" };
   }
 

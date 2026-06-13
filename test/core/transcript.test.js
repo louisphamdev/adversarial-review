@@ -12,8 +12,6 @@ import {
   isSubagentTranscript,
   lastUserText,
   wantsSkip,
-  GATE_SENTINEL,
-  DEBATE_SENTINEL,
 } from "../../src/core/transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -41,41 +39,6 @@ function makeEditEntry(timestamp, filePath, toolName = "Edit") {
       ],
     },
   };
-}
-
-/** Build a pair of entries (tool_use + tool_result) for a review Task. */
-function makeReviewEntries(timestamp, toolId, prompt, { completed = true } = {}) {
-  const callEntry = {
-    type: "assistant",
-    timestamp,
-    message: {
-      role: "assistant",
-      content: [
-        {
-          type: "tool_use",
-          id: toolId,
-          name: "Task",
-          input: { prompt },
-        },
-      ],
-    },
-  };
-  if (!completed) return [callEntry];
-  const resultEntry = {
-    type: "user",
-    timestamp,
-    message: {
-      role: "user",
-      content: [
-        {
-          type: "tool_result",
-          tool_use_id: toolId,
-          content: "done",
-        },
-      ],
-    },
-  };
-  return [callEntry, resultEntry];
 }
 
 /** Build a user text entry (genuine message, not isMeta). */
@@ -230,77 +193,47 @@ describe("scanKeys - edit detection", () => {
 });
 
 // ---------------------------------------------------------------------------
-// scanKeys — review detection (mirrors TestScanKeys from test_guard.py)
+// scanKeys — edit-only robustness (review-detection ordering keys were removed;
+// acceptance of a prior review is verdict-based, see collectReviewOutputs)
 // ---------------------------------------------------------------------------
 
-describe("scanKeys - review detection", () => {
-  it("completed review after edit sets lastReviewKey >= lastEditKey", () => {
-    // Port of: test_edit_paths_and_keys
-    const entries = [
-      makeEditEntry(TS0, "/x/a.py"),
-      ...makeReviewEntries(TS1, "t1", `do ${GATE_SENTINEL}`),
-    ];
-    const { lastEditKey, lastReviewKey, lastDebateKey, editedPaths } = scanKeys(entries);
-    assert.ok(lastEditKey > 0);
-    assert.ok(lastReviewKey >= lastEditKey);
-    assert.equal(lastDebateKey, 0); // no debate token
-    assert.ok(editedPaths.has("/x/a.py"));
-  });
+/** Build a completed (non-edit) Task tool_use + tool_result pair. */
+function makeTaskEntries(timestamp, toolId) {
+  return [
+    {
+      type: "assistant",
+      timestamp,
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: toolId, name: "Task", input: { prompt: "x" } }],
+      },
+    },
+    {
+      type: "user",
+      timestamp,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolId, content: "done" }],
+      },
+    },
+  ];
+}
 
-  it("debate token sets only lastDebateKey, not lastReviewKey", () => {
-    // Port of: test_debate_token_sets_debate_key_only
-    const entries = [
-      makeEditEntry(TS0, "/x/a.py"),
-      ...makeReviewEntries(TS1, "t1", `adjudicate ${DEBATE_SENTINEL}`),
-    ];
-    const { lastReviewKey, lastDebateKey, lastEditKey } = scanKeys(entries);
-    assert.equal(lastReviewKey, 0); // debate token != review token
-    assert.ok(lastDebateKey >= lastEditKey);
-  });
-
-  it("incomplete review (no tool_result) is NOT counted", () => {
-    // Port of: test_incomplete_review_not_counted
-    const entries = [
-      makeEditEntry(TS0, "/x/a.py"),
-      ...makeReviewEntries(TS1, "t1", `do ${GATE_SENTINEL}`, { completed: false }),
-    ];
-    const { lastReviewKey } = scanKeys(entries);
-    assert.equal(lastReviewKey, 0); // no tool_result -> not finished
-  });
-
-  it("review without sentinel token in prompt is not counted", () => {
-    const entries = [
-      makeEditEntry(TS0, "/x/a.py"),
-      ...makeReviewEntries(TS1, "t1", "please review this diff"),
-    ];
-    const { lastReviewKey } = scanKeys(entries);
-    assert.equal(lastReviewKey, 0);
-  });
-
+describe("scanKeys - edit-only robustness", () => {
   it("invalid timestamps default to 0 and do not crash", () => {
     const entries = [
       makeEditEntry("not-a-timestamp", "/x/a.py"),
-      ...makeReviewEntries("also-bad", "t1", `do ${GATE_SENTINEL}`),
+      ...makeTaskEntries("also-bad", "t1"),
     ];
-    const { lastEditKey, lastReviewKey } = scanKeys(entries);
-    assert.equal(lastEditKey, 0);
-    assert.equal(lastReviewKey, 0); // both bad, but no throw
-  });
-
-  it("same-timestamp edit and review: review key >= edit key (boundary check)", () => {
-    // Mirrors test_review_same_timestamp_as_edit_allows
-    const entries = [
-      makeEditEntry(TS0, "/x/big.py"),
-      ...makeReviewEntries(TS0, "t1", `do ${GATE_SENTINEL}`),
-    ];
-    const { lastEditKey, lastReviewKey } = scanKeys(entries);
-    assert.ok(lastReviewKey >= lastEditKey);
+    const { lastEditKey } = scanKeys(entries);
+    assert.equal(lastEditKey, 0); // bad timestamp, but no throw
   });
 
   it("returns empty editedPaths when no edit tools were used", () => {
-    const entries = [...makeReviewEntries(TS0, "t1", `do ${GATE_SENTINEL}`)];
-    const { editedPaths } = scanKeys(entries);
+    const entries = [...makeTaskEntries(TS0, "t1")];
+    const { editedPaths, lastEditKey } = scanKeys(entries);
     assert.equal(editedPaths.size, 0);
+    assert.equal(lastEditKey, 0); // a Task is not an edit
   });
 });
 
@@ -633,7 +566,7 @@ describe("wantsSkip - hook echo defense", () => {
     const blockReason =
       "Code was modified this turn but has NOT passed an adversarial review. " +
       "Before finishing, dispatch an ADVERSARIAL code reviewer... " +
-      `The reviewer's prompt MUST contain the exact token '${GATE_SENTINEL}' ` +
+      "The reviewer's prompt MUST contain the exact token 'adversarial-review-gate' " +
       "and run to completion... " +
       "Escape hatch: if the user's latest message tells you to skip the review, " +
       "this gate stands down.";
@@ -643,8 +576,8 @@ describe("wantsSkip - hook echo defense", () => {
   it("the gate's own debate block reason does NOT self-disarm", () => {
     const blockReason =
       "Code was modified this turn and the change is HIGH-STAKES... " +
-      `token '${GATE_SENTINEL}'... ` +
-      `token '${DEBATE_SENTINEL}' and run to completion — that is how this gate recognises a real debate. ` +
+      "token 'adversarial-review-gate'... " +
+      "token 'adversarial-debate-gate' and run to completion — that is how this gate recognises a real debate. " +
       "Escape hatch: if the user's latest message tells you to skip the debate, " +
       "this gate stands down.";
     assert.equal(wantsSkip(blockReason), false);

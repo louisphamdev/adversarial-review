@@ -986,4 +986,288 @@ describe("install command", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // FIX A (CRITICAL): installer must DEEP-MERGE into an existing settings.json,
+  // never clobber unrelated keys (permissions/env/statusLine/mcpServers/other
+  // hooks). Re-install is idempotent (no duplicate entries). A prior guard.py
+  // (Python plugin) hook command is stripped.
+  // -------------------------------------------------------------------------
+  it("PRESERVES existing settings.json keys and merges our hooks (no clobber)", async () => {
+    const cwd = await tmpDir("ar-install-merge-");
+    const home = await tmpDir("ar-install-merge-home-");
+    try {
+      // Pre-existing settings.json with permissions, env, statusLine, mcpServers,
+      // and an UNRELATED Stop hook plus a legacy guard.py hook.
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      const original = {
+        permissions: { allow: ["Bash(npm test)"] },
+        env: { FOO: "bar" },
+        statusLine: { type: "command", command: "my-status" },
+        mcpServers: { example: { command: "x" } },
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                { type: "command", command: "node other-tool.js" },
+                { type: "command", command: "python guard.py --event stop" },
+              ],
+            },
+          ],
+        },
+      };
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify(original, null, 2)
+      );
+
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const merged = JSON.parse(
+        await rf(join(cwd, ".claude", "settings.json"), "utf8")
+      );
+
+      // Every unrelated top-level key is preserved untouched.
+      assert.deepEqual(merged.permissions, original.permissions, "permissions preserved");
+      assert.deepEqual(merged.env, original.env, "env preserved");
+      assert.deepEqual(merged.statusLine, original.statusLine, "statusLine preserved");
+      assert.deepEqual(merged.mcpServers, original.mcpServers, "mcpServers preserved");
+
+      // The unrelated Stop hook ("node other-tool.js") survives.
+      const stopCommands = merged.hooks.Stop.flatMap((g) =>
+        (g.hooks || []).map((h) => h.command)
+      );
+      assert.ok(
+        stopCommands.some((c) => c.includes("other-tool.js")),
+        "unrelated Stop hook must be preserved"
+      );
+
+      // The legacy guard.py hook is STRIPPED.
+      assert.ok(
+        !stopCommands.some((c) => c.includes("guard.py")),
+        "legacy guard.py hook must be stripped"
+      );
+
+      // Our Stop + SessionStart hooks are present exactly once.
+      const allCommands = [
+        ...merged.hooks.SessionStart.flatMap((g) => (g.hooks || []).map((h) => h.command)),
+        ...stopCommands,
+      ];
+      const ourStop = allCommands.filter(
+        (c) => c.includes("adversarial-review") && c.includes("--event stop")
+      );
+      const ourStart = allCommands.filter(
+        (c) => c.includes("adversarial-review") && c.includes("--event session-start")
+      );
+      assert.equal(ourStop.length, 1, "exactly one adversarial-review Stop hook");
+      assert.equal(ourStart.length, 1, "exactly one adversarial-review SessionStart hook");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("re-install is idempotent: no duplicate adversarial-review hook entries", async () => {
+    const cwd = await tmpDir("ar-install-idem-");
+    const home = await tmpDir("ar-install-idem-home-");
+    try {
+      const { io: io1 } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io1
+      );
+      assert.equal(process.exitCode, 0);
+
+      // Second install — must not duplicate our hook entries.
+      const { io: io2, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io2
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const merged = JSON.parse(
+        await rf(join(cwd, ".claude", "settings.json"), "utf8")
+      );
+      const stop = merged.hooks.Stop.flatMap((g) => (g.hooks || []).map((h) => h.command));
+      const start = merged.hooks.SessionStart.flatMap((g) =>
+        (g.hooks || []).map((h) => h.command)
+      );
+      assert.equal(
+        stop.filter((c) => c.includes("adversarial-review")).length,
+        1,
+        "exactly one Stop entry after re-install"
+      );
+      assert.equal(
+        start.filter((c) => c.includes("adversarial-review")).length,
+        1,
+        "exactly one SessionStart entry after re-install"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("backs up a corrupt settings.json to settings.json.bak before merging", async () => {
+    const cwd = await tmpDir("ar-install-corrupt-");
+    const home = await tmpDir("ar-install-corrupt-home-");
+    try {
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(join(cwd, ".claude", "settings.json"), "{ not valid json ");
+
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      // A .bak was created with the corrupt original; the new settings.json is valid.
+      assert.ok(
+        existsSync(join(cwd, ".claude", "settings.json.bak")),
+        "corrupt settings.json must be backed up to settings.json.bak"
+      );
+      const { readFile: rf } = await import("node:fs/promises");
+      const merged = JSON.parse(
+        await rf(join(cwd, ".claude", "settings.json"), "utf8")
+      );
+      assert.ok(merged.hooks.Stop, "merged settings must have our Stop hook");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX C: installed hooks carry timeouts + statusMessages.
+  // -------------------------------------------------------------------------
+  it("installed Stop hook has timeout:300 and SessionStart has timeout:60", async () => {
+    const cwd = await tmpDir("ar-install-timeout-");
+    const home = await tmpDir("ar-install-timeout-home-");
+    try {
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const merged = JSON.parse(
+        await rf(join(cwd, ".claude", "settings.json"), "utf8")
+      );
+      const stopLeaf = merged.hooks.Stop[0].hooks[0];
+      const startLeaf = merged.hooks.SessionStart[0].hooks[0];
+      assert.equal(stopLeaf.timeout, 300, "Stop hook timeout must be 300");
+      assert.equal(startLeaf.timeout, 60, "SessionStart hook timeout must be 60");
+      assert.match(stopLeaf.statusMessage, /review gate/i);
+      assert.match(startLeaf.statusMessage, /baseline/i);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX B (HIGH): --user / --global writes machine-wide config + merges hooks
+  // into <home>/.claude/settings.json (NOT cwd).
+  // -------------------------------------------------------------------------
+  it("--user writes config + hooks under home, not cwd", async () => {
+    const cwd = await tmpDir("ar-install-user-");
+    const home = await tmpDir("ar-install-user-home-");
+    try {
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--user", "--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      // Config + settings written under HOME.
+      assert.ok(
+        existsSync(join(home, ".adversarial-review", "config.json")),
+        "user config must be written under home"
+      );
+      assert.ok(
+        existsSync(join(home, ".claude", "settings.json")),
+        "user settings.json must be written under home"
+      );
+      // NOT under cwd.
+      assert.ok(
+        !existsSync(join(cwd, ".adversarial-review", "config.json")),
+        "user scope must NOT write project config under cwd"
+      );
+      assert.ok(
+        !existsSync(join(cwd, ".claude", "settings.json")),
+        "user scope must NOT write settings under cwd"
+      );
+
+      // The machine-wide config explicitly includes policy.mode and reviewers.
+      const { readFile: rf } = await import("node:fs/promises");
+      const cfg = JSON.parse(
+        await rf(join(home, ".adversarial-review", "config.json"), "utf8")
+      );
+      assert.ok(typeof cfg.policy?.mode === "string", "user config must include policy.mode");
+      assert.ok(cfg.reviewers && typeof cfg.reviewers === "object", "user config must include reviewers block");
+
+      // The registry entry is keyed by the (normalized) home dir with scope:user.
+      const reg = JSON.parse(
+        await rf(join(home, ".adversarial-review", "install.json"), "utf8")
+      );
+      const entries = Object.values(reg);
+      assert.ok(entries.some((e) => e.scope === "user"), "registry must record a user-scope entry");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX F.1: project config + .claude/settings.json are written mode 0o644;
+  // the user registry stays 0o600. (POSIX only — Windows ignores POSIX modes.)
+  // -------------------------------------------------------------------------
+  it("writes project config + settings.json 0o644 and registry 0o600 (POSIX)", async () => {
+    if (process.platform === "win32") return; // Windows does not honor POSIX modes.
+    const cwd = await tmpDir("ar-install-mode-");
+    const home = await tmpDir("ar-install-mode-home-");
+    try {
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const cfgStat = await stat(join(cwd, ".adversarial-review", "config.json"));
+      const settingsStat = await stat(join(cwd, ".claude", "settings.json"));
+      const regStat = await stat(join(home, ".adversarial-review", "install.json"));
+      assert.equal(cfgStat.mode & 0o777, 0o644, "config.json must be 0o644");
+      assert.equal(settingsStat.mode & 0o777, 0o644, "settings.json must be 0o644");
+      assert.equal(regStat.mode & 0o777, 0o600, "install.json must be 0o600");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });

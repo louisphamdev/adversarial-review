@@ -42,10 +42,9 @@ import { createStubs, makeJob } from "./stub-helper.js";
 // a wrapper script named "codex" (or codex.cmd on Windows) in the temp dir
 // that delegates to the stub.
 
-import { mkdtemp, writeFile, readFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolveExecutable } from "../../src/core/process.js";
-import { buildVerdictOutput } from "./stub-helper.js";
+import { buildVerdictOutput, createToolShim } from "./stub-helper.js";
 
 /**
  * Build a codex stub that reads the prompt from stdin, extracts the diff path
@@ -79,49 +78,12 @@ process.stdin.on("end", () => {
 }
 
 /**
- * Create a "codex" shim in a temp dir that runs a specific stub script.
- * Returns { dir, env, cleanup }.
- *
- * On Windows we create codex.cmd; on other platforms a shell script named codex.
- *
- * The shim forwards all args to: node <stubPath> <...args>
- * But the codex adapter builds its own args, so we just want the shim to
- * ignore the args and run the stub directly.
+ * Create a "codex" shim that runs a specific stub script. The codex adapter
+ * builds its own args, so the shim IGNORES the forwarded args (forwardArgs:false)
+ * and runs the stub directly. Delegates to the shared createToolShim helper.
  */
-async function createCodexShim(stubPath) {
-  const shimDir = await mkdtemp(join(tmpdir(), "ar-shim-"));
-
-  let shimFile;
-  if (process.platform === "win32") {
-    shimFile = join(shimDir, "codex.cmd");
-    // On Windows, cmd shim that calls node with the stub script and ignores adapter args.
-    await writeFile(shimFile, `@"${process.execPath}" "${stubPath}"\r\n`);
-  } else {
-    shimFile = join(shimDir, "codex");
-    await writeFile(shimFile, `#!/bin/sh\nexec "${process.execPath}" "${stubPath}"\n`, { mode: 0o755 });
-  }
-
-  // DETERMINISM: prepend this test's UNIQUE shim dir to PATH so
-  // resolveExecutable("codex") resolves THIS test's shim first — never a real
-  // `codex` on the machine PATH nor another test's shim, even under parallel
-  // `node --test`. The original system PATH is kept AFTER the shim dir only so
-  // the cmd.exe wrapper used for .cmd shims on Windows still resolves; because
-  // the shim dir is first, it always wins the `codex`/`codex.cmd` lookup.
-  const env = {
-    ...process.env,
-    PATH: shimDir + (process.env.PATH ? (process.platform === "win32" ? ";" : ":") + process.env.PATH : ""),
-    PATHEXT: process.platform === "win32" ? ".CMD" : undefined,
-  };
-  // Remove undefined keys
-  for (const k of Object.keys(env)) {
-    if (env[k] === undefined) delete env[k];
-  }
-
-  return {
-    dir: shimDir,
-    env,
-    cleanup: () => rm(shimDir, { recursive: true, force: true }),
-  };
+function createCodexShim(stubPath) {
+  return createToolShim("codex", stubPath, { forwardArgs: false });
 }
 
 // ---------------------------------------------------------------------------

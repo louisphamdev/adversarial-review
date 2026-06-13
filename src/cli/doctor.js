@@ -11,31 +11,44 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { HOSTS } from "../hosts/index.js";
 import { createReviewer } from "../reviewers/index.js";
-import { loadEffectiveConfig } from "../core/load-config.js";
+import { loadEffectiveConfig, resolveHomeDir } from "../core/load-config.js";
+import { detectClaudeCodeHooks, claudeCodeSettingsPath } from "../hosts/claude-code.js";
 
 // Paths relative to home / cwd.
 const PROJECT_CONFIG_REL = path.join(".adversarial-review", "config.json");
 const USER_CONFIG_REL = path.join(".adversarial-review", "config.json");
 const USER_POLICY_REL = path.join(".adversarial-review", "policy.json");
+const OPENCODE_AGENT_REL = path.join(
+  ".config",
+  "opencode",
+  "agent",
+  "adversarial-reviewer.md"
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Resolve home from env, falling back to os.homedir(). Honors
- * ADVERSARIAL_REVIEW_HOME so doctor reports the SAME user-level base that
- * loadEffectiveConfig (the gate's loader) uses. */
-function homeDir(env) {
-  if (env) {
-    const fromEnv = env.ADVERSARIAL_REVIEW_HOME || env.HOME || env.USERPROFILE;
-    if (fromEnv) return fromEnv;
+/**
+ * Read + tolerantly parse a Claude Code settings.json. Returns {} on any error
+ * (missing or corrupt) so the hook-presence detection never throws.
+ *
+ * @param {string} filePath
+ * @returns {Promise<object>}
+ */
+async function readSettingsTolerant(filePath) {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    return {};
+  } catch {
+    return {};
   }
-  return os.homedir();
 }
 
 /** Read package.json to get the package version. */
@@ -77,7 +90,7 @@ export async function doctorCommand(argv, io) {
   const json = argv.includes("--json");
   const cwd = io.cwd || process.cwd();
   const env = io.env || process.env;
-  const home = homeDir(env);
+  const home = resolveHomeDir(env);
 
   // Read package version.
   const version = await readPackageVersion();
@@ -110,6 +123,23 @@ export async function doctorCommand(argv, io) {
   // hosts.)
   const effectiveConfig = await loadEffectiveConfig(cwd, io);
 
+  // For native hosts (claude-code) detect whether OUR SessionStart + Stop hooks
+  // are actually registered in the relevant .claude/settings.json — at BOTH
+  // project (<cwd>/.claude) and user (<home>/.claude) scope. A configured host
+  // whose hooks are missing means the gate would never fire.
+  const projectSettingsPath = claudeCodeSettingsPath(cwd);
+  const userSettingsPath = claudeCodeSettingsPath(home);
+  const projectHooks = detectClaudeCodeHooks(
+    await readSettingsTolerant(projectSettingsPath)
+  );
+  const userHooks = detectClaudeCodeHooks(
+    await readSettingsTolerant(userSettingsPath)
+  );
+
+  // opencode read-only agent presence (machine-wide, under <home>).
+  const opencodeAgentPath = path.join(home, OPENCODE_AGENT_REL);
+  const opencodeAgentExists = existsSync(opencodeAgentPath);
+
   // Enumerate configured hosts.
   const configuredHostIds = Object.keys(effectiveConfig.hosts || {});
   const hostReports = [];
@@ -135,6 +165,54 @@ export async function doctorCommand(argv, io) {
       reviewerNote: reviewerResult.note || null,
       reviewerReason: reviewerResult.reason || null,
     };
+
+    // For claude-code, report whether our native hooks are registered. We treat
+    // the host as "registered" if BOTH SessionStart + Stop are present at EITHER
+    // scope (project or user), since a user-scope install also covers this cwd.
+    if (hostId === "claude-code") {
+      const projectRegistered = projectHooks.sessionStart && projectHooks.stop;
+      const userRegistered = userHooks.sessionStart && userHooks.stop;
+      hostReport.hooks = {
+        projectSettingsPath,
+        userSettingsPath,
+        project: projectHooks,
+        user: userHooks,
+        registered: projectRegistered || userRegistered,
+      };
+      if (!hostReport.hooks.registered) {
+        warnings.push(
+          `WARNING: Host "claude-code" is configured but our SessionStart + Stop ` +
+            `hooks are NOT registered in ${projectSettingsPath} (project) or ` +
+            `${userSettingsPath} (user). Run \`adversarial-review install\` to register them.`
+        );
+      }
+    }
+
+    // For an opencode reviewer, report whether the read-only agent exists and
+    // whether reviewers.opencode.readOnlyConfig is set — the two settings the
+    // README promises and that enforced-mode isolation depends on.
+    if (reviewerId === "opencode") {
+      const readOnlyConfig =
+        effectiveConfig.reviewers?.opencode?.readOnlyConfig === true;
+      hostReport.opencode = {
+        agentPath: opencodeAgentPath,
+        agentExists: opencodeAgentExists,
+        readOnlyConfig,
+      };
+      if (!opencodeAgentExists) {
+        warnings.push(
+          `WARNING: opencode reviewer for host "${hostId}" but the read-only agent ` +
+            `is MISSING at ${opencodeAgentPath}. Run \`adversarial-review install\` to create it.`
+        );
+      }
+      if (!readOnlyConfig) {
+        warnings.push(
+          `WARNING: reviewers.opencode.readOnlyConfig is not set for host "${hostId}". ` +
+            `Enforced-mode isolation (readOnly && noEdit) will fail without it.`
+        );
+      }
+    }
+
     hostReports.push(hostReport);
 
     // Warn about wrapper/advisory hosts.
@@ -246,6 +324,25 @@ function printHumanReport(report, io) {
         }
       } else {
         w(`    reviewer status: UNAVAILABLE (${h.reviewerReason || "unknown"})\n`);
+      }
+      // Native hook registration (claude-code only).
+      if (h.hooks) {
+        w(
+          `    native hooks registered: ${h.hooks.registered ? "yes" : "NO"}\n`
+        );
+        w(
+          `      project (${h.hooks.projectSettingsPath}): ` +
+            `SessionStart=${h.hooks.project.sessionStart} Stop=${h.hooks.project.stop}\n`
+        );
+        w(
+          `      user (${h.hooks.userSettingsPath}): ` +
+            `SessionStart=${h.hooks.user.sessionStart} Stop=${h.hooks.user.stop}\n`
+        );
+      }
+      // opencode reviewer details.
+      if (h.opencode) {
+        w(`    opencode agent exists: ${h.opencode.agentExists ? "yes" : "NO"} (${h.opencode.agentPath})\n`);
+        w(`    opencode readOnlyConfig: ${h.opencode.readOnlyConfig}\n`);
       }
     }
   }

@@ -21,9 +21,11 @@ import { createAdapter as createCustomAdapter } from "./custom.js";
  * The adapter contract returned by each createAdapter() function:
  *
  * @typedef {object} ReviewerAdapter
- * @property {string}   id               - reviewer identifier
- * @property {Function} verify(env)      - check binary availability & version
- * @property {Function} run(job, io)     - run a review job; return gate result
+ * @property {string}   id                       - reviewer identifier
+ * @property {Function} verify(env, options?)     - check binary availability &
+ *           version; options may carry { requireAgent } (opencode honors it,
+ *           other adapters accept-and-ignore it for call-site uniformity)
+ * @property {Function} run(job, io)             - run a review job; return gate result
  */
 
 // ---------------------------------------------------------------------------

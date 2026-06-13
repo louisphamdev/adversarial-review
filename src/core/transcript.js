@@ -2,16 +2,11 @@
 // Ports the Python functions from hooks/guard.py:
 //   - ts_key         -> tsKey
 //   - iter_tool_uses -> iterToolUses (inline)
-//   - completed_tool_ids -> completedToolIds (inline in scanKeys)
-//   - scan_keys      -> scanKeys
+//   - completed_tool_ids -> completedToolIds (inline in collectReviewOutputs)
+//   - scan_keys      -> scanKeys (edit evidence only)
 //   - is_subagent    -> isSubagentTranscript
 //   - last_user_text -> lastUserText
 //   - wants_skip     -> wantsSkip
-
-// Sentinels must match guard.py exactly so that review-task detection is
-// consistent between the Python and Node code paths.
-export const GATE_SENTINEL = "adversarial-review-gate";
-export const DEBATE_SENTINEL = "adversarial-debate-gate";
 
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const REVIEW_TOOLS = new Set(["Task", "Agent"]);
@@ -108,36 +103,21 @@ export function tsKey(s) {
 // ---- scanKeys ---------------------------------------------------------------
 
 /**
- * Scan JSONL transcript entries and return edit/review ordering keys plus the
- * set of file paths touched by edit tools.
+ * Scan JSONL transcript entries for edit evidence: the timestamp of the most
+ * recent edit tool-use and the set of file paths touched by edit tools.
  *
- * Mirrors Python's scan_keys() in guard.py exactly:
- *   - Edit tools: Edit, Write, MultiEdit, NotebookEdit
- *   - Review tools: Task, Agent  (counted only when sentinel present AND
- *     the call ran to completion, i.e. has a matching tool_result)
+ * Edit tools: Edit, Write, MultiEdit, NotebookEdit.
+ *
+ * Review-task detection is intentionally NOT done here. Acceptance of a prior
+ * review is verdict-based (collectReviewOutputs + parseVerdict in gate.js), so
+ * the old sentinel-matched lastReviewKey/lastDebateKey ordering keys have been
+ * removed — no production caller consumed them.
  *
  * @param {object[]} entries  Parsed transcript entries
- * @returns {{ lastEditKey: number, lastReviewKey: number, lastDebateKey: number, editedPaths: Set<string> }}
+ * @returns {{ lastEditKey: number, editedPaths: Set<string> }}
  */
 export function scanKeys(entries) {
-  // Collect tool_use ids that have a corresponding tool_result (completed calls).
-  const completed = new Set();
-  for (const e of entries) {
-    const msg = e?.message;
-    if (!msg || typeof msg !== "object") continue;
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-    for (const blk of content) {
-      if (blk && typeof blk === "object" && blk.type === "tool_result") {
-        const tid = blk.tool_use_id;
-        if (tid) completed.add(tid);
-      }
-    }
-  }
-
   let lastEditKey = 0;
-  let lastReviewKey = 0;
-  let lastDebateKey = 0;
   const editedPaths = new Set();
 
   for (const e of entries) {
@@ -151,7 +131,6 @@ export function scanKeys(entries) {
       if (!blk || typeof blk !== "object" || blk.type !== "tool_use") continue;
       const name = blk.name || "";
       const inp = blk.input || {};
-      const tid = blk.id || "";
 
       if (EDIT_TOOLS.has(name)) {
         if (key > lastEditKey) lastEditKey = key;
@@ -161,23 +140,11 @@ export function scanKeys(entries) {
             if (typeof p === "string" && p) editedPaths.add(p);
           }
         }
-      } else if (REVIEW_TOOLS.has(name) && completed.has(tid)) {
-        // Serialize the input to a lowercase string and check for sentinels.
-        const blob =
-          typeof inp === "object"
-            ? JSON.stringify(inp).toLowerCase()
-            : String(inp).toLowerCase();
-        if (blob.includes(GATE_SENTINEL) && key > lastReviewKey) {
-          lastReviewKey = key;
-        }
-        if (blob.includes(DEBATE_SENTINEL) && key > lastDebateKey) {
-          lastDebateKey = key;
-        }
       }
     }
   }
 
-  return { lastEditKey, lastReviewKey, lastDebateKey, editedPaths };
+  return { lastEditKey, editedPaths };
 }
 
 // ---- collectReviewOutputs ---------------------------------------------------

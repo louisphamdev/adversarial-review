@@ -1,4 +1,4 @@
-const COMMANDS = new Set(["install", "check", "hook", "run", "doctor", "help"]);
+const COMMANDS = new Set(["install", "uninstall", "check", "hook", "run", "doctor", "help"]);
 
 export async function main(argv, io) {
   const [cmd = "help", ...rest] = argv;
@@ -28,6 +28,10 @@ export async function main(argv, io) {
     const { runCommand } = await import("./run.js");
     return runCommand(rest, io);
   }
+  if (cmd === "uninstall") {
+    const { uninstallCommand } = await import("./uninstall.js");
+    return uninstallCommand(rest, io);
+  }
   const { installCommand } = await import("./install.js");
   return installCommand(rest, io);
 }
@@ -38,6 +42,7 @@ export function helpText() {
     "",
     "Commands:",
     "  install   Install host integrations and project config",
+    "  uninstall Remove our host hooks and registry entry (keeps shared agent)",
     "  check     Run the review gate on the current workspace",
     "  hook      Run as a native host lifecycle hook",
     "  run       Wrap a host tool command and gate after it exits",

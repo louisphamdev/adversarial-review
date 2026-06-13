@@ -72,7 +72,7 @@ async function readJsonTolerant(file, io, label) {
  * @returns {Promise<object>} resolved config
  */
 export async function loadEffectiveConfig(cwd, io = {}) {
-  const home = homeDir(io.env);
+  const home = resolveHomeDir(io.env);
   const userConfig = await readJsonTolerant(
     path.join(home, USER_CONFIG_REL),
     io,
@@ -115,16 +115,25 @@ export async function loadEffectiveConfig(cwd, io = {}) {
 export function resolveStateDir(env = process.env) {
   const override = env && env.ADVERSARIAL_REVIEW_STATE_DIR;
   if (override) return path.resolve(override);
-  return path.join(homeDir(env), ".adversarial-review", "state");
+  return path.join(resolveHomeDir(env), ".adversarial-review", "state");
 }
 
-// Resolve the user's home directory, honoring an injected env so tests can
-// redirect the user-level base (config.json, policy.json, state dir) without
-// touching the real home dir. Priority:
-//   1. ADVERSARIAL_REVIEW_HOME — dedicated override for the user-level base;
-//   2. HOME / USERPROFILE — standard OS home env vars;
-//   3. os.homedir() — the real home dir.
-function homeDir(env) {
+/**
+ * Resolve the user's home directory, honoring an injected env so tests can
+ * redirect the user-level base (config.json, policy.json, state dir, install
+ * registry, opencode agent) without touching the real home dir.
+ *
+ * This is the SINGLE shared resolver imported by install.js and doctor.js so
+ * the installer/doctor write/read the SAME user-level base the gate later uses.
+ * Priority:
+ *   1. ADVERSARIAL_REVIEW_HOME — dedicated override for the user-level base;
+ *   2. HOME / USERPROFILE — standard OS home env vars;
+ *   3. os.homedir() — the real home dir.
+ *
+ * @param {object} [env]  - environment variables
+ * @returns {string} absolute home dir path
+ */
+export function resolveHomeDir(env) {
   if (env) {
     const fromEnv = env.ADVERSARIAL_REVIEW_HOME || env.HOME || env.USERPROFILE;
     if (fromEnv) return fromEnv;

@@ -7,15 +7,21 @@
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import { resolveExecutable, spawnResolved } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
+import {
+  collectOutput,
+  waitForExit,
+  runWithTimeout,
+  TIMEOUT_SENTINEL,
+  DEFAULT_TIMEOUT_SEC,
+} from "./_shared.js";
 
-// Default timeout in seconds when neither config nor job specifies one.
-const DEFAULT_TIMEOUT_SEC = 120;
-
-// Maximum stdout bytes captured from the reviewer process.
-const MAX_OUTPUT_BYTES = 1024 * 1024;
+// The bundled, read-only opencode agent that delivers reviewer isolation. In
+// enforced / strict-ci modes this name is ALWAYS used: a project-supplied agent
+// name is IGNORED so a malicious project config cannot redirect the enforced
+// gate to a writable agent while still passing the isolation check.
+const BUNDLED_READONLY_AGENT = "adversarial-reviewer";
 
 // Warning opencode prints (to stderr) when it cannot use the requested agent and
 // silently falls back to the full-permission default agent. opencode emits this
@@ -54,110 +60,10 @@ function buildBrief(job) {
 }
 
 /**
- * Collect stdout from a child process up to MAX_OUTPUT_BYTES, then resolve.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<string>}
- */
-function collectOutput(child) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalBytes = 0;
-    let truncated = false;
-
-    child.stdout.on("data", (chunk) => {
-      if (truncated) return;
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_OUTPUT_BYTES) {
-        truncated = true;
-        chunks.push(chunk.slice(0, chunk.length - (totalBytes - MAX_OUTPUT_BYTES)));
-      } else {
-        chunks.push(chunk);
-      }
-    });
-
-    child.on("error", reject);
-    child.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
-}
-
-/**
- * Collect stderr from a child process up to MAX_OUTPUT_BYTES, then resolve.
- *
- * stderr is needed to detect the silent agent-fallback warning opencode prints
- * when the configured read-only agent is missing.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<string>}
- */
-function collectStderr(child) {
-  return new Promise((resolve) => {
-    if (!child.stderr) {
-      resolve("");
-      return;
-    }
-    const chunks = [];
-    let totalBytes = 0;
-    let truncated = false;
-
-    child.stderr.on("data", (chunk) => {
-      if (truncated) return;
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_OUTPUT_BYTES) {
-        truncated = true;
-        chunks.push(chunk.slice(0, chunk.length - (totalBytes - MAX_OUTPUT_BYTES)));
-      } else {
-        chunks.push(chunk);
-      }
-    });
-
-    // Resolve on close OR error so a failed spawn never hangs this promise.
-    child.on("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    child.on("error", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
-}
-
-/**
- * Wait for a child process to exit and return its exit code.
- *
- * @param {import("node:child_process").ChildProcess} child
- * @returns {Promise<number|null>}
- */
-function waitForExit(child) {
-  return new Promise((resolve) => {
-    child.on("close", (code) => resolve(code));
-    child.on("error", () => resolve(null));
-  });
-}
-
-/**
- * Kill a child process tree as forcefully as possible.
- * On Windows, cmd.exe /c wrappers spawn node as a child; use taskkill /F /T
- * to terminate the entire process tree.
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function forceKill(child) {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } else {
-      child.kill("SIGTERM");
-    }
-  } catch { /* ignore */ }
-}
-
-// Sentinel value returned by the timeout race arm.
-const TIMEOUT_SENTINEL = Symbol("timeout");
-
-/**
  * Create an opencode reviewer adapter.
  *
  * @param {object} config  - full effective config
- * @returns {{ id: string, verify(env): Promise, run(job, io): Promise }}
+ * @returns {{ id: string, verify(env, options?): Promise, run(job, io): Promise }}
  */
 export function createAdapter(config) {
   const reviewerConfig = config?.reviewers?.opencode || {};
@@ -165,9 +71,27 @@ export function createAdapter(config) {
   // The readOnly capability is asserted when the config explicitly uses the
   // bundled read-only opencode configuration.
   const usesBundledReadOnlyConfig = reviewerConfig.readOnlyConfig === true;
-  // The read-only agent that delivers isolation. Configurable so projects can
-  // ship their own bundled read-only agent definition.
-  const agent = reviewerConfig.agent || "adversarial-reviewer";
+
+  // SECURITY (Layer A — enforced isolation cannot be decoupled from the agent):
+  // `reviewerConfig.agent` is PROJECT-CONFIG-CONTROLLED. In enforced / strict-ci
+  // we MUST ignore it and always run the bundled read-only agent — otherwise a
+  // malicious project config could point `agent` at a WRITABLE opencode agent
+  // while `readOnlyConfig:true` made verify() report readOnly/noEdit true, so the
+  // enforced isolation gate would pass yet a writable agent would actually run.
+  // In soft mode a custom agent name may be honored (with capabilities reflecting
+  // reality). The SAME effective agent is used in BOTH verify() (the agent-list
+  // existence check) and run() (--agent) so a doctor/runtime caller cannot be
+  // redirected.
+  const mode = config?.policy?.mode;
+  const enforced = mode === "enforced" || mode === "strict-ci";
+  const effectiveAgent = enforced
+    ? BUNDLED_READONLY_AGENT
+    : (reviewerConfig.agent || BUNDLED_READONLY_AGENT);
+
+  // Isolation (readOnly/noEdit) is only real when the read-only config is in
+  // effect AND the agent actually used is the bundled read-only agent. A custom
+  // agent name (honored only in soft mode) carries no isolation guarantee.
+  const isolated = usesBundledReadOnlyConfig && effectiveAgent === BUNDLED_READONLY_AGENT;
 
   return {
     id: "opencode",
@@ -179,7 +103,7 @@ export function createAdapter(config) {
      * Two-phase verification:
      *  - BINARY (always): the `opencode` binary resolves on PATH and answers
      *    `--version` with exit 0. This is the "is the tool installed" check.
-     *  - AGENT (optional, default ON): the configured read-only agent exists in
+     *  - AGENT (optional, default ON): the EFFECTIVE read-only agent exists in
      *    `opencode agent list`. This is the "can it run isolated NOW" check.
      *
      * The agent phase must be SKIPPABLE because of a chicken-and-egg at install
@@ -215,10 +139,12 @@ export function createAdapter(config) {
         return { ok: false, reason: "version_check_error" };
       }
 
-      // Confirm the configured read-only agent actually exists. opencode SILENTLY
+      // Confirm the EFFECTIVE read-only agent actually exists. opencode SILENTLY
       // falls back to the full-permission default agent when the requested agent
       // is missing, so a read-only gate cannot deliver isolation without it.
-      // Run `opencode agent list` and require the agent name to appear.
+      // Run `opencode agent list` and require the EFFECTIVE agent name to appear
+      // — the same name run() will pass via --agent, so verify cannot be tricked
+      // into approving an agent run() won't actually use.
       //
       // SKIPPED when requireAgent:false (install time): the installer creates the
       // agent, so a missing agent here is expected and must not block install.
@@ -232,7 +158,7 @@ export function createAdapter(config) {
           if (code !== 0) {
             return { ok: false, reason: "agent_list_failed" };
           }
-          if (!agentOutput.includes(agent)) {
+          if (!agentOutput.includes(effectiveAgent)) {
             return { ok: false, reason: "reviewer_agent_missing" };
           }
         } catch {
@@ -245,11 +171,12 @@ export function createAdapter(config) {
         resolvedPath,
         version: versionOutput,
         capabilities: {
-          readOnly: usesBundledReadOnlyConfig,
-          // Isolation (noEdit) is delivered by the bundled read-only agent the
-          // user configures; only assert it when that config is in effect so the
-          // gate's enforced isolation check (readOnly && noEdit) reflects reality.
-          noEdit: usesBundledReadOnlyConfig,
+          // readOnly/noEdit are only asserted when the read-only config is in
+          // effect AND the EFFECTIVE agent is the bundled read-only agent, so the
+          // gate's enforced isolation check (readOnly && noEdit) can never pass
+          // for a project-supplied writable agent.
+          readOnly: isolated,
+          noEdit: isolated,
           ephemeral: false,
         },
       };
@@ -258,7 +185,7 @@ export function createAdapter(config) {
     /**
      * Run the opencode reviewer on a review job.
      *
-     * Command: opencode run --pure --agent <agent> -f <diffPath>
+     * Command: opencode run --pure --agent <effectiveAgent> -f <diffPath>
      *          (the brief is delivered via the child's STDIN, never as an arg)
      *
      * @param {object} job  - review job descriptor
@@ -300,12 +227,17 @@ export function createAdapter(config) {
         // STDIN. Every arg handed to spawnResolved is a flag or an mkdtemp diff
         // path — none free-text.
         //
-        // Command: opencode run --pure --agent <agent> -f <diffPath>
+        // SECURITY (Layer A): the --agent value is the EFFECTIVE agent, which in
+        // enforced / strict-ci is ALWAYS the bundled read-only agent regardless of
+        // any project-supplied agent name. This is the same name verify() asserted
+        // exists, so the run cannot be redirected to a writable agent.
+        //
+        // Command: opencode run --pure --agent <effectiveAgent> -f <diffPath>
         //          (prompt/brief delivered via stdin)
         const args = [
           "run",
           "--pure",
-          "--agent", agent,
+          "--agent", effectiveAgent,
           "-f", diffPath,
         ];
 
@@ -322,56 +254,66 @@ export function createAdapter(config) {
           return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
         }
         if (child.stdin) {
+          // ROBUSTNESS: a child that exits early closes its stdin, so the
+          // subsequent end(brief) write triggers an EPIPE 'error' event. Without
+          // a listener that error is unhandled and crashes the gate process.
+          // Attach a no-op handler so an early-exit child is handled gracefully.
+          child.stdin.on("error", () => { /* ignore EPIPE on early child exit */ });
           child.stdin.end(brief);
         }
 
         // Race the process completion against the timeout. Capture stderr too so
         // we can detect the silent agent-fallback warning.
-        const processPromise = Promise.all([
-          collectOutput(child),
-          collectStderr(child),
-          waitForExit(child),
-        ]);
-        const timeoutPromise = new Promise((resolve) =>
-          setTimeout(() => resolve(TIMEOUT_SENTINEL), effectiveTimeout)
-        );
-
-        const raceResult = await Promise.race([processPromise, timeoutPromise]);
+        const raceResult = await runWithTimeout(child, {
+          timeoutMs: effectiveTimeout,
+          captureStderr: true,
+        });
 
         if (raceResult === TIMEOUT_SENTINEL) {
-          forceKill(child);
           return { ok: false, error: "timeout" };
         }
 
-        const [stdout, stderr, exitCode] = raceResult;
+        const { stdout, stderr, exitCode } = raceResult;
 
         // SECURITY: opencode silently falls back to the full-permission DEFAULT
         // agent when the requested read-only agent is missing, printing a warning
         // to stderr. NEVER accept a review from the fallback agent — treat it as an
-        // operational failure even if a verdict block was printed.
+        // operational failure even if a verdict block was printed. This check runs
+        // BEFORE accepting any verdict so a fallback-agent review is always rejected.
         if (
           stderr.includes(AGENT_FALLBACK_MARKER) ||
-          stderr.includes(`agent "${agent}" not found`)
+          stderr.includes(`agent "${effectiveAgent}" not found`)
         ) {
           return { ok: false, error: "reviewer_agent_fallback" };
         }
 
-        if (exitCode !== 0) {
-          return { ok: false, error: `nonzero_exit:${exitCode}` };
-        }
-
-        if (!stdout) {
-          return { ok: false, error: "empty_output" };
-        }
-
-        // Parse the verdict from stdout.
-        const parsed = parseVerdict(stdout, job);
-        if (!parsed.ok) {
+        // ROBUSTNESS: PARSE stdout for a valid verdict BEFORE consulting the exit
+        // code. Real CLIs frequently print a perfectly valid verdict block and
+        // STILL exit nonzero (review found issues, telemetry/cleanup hiccup, etc).
+        // Returning nonzero_exit first would drop that valid verdict. So: if a
+        // valid verdict is present, honor it regardless of exit code; only return
+        // nonzero_exit / empty_output when NO valid verdict was produced. (The
+        // fallback-agent check above already ran, so an accepted verdict can never
+        // be from the writable default agent.)
+        if (stdout) {
+          const parsed = parseVerdict(stdout, job);
+          if (parsed.ok) {
+            // A valid fail verdict is NOT an operational failure.
+            return { ok: true, verdict: parsed.verdict };
+          }
+          // No valid verdict: surface the exit code first (more actionable than a
+          // parse error), else the parse failure reason.
+          if (exitCode !== 0) {
+            return { ok: false, error: `nonzero_exit:${exitCode}` };
+          }
           return { ok: false, error: parsed.error };
         }
 
-        // A valid fail verdict is NOT an operational failure.
-        return { ok: true, verdict: parsed.verdict };
+        // No stdout at all.
+        if (exitCode !== 0) {
+          return { ok: false, error: `nonzero_exit:${exitCode}` };
+        }
+        return { ok: false, error: "empty_output" };
       } finally {
         if (tempDir) {
           try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }

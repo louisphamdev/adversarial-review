@@ -1,5 +1,10 @@
 # adversarial-review
 
+[![npm version](https://img.shields.io/npm/v/adversarial-review-gate.svg)](https://www.npmjs.com/package/adversarial-review-gate)
+[![CI](https://github.com/louisphamdev/adversarial-review/actions/workflows/ci.yml/badge.svg)](https://github.com/louisphamdev/adversarial-review/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/adversarial-review-gate.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/adversarial-review-gate.svg)](https://nodejs.org)
+
 A NodeJS multi-tool adversarial review gate for coding agents.
 
 The gate stops a coding agent from finishing a turn when a significant code
@@ -29,20 +34,62 @@ npx adversarial-review-gate install \
 
 The installer detects available host and reviewer tools, verifies each reviewer
 binary (it must resolve on `PATH` and pass a version/auth check), and writes the
-project config plus any native host integration files. Run with no flags for the
-interactive wizard, or pass `--hosts`/`--reviewer` for a scripted setup.
+project config plus any native host integration files.
+
+`--hosts` and `--reviewer` are **required** — there is no interactive wizard
+(one may be added in a future release). Pass them explicitly for a scripted
+setup.
+
+What the installer writes for you (idempotent — it never clobbers a file you
+have customized):
+
+- The **project config** at `.adversarial-review/config.json` with the
+  host → reviewer mapping you chose.
+- For an **opencode** reviewer: the read-only `adversarial-reviewer` opencode
+  agent at `~/.config/opencode/agent/adversarial-reviewer.md` (skipped if it
+  already exists) **and** `reviewers.opencode.readOnlyConfig: true` in the
+  project config, so enforced-mode isolation passes out of the box.
+- For **Claude Code**: the native `SessionStart` + `Stop` hooks in
+  `.claude/settings.json`.
+- The user-level install registry at `~/.adversarial-review/install.json`.
 
 Supported flags (see `src/cli/install.js`):
 
 | Flag | Meaning |
 |---|---|
-| `--hosts a,b` | Comma-separated list of hosts to install (repeatable). |
-| `--reviewer host=reviewer` | Reviewer mapping for a host (repeatable). Use `host=none` for self-review. |
+| `--hosts a,b` | Comma-separated list of hosts to install (repeatable). **Required.** |
+| `--reviewer host=reviewer` | Reviewer mapping for a host (repeatable). Use `host=none` for self-review. **Required per host.** |
+| `--global` / `--user` | Machine-wide install: write the defaults to `~/.adversarial-review/config.json` and merge the Claude Code hooks into your user-level `~/.claude/settings.json` instead of the per-project files. |
 | `--dry-run` | Print every planned write and exit 0 without writing anything. |
 | `--project-config <path>` | Write the project config to an explicit path. |
 
-> There is no `--user-config` flag. The machine-wide defaults file below is
-> written/edited by hand — the installer does not generate it.
+### Machine-wide install
+
+To install once for **every** project on the machine, add `--global` (alias
+`--user`):
+
+```bash
+npx adversarial-review-gate install --global \
+  --hosts claude-code,codex \
+  --reviewer claude-code=opencode \
+  --reviewer codex=opencode
+```
+
+This writes the host/reviewer defaults to `~/.adversarial-review/config.json`
+and merges the Claude Code `SessionStart` + `Stop` hooks into your user-level
+`~/.claude/settings.json` (existing keys are preserved). New projects then
+inherit the gate without re-running install per project.
+
+### Uninstall
+
+```bash
+npx adversarial-review-gate uninstall          # remove the project install
+npx adversarial-review-gate uninstall --user   # remove the machine-wide install
+```
+
+`uninstall` removes the hooks this tool wrote (from the project or user
+`settings.json`) and the install-registry entry. Re-run `doctor` afterward to
+confirm the gate is no longer active.
 
 ### After install
 
@@ -55,13 +102,25 @@ project config validity, and the Claude Code session baseline.
 
 ### Machine-wide defaults
 
-A user-level `~/.adversarial-review/config.json` provides host/reviewer defaults
-that apply across **all** projects. Config is layered in this order, where each
-later layer overrides the earlier ones — except the policy floor, which can only
-ever tighten, never loosen:
+Two distinct user-level files shape every project on the machine:
+
+- **`~/.adversarial-review/config.json`** — the user **override layer**. It
+  provides host/reviewer defaults and policy that apply across **all** projects.
+  As a normal config layer it can either loosen **or** tighten relative to the
+  built-in defaults; a project config can in turn override it.
+- **`~/.adversarial-review/policy.json`** — the **policy floor**. It is
+  **tighten-only**: it can raise the minimum policy (e.g. force `enforced` or
+  `strict-ci`) but no later layer — user config or project config — can ever
+  loosen below it.
+
+Config is layered in this order, where each later layer overrides the earlier
+ones, and the policy floor is applied last and can only ever tighten:
 
 ```text
-DEFAULT_CONFIG  <  userConfig (~/.adversarial-review/config.json)  <  projectConfig (.adversarial-review/config.json)  <  policy floor
+DEFAULT_CONFIG
+  <  userConfig    (~/.adversarial-review/config.json)   # override layer (loosen or tighten)
+  <  projectConfig (.adversarial-review/config.json)     # override layer (loosen or tighten)
+  <  policyFloor   (~/.adversarial-review/policy.json)   # tighten-only, applied last
 ```
 
 Example `~/.adversarial-review/config.json`:
@@ -87,7 +146,8 @@ Example `~/.adversarial-review/config.json`:
 
 With this in place, a new project inherits the host/reviewer mapping and the
 `enforced` mode without re-running install per project. A project may still ship
-its own `.adversarial-review/config.json` to make policy **stricter** (see
+its own `.adversarial-review/config.json` to override these defaults, but it can
+never go below the policy floor in `~/.adversarial-review/policy.json` (see
 [Policy Modes](#policy-modes)).
 
 ---
@@ -135,8 +195,22 @@ explicitly `none`.
 Claude Code        -> codex        (external reviewer)
 Codex              -> opencode     (external reviewer)
 opencode           -> none         (self-review orchestration)
-GitHub Copilot CLI -> claude-code  (external reviewer, if available)
 ```
+
+The five hosts in the registry, with their enforcement and whether they can
+delegate to an **external** reviewer:
+
+| Host | Enforcement | External reviewer? |
+|---|---|---|
+| `claude-code` | native-enforced | yes |
+| `codex` | wrapper-enforced | yes |
+| `opencode` | wrapper-enforced | yes |
+| `github-copilot-cli` | wrapper-enforced | no — self-review (`none`) only |
+| `antigravity` | wrapper-enforced | no — self-review (`none`) only |
+
+`github-copilot-cli` and `antigravity` are marked `supportsExternalReview: false`
+in the registry, so they cannot be mapped to an external reviewer — use
+`--reviewer github-copilot-cli=none` (self-review orchestration) for those.
 
 Reviewer tools are verified during install: binary must exist, basic version
 check must succeed, and auth check must pass where available.
@@ -162,38 +236,50 @@ unresolved Critical or Important findings.
 
 ## Using opencode as the reviewer (read-only)
 
-**This setup is required before opencode can pass the gate.** It was a real
-gotcha during local validation, so follow every point below.
+**The installer sets this up for you.** When you map any host to
+`--reviewer <host>=opencode`, `install` writes a working read-only opencode
+reviewer with no manual steps:
+
+- It creates the bundled `adversarial-reviewer` agent at
+  `~/.config/opencode/agent/adversarial-reviewer.md` (idempotent — it is
+  **skipped if the file already exists**, so a customized agent is never
+  overwritten).
+- It writes `reviewers.opencode.readOnlyConfig: true` into the project config so
+  the gate's enforced-mode isolation check passes.
 
 opencode is invoked as `opencode run --pure --agent adversarial-reviewer -f <diff>`
-with the review brief delivered on stdin. For that to work, opencode must have an
-`adversarial-reviewer` agent defined, for example at
-`~/.config/opencode/agent/adversarial-reviewer.md`.
+with the review brief delivered on stdin.
 
-Three hard requirements:
+### What the bundled setup guarantees
 
-1. **The agent MUST be `mode: primary` — NOT `subagent`.** `opencode run --agent`
+The agent the installer ships satisfies three invariants that the gate enforces.
+You do not configure these by hand — verify them with
+`npx adversarial-review-gate doctor` and `opencode agent list`:
+
+1. **The agent is `mode: primary` — NOT `subagent`.** `opencode run --agent`
    rejects a subagent and **silently** falls back to the full-permission default
    agent, printing `Falling back to default agent` to stderr. The gate detects
    that marker and rejects the review as an operational failure
    (`reviewer_agent_fallback`), so a subagent-mode agent can never pass — even if
    it printed a perfect verdict block.
 
-2. **It must be read-only.** Set `permission` to deny everything and turn tools
-   off, so the gate's enforced isolation check passes. In `enforced`/`strict-ci`
-   the gate refuses any reviewer whose `verify()` capabilities are not
-   `readOnly === true && noEdit === true` (`reviewer_not_isolated`). The opencode
-   adapter only asserts those capabilities when
-   `reviewers.opencode.readOnlyConfig: true` is set in config — so you must both
-   make the agent read-only **and** set that flag.
+2. **The agent is read-only.** `permission` denies everything and tools are
+   turned off, and `reviewers.opencode.readOnlyConfig: true` is set, so the
+   adapter reports `readOnly === true && noEdit === true`. In
+   `enforced`/`strict-ci` the gate refuses any reviewer whose `verify()`
+   capabilities are not isolated (`reviewer_not_isolated`).
 
-3. **The agent body must contain the verdict-block format the gate parses.** The
+3. **The agent body contains the verdict-block format the gate parses.** The
    brief on stdin carries the per-job `job_id` / `diff_hash` / `payload_hash` /
-   `reviewer` / `level`; the agent must echo those exact values back inside a
-   single `<<<ADVERSARIAL-REVIEW-VERDICT>>> ... <<<END>>>` block (see
+   `reviewer` / `level`; the agent echoes those exact values back inside a single
+   `<<<ADVERSARIAL-REVIEW-VERDICT>>> ... <<<END>>>` block (see
    [Verdict Format](#verdict-format)) with nothing after `<<<END>>>`.
 
-Minimal `~/.config/opencode/agent/adversarial-reviewer.md`:
+### If you customize the agent, keep these invariants
+
+Because the installer never overwrites an existing agent file, an edited
+`~/.config/opencode/agent/adversarial-reviewer.md` must still satisfy all three
+invariants above. A minimal shape:
 
 ```markdown
 ---
@@ -274,11 +360,20 @@ node C:\abs\path\to\adversarial-review\bin\adversarial-review.js run --host code
 
 ## Claude Code (native)
 
-Claude Code is the only **native-enforced** host. The installer adds two hooks to
-`.claude/settings.json`:
+Claude Code is the only **native-enforced** host. **The installer writes the
+hooks for you** — when `claude-code` is in `--hosts`, `install` merges two hooks
+into `.claude/settings.json` (or, with `--global`, into your user-level
+`~/.claude/settings.json`):
 
 - A **SessionStart** hook that records the workspace baseline.
-- A **Stop** hook that applies the gate before the turn finishes.
+- A **Stop** hook (with a **300-second timeout**) that applies the gate before
+  the turn finishes.
+
+### What the bundled setup guarantees
+
+The hook commands invoke `adversarial-review-gate` directly when it resolves on
+`PATH` (a global npm install), otherwise via `npx adversarial-review-gate`. The
+written block looks like this:
 
 ```json
 {
@@ -288,7 +383,7 @@ Claude Code is the only **native-enforced** host. The installer adds two hooks t
         "hooks": [
           {
             "type": "command",
-            "command": "node /abs/path/to/adversarial-review/bin/adversarial-review.js hook --host claude-code --event session-start"
+            "command": "adversarial-review-gate hook --host claude-code --event session-start"
           }
         ]
       }
@@ -298,7 +393,8 @@ Claude Code is the only **native-enforced** host. The installer adds two hooks t
         "hooks": [
           {
             "type": "command",
-            "command": "node /abs/path/to/adversarial-review/bin/adversarial-review.js hook --host claude-code --event stop"
+            "command": "adversarial-review-gate hook --host claude-code --event stop",
+            "timeout": 300
           }
         ]
       }
@@ -307,15 +403,19 @@ Claude Code is the only **native-enforced** host. The installer adds two hooks t
 }
 ```
 
-For a **local (non-marketplace) install**, the hook command needs an **absolute
-path** to `bin/adversarial-review.js`. `${CLAUDE_PLUGIN_ROOT}` only resolves
-inside a marketplace plugin, so it will not work for a plain local checkout — use
-the absolute node path as shown above.
+> The Stop hook carries a **300s timeout** because an external review can take up
+> to a few minutes — Claude Code will not abort the hook before the review
+> finishes.
 
 > Both hooks are required. A Stop hook that sees edit evidence but finds **no
 > recorded SessionStart baseline** fails closed (blocks) in `enforced`/`strict-ci`,
-> because the full change scope is unknown. Restart Claude Code after editing
-> `settings.json`.
+> because the full change scope is unknown. **Restart Claude Code after install**
+> so it re-reads `settings.json`. Verify the hooks with
+> `npx adversarial-review-gate doctor`.
+
+> For a **local (non-marketplace) checkout** where the package is not on `PATH`,
+> the hook command needs an **absolute path** to `bin/adversarial-review.js`;
+> `${CLAUDE_PLUGIN_ROOT}` only resolves inside a marketplace plugin.
 
 ---
 
@@ -337,7 +437,9 @@ never committed.
 
 ## Cost
 
-An external opencode review takes roughly **30 seconds** and **BLOCKS in
+An external opencode review takes roughly **30 seconds** — and a debate-tier
+review on a large or sensitive diff can take **up to a few minutes** (the Claude
+Code Stop hook is given a 300-second timeout for this reason). It **BLOCKS in
 `enforced`** until it passes. With a machine-wide `enforced` config, that gate
 runs on every significant-edit Stop across **all** projects — which adds up
 quickly.
@@ -563,13 +665,18 @@ Common issues:
 ## Commands
 
 ```bash
-npx adversarial-review-gate install    # Interactive install wizard
 npx adversarial-review-gate install --hosts claude-code,codex --reviewer claude-code=opencode --reviewer codex=opencode
-npx adversarial-review-gate install --dry-run  # Preview without writing
+npx adversarial-review-gate install --global --hosts claude-code --reviewer claude-code=opencode  # Machine-wide
+npx adversarial-review-gate install --dry-run ...  # Preview without writing
+npx adversarial-review-gate uninstall          # Remove the project install
+npx adversarial-review-gate uninstall --user   # Remove the machine-wide install
 npx adversarial-review-gate check      # Run the gate manually against current working tree
 npx adversarial-review-gate run --host codex -- codex exec "..."  # Wrapper mode
 npx adversarial-review-gate doctor     # Verify installation
 ```
+
+`--hosts` and `--reviewer` are required for `install`; there is no interactive
+wizard (one may be added later).
 
 For a local (unpublished) checkout, `npx adversarial-review-gate` becomes
 `node /abs/path/to/adversarial-review/bin/adversarial-review.js`.

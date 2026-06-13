@@ -51,25 +51,6 @@ export async function resolveExecutable(command, env = process.env) {
   return null;
 }
 
-/**
- * Spawn a child process with shell:false to prevent shell-injection.
- * stdio defaults to ["ignore", "pipe", "pipe"].
- *
- * @param {string}   command
- * @param {string[]} args
- * @param {object}   options  - { cwd, env, stdio }
- * @returns {import("node:child_process").ChildProcess}
- */
-export function spawnSafe(command, args, options = {}) {
-  return spawn(command, args, {
-    cwd: options.cwd,
-    env: options.env,
-    shell: false,
-    stdio: options.stdio || ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-}
-
 // Characters that cmd.exe treats as metacharacters when it re-parses the
 // trailing arguments of `cmd.exe /c <batch> <args...>`. An argument containing
 // any of these can break out of the intended command and execute attacker code,
