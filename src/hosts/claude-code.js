@@ -23,6 +23,146 @@ const AR_HOOK_MARKER = "adversarial-review";
 // and our new native hook.
 const LEGACY_GUARD_MARKER = "guard.py";
 
+// Canonical invocation tail that EVERY adversarial-review hook command ends
+// with: `... hook --host claude-code --event <event>`. Hook ownership is a
+// SECURITY decision (doctor's health verdict + uninstall's "remove only our
+// hooks" guarantee), so it MUST be matched on the exact canonical token
+// sequence — never a loose substring. A loose `cmd.includes("--event stop")`
+// is spoofable (e.g. `true # adversarial-review --event stop` neuters the gate
+// while still matching) AND collides with distinct user hooks (`--event stop`
+// is a substring of `--event stop-done`).
+//
+// We accept the leaf as OURS only when, after collapsing internal whitespace,
+// the command ENDS WITH the exact canonical tail for the event AND the bin
+// portion preceding it carries the package marker as a real path token (not as
+// a comment). This anchors on structure we write, so a re-install dedupes its
+// own prior entry while a neutered/decorated command (leading `true #`, `;`,
+// `&&`, `|`, backticks before the invocation) fails the match.
+
+/** Collapse runs of whitespace to single spaces and trim ends. */
+function normalizeCommand(cmd) {
+  return String(cmd).replace(/\s+/g, " ").trim();
+}
+
+/** Escape a string for safe interpolation into a RegExp source. */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Shell metacharacters that would let an attacker wrap/neuter our invocation
+// while keeping the canonical tail intact (e.g. `true # <bin> ... --event stop`
+// or `<bin> ... --event stop; rm -rf /`). Any of these in the UNQUOTED part of a
+// leaf command disqualifies it from being treated as OURS. (Metachars that occur
+// only INSIDE the double-quoted bin token — e.g. `C:\Program Files (x86)\...` —
+// are inert to the shell and are explicitly allowed; see isOurBinPrefix.)
+const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
+
+/**
+ * Shell-quote a bin invocation for embedding in a `type: command` hook string.
+ *
+ * FINDING 1 (fail-open): an unquoted bin path containing a space (extremely
+ * common on Windows, e.g. `C:\Users\John Doe\...`) is split by the shell at the
+ * space — the first fragment is run as the executable, fails, no block JSON is
+ * emitted, and Claude Code ALLOWS the change: a silent gate bypass. We therefore
+ * double-quote any bin that contains a space or a shell metacharacter, escaping
+ * embedded double-quotes. A clean, special-char-free bin (the common
+ * `adversarial-review-gate` / `npx adversarial-review-gate` forms) is left
+ * unquoted so the emitted command stays human-readable and the existing canonical
+ * forms are unchanged.
+ *
+ * The quoting is the SAME shape isOurHookLeaf recognizes, so a command this
+ * produces always round-trips through ownership detection (FINDING 2: re-install
+ * dedupes its own prior entry even when the bin path carries `(`/`)`/space).
+ *
+ * @param {string} bin
+ * @returns {string}
+ */
+function quoteBin(bin) {
+  // Already needs no quoting: no whitespace and no shell metacharacters.
+  if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
+  return `"${bin.replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Build the canonical hook command string for an event:
+ * `<bin> hook --host claude-code --event <event>` with `<bin>` shell-quoted via
+ * quoteBin(). Single source of truth so buildHookConfig() and isOurHookLeaf()
+ * cannot drift (the command we WRITE must always be one we RECOGNIZE).
+ *
+ * @param {string} bin   - resolved gate invocation
+ * @param {string} event - "session-start" | "stop"
+ * @returns {string}
+ */
+function buildHookCommand(bin, event) {
+  return `${quoteBin(bin)} hook --host claude-code --event ${event}`;
+}
+
+// A fully double-quoted bin token: an opening quote, a run of non-quote chars or
+// backslash-escaped quotes, and a closing quote — nothing else. This is exactly
+// the shape quoteBin() emits, so metachars that appear ONLY inside it (a literal
+// `(x86)` in a path) are inert to the shell yet still recognized as ours.
+const QUOTED_BIN_RE = /^"(?:[^"\\]|\\.)*"$/;
+
+/**
+ * Whether the portion of a command preceding the canonical tail is one of OUR
+ * bin invocations — and NOT an attacker wrapper. Two accepted shapes:
+ *   (a) a single fully double-quoted token (`"C:\Program Files (x86)\...\ar.js"`),
+ *       which neutralizes any interior metachar, OR
+ *   (b) a bare, metachar-FREE invocation (`adversarial-review-gate`,
+ *       `npx adversarial-review-gate`).
+ * In both shapes the prefix MUST carry the package marker. A wrapper such as
+ * `true # adversarial-review` or `foo; bar` fails both shapes (it is neither a
+ * lone quoted token nor metachar-free), so the gate cannot be neutered while
+ * still matching.
+ *
+ * @param {string} prefix - normalized command text before ` <tail>` (trimmed)
+ * @returns {boolean}
+ */
+function isOurBinPrefix(prefix) {
+  if (!prefix) return false; // `cmd === tail` (no bin) is not one of ours
+  if (QUOTED_BIN_RE.test(prefix)) {
+    // Quoted token: the marker must appear inside the quotes (interior metachars
+    // are inert). Strip the surrounding quotes and unescape for the marker check.
+    const inner = prefix.slice(1, -1).replace(/\\"/g, '"');
+    return inner.includes(AR_HOOK_MARKER);
+  }
+  // Unquoted shape: must be metachar-free AND carry the marker.
+  if (SHELL_META_RE.test(prefix)) return false;
+  return prefix.includes(AR_HOOK_MARKER);
+}
+
+/**
+ * Whether a single hook leaf object is one of OUR adversarial-review hooks for
+ * the given event ("session-start" | "stop").
+ *
+ * STRICT canonical match (security-critical — used by doctor's registration
+ * verdict, install dedupe, AND uninstall removal). A leaf is ours only when its
+ * whitespace-normalized command:
+ *   1. ENDS WITH the exact canonical tail `hook --host claude-code --event <event>`
+ *      as a whole-token suffix, and
+ *   2. the bin prefix before that tail passes isOurBinPrefix (a single quoted
+ *      token OR a metachar-free invocation, carrying the package marker).
+ *
+ * This rejects a spoofed `true # adversarial-review --event stop`, refuses to
+ * treat `--event stop` as covering `--event stop-done`, still matches every
+ * command buildHookCommand() emits (so re-install stays idempotent even when the
+ * bin path contains spaces or `(x86)`-style metachars — FINDINGS 1 & 2).
+ *
+ * @param {object} leaf  - { type, command, ... }
+ * @param {string} event - "session-start" | "stop"
+ * @returns {boolean}
+ */
+function isOurHookLeaf(leaf, event) {
+  if (!leaf || typeof leaf.command !== "string") return false;
+  const cmd = normalizeCommand(leaf.command);
+  const tail = `hook --host claude-code --event ${event}`;
+  if (cmd !== tail && !cmd.endsWith(` ${tail}`)) return false;
+  // The portion before the canonical tail is the bin invocation and MUST be one
+  // of our recognized shapes (quoted token or metachar-free), marker-bearing.
+  const prefix = cmd.slice(0, cmd.length - tail.length).trim();
+  return isOurBinPrefix(prefix);
+}
+
 /**
  * Build the hook configuration object for Claude Code.
  *
@@ -43,7 +183,7 @@ function buildHookConfig(binPath) {
           hooks: [
             {
               type: "command",
-              command: `${bin} hook --host claude-code --event session-start`,
+              command: buildHookCommand(bin, "session-start"),
               statusMessage: "Adversarial review baseline",
               timeout: 60,
             },
@@ -55,7 +195,7 @@ function buildHookConfig(binPath) {
           hooks: [
             {
               type: "command",
-              command: `${bin} hook --host claude-code --event stop`,
+              command: buildHookCommand(bin, "stop"),
               statusMessage: "Adversarial review gate",
               timeout: 300,
             },
@@ -66,26 +206,35 @@ function buildHookConfig(binPath) {
   };
 }
 
+// The legacy Python plugin invoked a script whose FILENAME is exactly `guard.py`
+// (e.g. `python ${CLAUDE_PLUGIN_ROOT}/hooks/guard.py` or `python guard.py
+// --event stop`). We match that basename at a path/word boundary so an unrelated
+// user script with a DIFFERENT filename that merely ends in the same substring
+// (`my-guard.py`, `safeguard.py`) is NOT mistaken for ours. The boundary before
+// the basename is start-of-string, whitespace, or a path separator (`/` or `\`);
+// the boundary after `.py` is end-of-string, whitespace, or any non-name char.
+const LEGACY_GUARD_RE = new RegExp(
+  `(?:^|[\\s/\\\\])${LEGACY_GUARD_MARKER.replace(/[.]/g, "\\$&")}(?![\\w.])`
+);
+
 /**
- * Whether a single hook leaf object is one of OUR adversarial-review hooks for
- * the given event ("session-start" | "stop"). Matches on the command string
- * carrying both the package marker and the matching --event flag.
+ * Whether a hook leaf is a legacy Python-era adversarial-review guard.py command
+ * (to be stripped on migration).
  *
- * @param {object} leaf  - { type, command, ... }
- * @param {string} event - "session-start" | "stop"
+ * FINDING 3: a bare `command.includes("guard.py")` is over-broad — it strips ANY
+ * user hook whose command merely contains the substring `guard.py` (an unrelated
+ * `my-guard.py` lint script, `safeguard.py`, a comment), silently deleting user
+ * configuration. We instead match `guard.py` as a whole PATH BASENAME (bounded by
+ * a path separator / whitespace / start, and by a non-name char / end), which is
+ * exactly how the legacy plugin's script was invoked while still excluding the
+ * `*-guard.py` family of unrelated user scripts.
+ *
+ * @param {object} leaf
  * @returns {boolean}
  */
-function isOurHookLeaf(leaf, event) {
-  if (!leaf || typeof leaf.command !== "string") return false;
-  const cmd = leaf.command;
-  return cmd.includes(AR_HOOK_MARKER) && cmd.includes(`--event ${event}`);
-}
-
-/** Whether a hook leaf is a legacy Python guard.py command (to be stripped). */
 function isLegacyGuardLeaf(leaf) {
-  return Boolean(
-    leaf && typeof leaf.command === "string" && leaf.command.includes(LEGACY_GUARD_MARKER)
-  );
+  if (!leaf || typeof leaf.command !== "string") return false;
+  return LEGACY_GUARD_RE.test(leaf.command);
 }
 
 /**
@@ -237,6 +386,63 @@ export function detectClaudeCodeHooks(existing) {
   return {
     sessionStart: hasEvent("SessionStart", "session-start"),
     stop: hasEvent("Stop", "stop"),
+  };
+}
+
+/**
+ * Whether a leaf command LOOKS LIKE an adversarial-review hook for `event`
+ * (carries the package marker + an `--event <event>` reference) but FAILS the
+ * strict canonical match — i.e. it is present-but-tampered/neutered (e.g.
+ * `true # adversarial-review hook ... --event stop`). Used by `doctor` to warn
+ * rather than silently report the gate as healthy.
+ *
+ * @param {object} leaf
+ * @param {string} event - "session-start" | "stop"
+ * @returns {boolean}
+ */
+function isTamperedHookLeaf(leaf, event) {
+  if (!leaf || typeof leaf.command !== "string") return false;
+  const cmd = normalizeCommand(leaf.command);
+  // FINDING 4: `cmd.includes("--event stop")` also matches a DISTINCT user event
+  // like `--event stop-done` (stop ⊂ stop-done), so doctor spuriously flagged an
+  // unrelated third-party hook as our tampered Stop hook. Match the event as a
+  // whole token (word boundary after the event name) so `stop` never covers
+  // `stop-done`/`stop-report`.
+  const eventTokenRe = new RegExp(`--event\\s+${escapeRegExp(event)}(?![\\w-])`);
+  const looksLikeOurs = cmd.includes(AR_HOOK_MARKER) && eventTokenRe.test(cmd);
+  return looksLikeOurs && !isOurHookLeaf(leaf, event);
+}
+
+/**
+ * Detect present-but-non-canonical (tampered/neutered) adversarial-review hooks
+ * in a settings object. A configured Stop/SessionStart leaf that carries our
+ * marker but does NOT match the exact canonical command is a SECURITY signal:
+ * the gate may have been disarmed while still appearing installed.
+ *
+ * @param {object} existing - parsed settings.json (or {})
+ * @returns {{ sessionStart: boolean, stop: boolean }}
+ */
+export function detectTamperedClaudeCodeHooks(existing) {
+  const base =
+    existing && typeof existing === "object" && !Array.isArray(existing) ? existing : {};
+  const hooks =
+    base.hooks && typeof base.hooks === "object" && !Array.isArray(base.hooks)
+      ? base.hooks
+      : {};
+
+  const hasTampered = (event, key) => {
+    const groups = Array.isArray(hooks[event]) ? hooks[event] : [];
+    return groups.some(
+      (group) =>
+        group &&
+        Array.isArray(group.hooks) &&
+        group.hooks.some((leaf) => isTamperedHookLeaf(leaf, key))
+    );
+  };
+
+  return {
+    sessionStart: hasTampered("SessionStart", "session-start"),
+    stop: hasTampered("Stop", "stop"),
   };
 }
 

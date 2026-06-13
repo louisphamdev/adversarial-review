@@ -4,9 +4,12 @@
 // reports a human-readable (or --json) summary with explicit WARNINGS for
 // wrapper/advisory hosts.
 //
-// Exit codes:
-//   0 - all checks passed (or completed with warnings)
-//   1 - a fatal error was encountered (corrupt package.json, etc.)
+// Exit codes (honored so CI can GATE on a healthy, actually-enforced gate):
+//   0 - the gate is healthy AND effectively enforced (or no enforcing host is
+//       configured, in which case there is nothing to certify)
+//   1 - the gate is configured to enforce but is NOT actually enforced
+//       (hooks missing/neutered, reviewer unavailable, etc.) — fail CLOSED so a
+//       CI step that runs `doctor` blocks on a bypassed/unhealthy gate.
 
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -16,7 +19,11 @@ import { fileURLToPath } from "node:url";
 import { HOSTS } from "../hosts/index.js";
 import { createReviewer } from "../reviewers/index.js";
 import { loadEffectiveConfig, resolveHomeDir } from "../core/load-config.js";
-import { detectClaudeCodeHooks, claudeCodeSettingsPath } from "../hosts/claude-code.js";
+import {
+  detectClaudeCodeHooks,
+  detectTamperedClaudeCodeHooks,
+  claudeCodeSettingsPath,
+} from "../hosts/claude-code.js";
 
 // Paths relative to home / cwd.
 const PROJECT_CONFIG_REL = path.join(".adversarial-review", "config.json");
@@ -129,12 +136,17 @@ export async function doctorCommand(argv, io) {
   // whose hooks are missing means the gate would never fire.
   const projectSettingsPath = claudeCodeSettingsPath(cwd);
   const userSettingsPath = claudeCodeSettingsPath(home);
-  const projectHooks = detectClaudeCodeHooks(
-    await readSettingsTolerant(projectSettingsPath)
-  );
-  const userHooks = detectClaudeCodeHooks(
-    await readSettingsTolerant(userSettingsPath)
-  );
+  const projectSettings = await readSettingsTolerant(projectSettingsPath);
+  const userSettings = await readSettingsTolerant(userSettingsPath);
+  // `detectClaudeCodeHooks` uses the STRICT canonical matcher, so a neutered
+  // hook (e.g. `true # adversarial-review ... --event stop`) is NOT counted as
+  // registered. `detectTamperedClaudeCodeHooks` separately flags such a
+  // present-but-non-canonical leaf so doctor can WARN instead of certifying a
+  // bypassed gate as healthy.
+  const projectHooks = detectClaudeCodeHooks(projectSettings);
+  const userHooks = detectClaudeCodeHooks(userSettings);
+  const projectTampered = detectTamperedClaudeCodeHooks(projectSettings);
+  const userTampered = detectTamperedClaudeCodeHooks(userSettings);
 
   // opencode read-only agent presence (machine-wide, under <home>).
   const opencodeAgentPath = path.join(home, OPENCODE_AGENT_REL);
@@ -172,18 +184,31 @@ export async function doctorCommand(argv, io) {
     if (hostId === "claude-code") {
       const projectRegistered = projectHooks.sessionStart && projectHooks.stop;
       const userRegistered = userHooks.sessionStart && userHooks.stop;
+      const tampered =
+        projectTampered.sessionStart ||
+        projectTampered.stop ||
+        userTampered.sessionStart ||
+        userTampered.stop;
       hostReport.hooks = {
         projectSettingsPath,
         userSettingsPath,
         project: projectHooks,
         user: userHooks,
         registered: projectRegistered || userRegistered,
+        tampered,
       };
       if (!hostReport.hooks.registered) {
         warnings.push(
           `WARNING: Host "claude-code" is configured but our SessionStart + Stop ` +
             `hooks are NOT registered in ${projectSettingsPath} (project) or ` +
             `${userSettingsPath} (user). Run \`adversarial-review install\` to register them.`
+        );
+      }
+      if (tampered) {
+        warnings.push(
+          `WARNING: Host "claude-code" has a hook that carries the adversarial-review ` +
+            `marker but does NOT match the canonical command — possibly tampered/neutered. ` +
+            `The gate may NOT actually run. Re-run \`adversarial-review install\` to restore it.`
         );
       }
     }
@@ -232,15 +257,68 @@ export async function doctorCommand(argv, io) {
     }
   }
 
-  // Effective enforcement level.
-  const hasNativeHost = hostReports.some((h) => h.enforcement === "native-enforced");
+  // Effective enforcement level — derived from ACTUAL hook presence/correctness,
+  // not merely the host capability table. A "native-enforced" host whose hooks
+  // are absent or neutered does NOT actually enforce anything: the gate never
+  // fires, so reporting `native-enforced` would certify a bypassed gate. We
+  // therefore require a native-enforced host to also have its hooks registered
+  // (strict canonical match) before counting it as actually enforced.
+  //
+  // FINDING 8: a native host with registered hooks but an UNAVAILABLE reviewer
+  // (binary removed/version mismatch) cannot actually perform any review — every
+  // review fails and (with the floor's onReviewerError:'block') the gate blocks
+  // ALL changes. That is effectively broken, not "enforced". Require the reviewer
+  // to be available too before counting the host as actively enforcing. "none"
+  // (native self-review) is always available, so self-review hosts still count.
+  const isActuallyNative = (h) =>
+    h.enforcement === "native-enforced" &&
+    (!h.hooks || h.hooks.registered === true) &&
+    h.reviewerAvailable === true;
+  const hasActiveNativeHost = hostReports.some(isActuallyNative);
+  const hasConfiguredNativeHost = hostReports.some(
+    (h) => h.enforcement === "native-enforced"
+  );
   const hasWrapperOnlyHosts =
     hostReports.length > 0 && hostReports.every((h) => h.enforcement === "wrapper-enforced");
-  const effectiveEnforcement = hasNativeHost
+  const effectiveEnforcement = hasActiveNativeHost
     ? "native-enforced"
     : hasWrapperOnlyHosts
       ? "wrapper-enforced (advisory)"
       : "none";
+
+  // A native-enforced host that is configured but whose hooks are NOT actually
+  // registered (or are tampered) is a FAIL-CLOSED condition for CI: the gate is
+  // supposed to enforce but does not. `doctor` must exit non-zero so a CI step
+  // can gate on it.
+  const nativeNotEnforced = hasConfiguredNativeHost && !hasActiveNativeHost;
+  if (nativeNotEnforced) {
+    warnings.push(
+      `WARNING: effectiveEnforcement is NOT native-enforced even though a ` +
+        `native-enforced host is configured — the gate would not actually run. ` +
+        `doctor will exit non-zero.`
+    );
+  }
+
+  // FINDING 7: a WRAPPER-ONLY configuration (no active native host) is advisory —
+  // bypassing the wrapper skips the gate entirely. Certifying it with exit 0 gives
+  // CI false confidence that the gate is enforced. When there is no active native
+  // enforcement and the only hosts are wrapper-enforced, doctor must exit non-zero
+  // so CI can detect that NO native enforcement is active. (This is distinct from
+  // nativeNotEnforced, which is about a native host whose hooks are missing.)
+  const wrapperOnlyNotEnforced = hasWrapperOnlyHosts && !hasActiveNativeHost;
+  if (wrapperOnlyNotEnforced) {
+    warnings.push(
+      `WARNING: the only configured hosts are wrapper-enforced (advisory). No NATIVE ` +
+        `enforcement is active — running the host WITHOUT the wrapper bypasses the gate ` +
+        `entirely. doctor will exit non-zero so CI does not mistake this for an enforced gate.`
+    );
+  }
+
+  // A native-enforced host whose reviewer is unavailable is a distinct, explicit
+  // condition worth surfacing in the exit code even though it overlaps with
+  // nativeNotEnforced above (the reviewer-availability warning is already pushed
+  // in the host loop). Captured here so the exit-code computation reads clearly.
+  const notEffectivelyEnforced = nativeNotEnforced || wrapperOnlyNotEnforced;
 
   // Build the report object.
   const report = {
@@ -255,6 +333,9 @@ export async function doctorCommand(argv, io) {
     privacyMode: effectiveConfig.privacy?.externalReview || "allow",
     policyMode: effectiveConfig.policy?.mode || "enforced",
     effectiveEnforcement,
+    nativeNotEnforced,
+    wrapperOnlyNotEnforced,
+    notEffectivelyEnforced,
     allowAdvisoryHosts: effectiveConfig.policy?.allowAdvisoryHosts ?? false,
     hosts: hostReports,
     warnings,
@@ -266,7 +347,12 @@ export async function doctorCommand(argv, io) {
     printHumanReport(report, io);
   }
 
-  process.exitCode = 0;
+  // Honor the documented exit-code contract so CI can gate on it: exit 1 when the
+  // gate is NOT effectively enforced — a configured native host whose hooks are
+  // missing/neutered or whose reviewer is unavailable (FINDING 8), OR a wrapper-
+  // only/advisory configuration with no active native enforcement (FINDING 7).
+  // Otherwise exit 0.
+  process.exitCode = notEffectivelyEnforced ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +391,11 @@ function printHumanReport(report, io) {
   w(`  enforcement:         ${report.effectiveEnforcement}\n`);
   w(`  allowAdvisoryHosts:  ${report.allowAdvisoryHosts}\n`);
   w(`  privacyMode:         ${report.privacyMode}\n`);
+  // Be explicit about an advisory / not-effectively-enforced gate so the human
+  // report matches the non-zero exit code (no false confidence).
+  if (report.notEffectivelyEnforced) {
+    w(`  effectively enforced: NO (doctor will exit non-zero)\n`);
+  }
 
   if (report.hosts.length === 0) {
     w(`\nHosts: (none configured)\n`);
@@ -328,7 +419,8 @@ function printHumanReport(report, io) {
       // Native hook registration (claude-code only).
       if (h.hooks) {
         w(
-          `    native hooks registered: ${h.hooks.registered ? "yes" : "NO"}\n`
+          `    native hooks registered: ${h.hooks.registered ? "yes" : "NO"}` +
+            `${h.hooks.tampered ? " (TAMPERED hook present!)" : ""}\n`
         );
         w(
           `      project (${h.hooks.projectSettingsPath}): ` +

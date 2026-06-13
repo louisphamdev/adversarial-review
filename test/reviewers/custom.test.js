@@ -219,6 +219,62 @@ process.exit(0);
     }
   });
 
+  // REGRESSION (Finding 4): brief.txt and job.json must be written OWNER-ONLY
+  // (mode 0o600), like the diff temp file — on a shared POSIX CI runner another
+  // UID must not be able to read the job metadata / full descriptor (incl.
+  // diffText) before cleanup. The stub stats {briefPath} and {jobPath} (passed as
+  // args) and records their permission bits to a sidecar so we can assert them.
+  // Skipped on Windows where POSIX permission bits are not modeled.
+  it("run() writes brief.txt and job.json with owner-only (0o600) permissions on POSIX", async () => {
+    if (process.platform === "win32") {
+      return; // POSIX permission bits only.
+    }
+    const recDir = await mkdtemp(join(tmpdir(), "ar-custom-mode-"));
+    const recModes = join(recDir, "modes.json");
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-custom-modestub-"));
+    const stubPath = join(stubDir, "mode-stub.cjs");
+    const verdictBlock = buildVerdictOutput(makeJob({ reviewer: "my-reviewer" }), "pass");
+    // argv: [stubPath, briefPath, jobPath]
+    await writeFile(
+      stubPath,
+      `
+const fs = require("node:fs");
+const briefPath = process.argv[3];
+const jobPath = process.argv[4];
+const modes = {
+  brief: (fs.statSync(briefPath).mode & 0o777),
+  job: (fs.statSync(jobPath).mode & 0o777),
+};
+try { fs.writeFileSync(${JSON.stringify(recModes)}, JSON.stringify(modes)); } catch {}
+process.stdout.write(${JSON.stringify(verdictBlock)});
+process.exit(0);
+`,
+      "utf8"
+    );
+    const config = {
+      reviewers: {
+        "my-reviewer": {
+          type: "custom",
+          trusted: true,
+          command: process.execPath,
+          args: [stubPath, "{briefPath}", "{jobPath}"],
+          timeoutSec: 10,
+        },
+      },
+    };
+    try {
+      const adapter = createAdapter(config, "my-reviewer");
+      const result = await adapter.run(job, {});
+      assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
+      const modes = JSON.parse(await readFile(recModes, "utf8"));
+      assert.equal(modes.brief, 0o600, `brief.txt must be 0o600, got 0o${modes.brief.toString(8)}`);
+      assert.equal(modes.job, 0o600, `job.json must be 0o600, got 0o${modes.job.toString(8)}`);
+    } finally {
+      await rm(stubDir, { recursive: true, force: true });
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
   // --- valid fail ---
 
   it("run() returns ok:true with verdict.verdict==='fail' for a valid fail stub", async () => {

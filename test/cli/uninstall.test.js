@@ -273,4 +273,114 @@ describe("uninstall command", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Finding 4: uninstall must NOT remove a user hook that merely shares a marker
+  // prefix/substring with ours (e.g. `--event stop` ⊂ `--event stop-done`).
+  // -------------------------------------------------------------------------
+  it("does NOT remove a user-authored hook that collides on prefix/substring (finding 4)", async () => {
+    const cwd = await tmpDir("ar-uninstall-collide-");
+    const home = await tmpDir("ar-uninstall-collide-home-");
+    try {
+      // Seed a user hook whose command shares the marker AND a stop-PREFIXED
+      // event token, then install ours on top.
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command: "my-tool adversarial-review --event stop-done",
+                  },
+                ],
+              },
+            ],
+          },
+        })
+      );
+
+      const { io: ioInstall } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        ioInstall
+      );
+      assert.equal(process.exitCode, 0);
+
+      const { io: ioUninstall, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await uninstallCommand([], ioUninstall);
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const after = JSON.parse(
+        await rf(join(cwd, ".claude", "settings.json"), "utf8")
+      );
+      const stopCmds = (after.hooks?.Stop || []).flatMap((g) =>
+        (g.hooks || []).map((h) => h.command)
+      );
+      // The user's stop-done hook must survive.
+      assert.ok(
+        stopCmds.some((c) => c.includes("--event stop-done")),
+        "user --event stop-done hook must NOT be removed by uninstall"
+      );
+      // Our exact stop hook must be gone.
+      assert.ok(
+        !stopCmds.some((c) => c.includes("hook --host claude-code --event stop")),
+        "our exact stop hook must be removed"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 5: install then uninstall from a DIFFERENT-cased cwd still finds and
+  // removes the same registry entry (keys agree across install/uninstall).
+  // -------------------------------------------------------------------------
+  it("uninstall removes the registry entry even when cwd casing differs (finding 5)", async () => {
+    if (process.platform !== "win32") return; // Behavior is win32-specific.
+    const cwd = await tmpDir("ar-uninstall-regcase-");
+    const home = await tmpDir("ar-uninstall-regcase-home-");
+    try {
+      const { io: ioInstall } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        ioInstall
+      );
+      assert.equal(process.exitCode, 0);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const regBefore = JSON.parse(
+        await rf(join(home, ".adversarial-review", "install.json"), "utf8")
+      );
+      assert.equal(Object.keys(regBefore).length, 1);
+
+      // Uninstall using an UPPER-CASED cwd — must still match the same key.
+      const { io: ioUninstall } = makeIo(cwd.toUpperCase(), home);
+      process.exitCode = 0;
+      await uninstallCommand([], ioUninstall);
+      assert.equal(process.exitCode, 0);
+
+      const regAfter = JSON.parse(
+        await rf(join(home, ".adversarial-review", "install.json"), "utf8")
+      );
+      assert.equal(
+        Object.keys(regAfter).length,
+        0,
+        "registry entry must be removed regardless of cwd casing"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });

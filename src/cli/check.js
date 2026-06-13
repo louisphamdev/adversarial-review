@@ -28,8 +28,17 @@ export async function checkCommand(argv, io) {
   const { hostDescriptor, reviewerRunner } = buildHostRouting(host, config, env);
 
   let decision;
+  // Hoist `baseline` OUT of the try so the catch can forward it to
+  // failClosedDecision. If it stayed `const baseline` inside the try, the catch
+  // (a separate scope) could not see it, so failClosedDecision would receive
+  // baseline:undefined and could not recompute the live diff — and with no
+  // transcript either, hasEditEvidence() would return false and FAIL OPEN
+  // (`fail_open_no_evidence`) even when the workspace really changed. We pass the
+  // captured baseline so fail-closed can detect edit evidence and block in
+  // enforced/strict.
+  let baseline;
   try {
-    const baseline = await captureBaseline(cwd);
+    baseline = await captureBaseline(cwd);
     decision = await evaluateGate({
       config,
       cwd,
@@ -46,8 +55,10 @@ export async function checkCommand(argv, io) {
     });
   } catch (err) {
     // HARDENING #2: fail closed. `check` has no transcript, so edit evidence is
-    // whatever the live diff shows; failClosedDecision recomputes that.
-    decision = await failClosedDecision({ config, cwd, err, io });
+    // whatever the live diff shows; failClosedDecision recomputes that from the
+    // captured baseline (may be undefined if captureBaseline itself threw, in
+    // which case failClosedDecision computes against an empty baseline).
+    decision = await failClosedDecision({ config, cwd, baseline, transcript: "", err, io });
   }
 
   if (json) {

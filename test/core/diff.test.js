@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm, mkdir, symlink } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -79,6 +79,21 @@ describe("buildReviewDiff (git)", () => {
       diff.changedFiles.some((f) => f.path === "feature.js" && f.status === "A"),
       "changedFiles should contain feature.js as A"
     );
+  });
+
+  it("R3: a git repo with NO commits falls back to a filesystem baseline (no bypass)", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "zero-commit");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo); // initialized but NEVER committed -> no HEAD
+    const baseline = await captureBaseline(repo);
+    // With no HEAD there is no committed tree to diff against; the baseline must
+    // fall back to a filesystem snapshot, not type:"git" with head:null (which
+    // made buildReviewDiff skip BOTH branches and render every file invisible).
+    assert.equal(baseline.type, "filesystem", "no-HEAD repo uses a filesystem baseline");
+    await writeFile(join(repo, "evil.js"), "const evil = 1;\n");
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(diff.text.includes("evil.js"), "a new file in a zero-commit repo must be visible to the gate");
   });
 
   it("reports a staged file", async (t) => {
@@ -369,6 +384,124 @@ describe("synthesizeNewFileDiff", () => {
     assert.ok(block.includes("+line1"));
     assert.ok(block.includes("+line2"));
   });
+
+  // ROUND2 finding 4 — an empty (0-byte) new TEXT file must render as a proper
+  // empty added-file block, NOT be misreported as "Binary or unreadable file".
+  it("renders an empty new text file as an added file, not binary/unreadable (round2 #4)", async () => {
+    await writeFile(join(dir, "empty.txt"), "");
+    const block = await synthesizeNewFileDiff(dir, "empty.txt");
+    assert.ok(block.includes("new file mode 100644"), "should mark a new file");
+    assert.ok(block.includes("--- /dev/null"), "should render the added-file header");
+    assert.ok(block.includes("+++ b/empty.txt"), "should reference the new path");
+    assert.equal(
+      block.includes("Binary or unreadable file"),
+      false,
+      "empty text file must NOT be reported as binary/unreadable"
+    );
+  });
+
+  // ROUND2 finding 4 — a genuinely missing/unreadable file MUST still take the
+  // "Binary or unreadable" path (the read-failure branch is preserved).
+  it("still reports a missing/unreadable file as binary/unreadable (round2 #4)", async () => {
+    const block = await synthesizeNewFileDiff(dir, "does-not-exist.txt");
+    assert.ok(
+      block.includes("Binary or unreadable file"),
+      "a missing file must still be reported as binary/unreadable"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND2 finding 3 — a truncated filesystem baseline fails CLOSED: the diff is
+// never a vacuous empty result and carries a coverage-limitation marker plus a
+// reviewable sentinel changed-file so the gate cannot treat it as "no changes".
+// ---------------------------------------------------------------------------
+
+describe("truncated filesystem baseline fails closed (round2 #3)", () => {
+  let dir;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-trunc-baseline-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("surfaces a change to a file outside the truncated window via a sentinel + marker", async () => {
+    const ws = join(dir, "trunc");
+    await mkdir(ws, { recursive: true });
+    for (let i = 0; i < 10; i += 1) {
+      await writeFile(join(ws, `f${String(i).padStart(3, "0")}.txt`), `content ${i}\n`);
+    }
+
+    // Build a TRUNCATED filesystem baseline (capture only a subset of files).
+    const snap = await snapshotWorkspace(ws, { maxFiles: 3 });
+    assert.equal(snap.truncated, true, "snapshot must be truncated for this repro");
+    const baseline = {
+      type: "filesystem",
+      cwd: ws,
+      capturedAt: Date.now(),
+      snapshot: Object.fromEntries(snap.files),
+      truncated: snap.truncated,
+      options: { maxFiles: 3 },
+    };
+
+    // Modify a victim file that fell OUTSIDE the captured window.
+    const captured = new Set(Object.keys(baseline.snapshot));
+    let victim = null;
+    for (let i = 0; i < 10; i += 1) {
+      const name = `f${String(i).padStart(3, "0")}.txt`;
+      if (!captured.has(name)) {
+        victim = name;
+        break;
+      }
+    }
+    assert.ok(victim, "there must be an uncaptured victim file");
+    await writeFile(join(ws, victim), "MALICIOUS PAYLOAD\n");
+
+    const diff = await buildReviewDiff(ws, baseline);
+
+    // The diff must NOT be vacuously empty (the silent-bypass case).
+    assert.ok(diff.text.length > 0, "truncated baseline must not yield empty text");
+    assert.ok(diff.changedFiles.length > 0, "truncated baseline must not yield empty changedFiles");
+    // The coverage-limitation marker must be present.
+    assert.ok(
+      /coverage limitation: filesystem snapshot truncated/.test(diff.text),
+      "diff text must carry the truncation coverage-limitation marker"
+    );
+    // A sentinel reviewable changed-file must be present so the gate escalates.
+    assert.ok(
+      diff.changedFiles.some((f) => f.path === ".adversarial-review-snapshot-truncated"),
+      "diff must include the reviewable truncation sentinel changed-file"
+    );
+  });
+
+  it("does NOT add the truncation marker for a complete (non-truncated) baseline", async () => {
+    const ws = join(dir, "complete");
+    await mkdir(ws, { recursive: true });
+    await writeFile(join(ws, "a.txt"), "1\n");
+    const baseline = await captureBaseline(ws);
+    assert.equal(baseline.truncated, false, "small workspace must not truncate");
+
+    await writeFile(join(ws, "a.txt"), "2\n");
+    const diff = await buildReviewDiff(ws, baseline);
+
+    assert.equal(
+      /snapshot truncated/.test(diff.text),
+      false,
+      "a complete baseline must NOT carry a truncation marker (no false positive)"
+    );
+    assert.equal(
+      diff.changedFiles.some((f) => f.path === ".adversarial-review-snapshot-truncated"),
+      false,
+      "a complete baseline must NOT add the truncation sentinel"
+    );
+    assert.ok(
+      diff.changedFiles.some((f) => f.path === "a.txt" && f.status === "M"),
+      "the real modification is still reported normally"
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -569,5 +702,189 @@ describe("git() stdout buffering (FIX 6)", () => {
     assert.equal(result.code, 0);
     assert.ok(result.stdout.includes("git version"), "should capture normal output");
     assert.ok(!result.truncated, "truncated should default to falsy on normal output");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AUDIT — non-ASCII filenames classify reviewable in a default git repo
+// (git core.quotePath=true C-quotes non-ASCII paths; git.js now forces it off)
+// ---------------------------------------------------------------------------
+
+describe("non-ASCII code filenames are reviewable under git (quotePath)", () => {
+  let dir;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-quotepath-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // Repro: with the DEFAULT core.quotePath=true, `git ls-files --others` /
+  // `git diff --name-status` emit "caf\303\251.js" (octal-escaped, quoted).
+  // The old code turned that into the bogus path "caf/303/251.js" with a
+  // literal trailing quote, so classifyPath saw ext '.js"' -> reviewable:false
+  // and synthesizeNewFileDiff could not read the (phantom) file.
+  it("surfaces an untracked café.js with a clean UTF-8 path and real content", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "untracked-unicode");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "base.txt"), "base\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+
+    await writeFile(join(repo, "café.js"), "export const x = 1;\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(
+      diff.changedFiles.some((f) => f.path === "café.js" && f.status === "A"),
+      "café.js must appear with its real UTF-8 path, not an octal-mangled one"
+    );
+    assert.equal(
+      diff.changedFiles.some((f) => /\\\d{3}|"/.test(f.path)),
+      false,
+      "no changed-file path should carry octal escapes or quote chars"
+    );
+    // The real file content (not a 'Binary or unreadable file' phantom) is inlined.
+    assert.ok(
+      diff.text.includes("+export const x = 1;"),
+      "the real non-ASCII file content must be in the diff text"
+    );
+  });
+
+  it("surfaces a committed CJK code file (日本.ts) with a clean path", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "committed-cjk");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "base.txt"), "base\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+
+    await writeFile(join(repo, "日本.ts"), "export const y = 2;\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "cjk"]);
+
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(
+      diff.changedFiles.some((f) => f.path === "日本.ts"),
+      "日本.ts must appear with its real UTF-8 path"
+    );
+  });
+
+  it("preserves rename old/new paths and space-containing paths", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "rename-unicode");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "café.js"), "export const v = 1;\nconst more = 2;\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+
+    gitSync(repo, ["mv", "café.js", "naïve.js"]);
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "rename"]);
+    // A separate untracked file whose name contains a space must still parse.
+    await writeFile(join(repo, "my file.js"), "const z = 3;\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    const paths = diff.changedFiles.map((f) => f.path);
+    assert.ok(paths.includes("café.js"), "rename old non-ASCII path retained");
+    assert.ok(paths.includes("naïve.js"), "rename new non-ASCII path retained");
+    assert.ok(paths.includes("my file.js"), "path with a space still parses");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AUDIT — synthesized diff is byte-faithful: CRLF vs LF -> different diffHash
+// ---------------------------------------------------------------------------
+
+describe("synthesized diff preserves line endings (CRLF != LF diffHash)", () => {
+  let dir;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-crlf-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("renders CRLF and LF bodies to DIFFERENT diff text", async () => {
+    const ws = join(dir, "render");
+    await mkdir(ws, { recursive: true });
+    await writeFile(join(ws, "lf.txt"), "a\nb\nc\n");
+    await writeFile(join(ws, "crlf.txt"), "a\r\nb\r\nc\r\n");
+
+    // Normalize the filename out so only the content rendering is compared.
+    const lf = (await synthesizeNewFileDiff(ws, "lf.txt")).replace(/lf\.txt/g, "X");
+    const crlf = (await synthesizeNewFileDiff(ws, "crlf.txt")).replace(/crlf\.txt/g, "X");
+    assert.notEqual(lf, crlf, "CRLF and LF content must render to different diff text");
+    assert.ok(crlf.includes("+a\r"), "CRLF rendering must retain the carriage return");
+    assert.ok(!lf.includes("\r"), "LF rendering must not introduce a carriage return");
+  });
+
+  it("yields a DIFFERENT diffHash for CRLF vs LF content at the same path", async () => {
+    const wsLf = join(dir, "fslf");
+    await mkdir(wsLf, { recursive: true });
+    const blLf = await captureBaseline(wsLf);
+    await writeFile(join(wsLf, "f.txt"), "a\nb\nc\n");
+    const dLf = await buildReviewDiff(wsLf, blLf);
+
+    const wsCr = join(dir, "fscr");
+    await mkdir(wsCr, { recursive: true });
+    const blCr = await captureBaseline(wsCr);
+    await writeFile(join(wsCr, "f.txt"), "a\r\nb\r\nc\r\n");
+    const dCr = await buildReviewDiff(wsCr, blCr);
+
+    assert.notEqual(
+      dLf.diffHash,
+      dCr.diffHash,
+      "byte-distinct CRLF vs LF content must produce different diffHash"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AUDIT — git() bounds stderr with the same byte cap as stdout
+// ---------------------------------------------------------------------------
+
+describe("git() bounds stderr accumulation", () => {
+  it("captures error stderr as a decoded string (chunk-buffered, not unbounded concat)", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    // An invalid ref makes git write a 'fatal:' line to stderr and exit nonzero.
+    const r = await git(["rev-parse", "--verify", "no-such-ref-xyz"], process.cwd());
+    assert.notEqual(r.code, 0, "invalid ref should exit nonzero");
+    assert.equal(typeof r.stderr, "string", "stderr must be a decoded string");
+    assert.ok(r.stderr.length > 0, "stderr from a failing git command must be captured");
+  });
+
+  it("decodes multibyte stderr without splitting a UTF-8 sequence", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    // A non-ASCII bad ref forces a multibyte sequence into git's stderr message;
+    // the chunked Buffer.concat decode must round-trip it intact.
+    const r = await git(["rev-parse", "--verify", "réf-入"], process.cwd());
+    assert.equal(typeof r.stderr, "string");
+    assert.ok(!r.stderr.includes("�"), "stderr must not contain a replacement char");
+  });
+
+  it("never lets stderr exceed the documented byte cap", async () => {
+    // Structural guarantee: a real 64MB+ stderr flood is impractical to drive
+    // through `git` in a unit test, so assert the source enforces the same
+    // MAX_*_BYTES ceiling on stderr that it does on stdout (the audited fix).
+    const src = await readFile(
+      new URL("../../src/core/git.js", import.meta.url),
+      "utf8"
+    );
+    assert.ok(/MAX_STDERR_BYTES/.test(src), "git.js must define a stderr byte cap");
+    assert.ok(
+      /stderrBytes\s*>=\s*MAX_STDERR_BYTES|stderrBytes\s*\+/.test(src),
+      "git.js must bound stderr accumulation against the cap"
+    );
   });
 });

@@ -10,23 +10,107 @@
 import { spawnSync } from "node:child_process";
 
 // Default timeout in seconds when neither config nor job specifies one.
+// Used by the FIXED-deadline runWithTimeout (verify() probes). For the actual
+// review run(), see the inactivity/hard-cap watchdog constants below.
 export const DEFAULT_TIMEOUT_SEC = 120;
+
+// Default inactivity window (seconds) for the review run() watchdog: the
+// reviewer is force-killed only after this many seconds with NO output on
+// stdout/stderr (a liveness check), NOT at a fixed wall-clock deadline — a
+// reviewer that is still streaming output is never killed mid-review. A truly
+// hung reviewer (no output) is still caught quickly, so the gate never hangs.
+export const DEFAULT_INACTIVITY_SEC = 120;
+
+// Absolute hard-cap backstop (seconds) for the review run() watchdog: even a
+// reviewer that keeps dribbling output is force-killed after this long, so the
+// gate can never hang forever (preserves the async-lifecycle invariant). Set
+// far above any real review so it only ever catches a runaway.
+export const DEFAULT_HARDCAP_SEC = 1800;
 
 // Maximum stdout/stderr bytes captured from the reviewer process.
 export const MAX_OUTPUT_BYTES = 1024 * 1024;
+
+// Grace period (ms) on POSIX between the initial SIGTERM and the SIGKILL
+// escalation in forceKill. A well-behaved child exits on SIGTERM within this
+// window; a child that TRAPS or ignores SIGTERM (e.g. `trap '' TERM; sleep`) is
+// then unconditionally SIGKILLed so a hung/malicious reviewer can never survive
+// the watchdog as a zombie holding the gate's permissions.
+export const FORCE_KILL_GRACE_MS = 2000;
 
 // Sentinel value returned by the timeout race arm.
 export const TIMEOUT_SENTINEL = Symbol("timeout");
 
 /**
+ * Clamp a configured seconds value to a sane positive number, else the fallback.
+ *
+ * Defense-in-depth for the reviewer timers: a 0 / negative / NaN / non-numeric
+ * timeout would instantly fire the watchdog and wedge the gate (a DoS primitive
+ * if it ever came from an untrusted layer). The config trust floor already keeps
+ * a project from setting these, but a malformed user value or test override is
+ * neutralized here too.
+ *
+ * @param {*} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+export function sanePositiveSec(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * Scan the FULL (untruncated) stream for any of `markers`, even when the captured
+ * string is byte-capped. A reviewer can flood stdout/stderr past MAX_OUTPUT_BYTES
+ * BEFORE printing a security-critical marker (e.g. opencode's silent
+ * agent-fallback warning); if the marker check ran only on the truncated captured
+ * string it would be defeated by the flood and a writable-agent review wrongly
+ * accepted. This scanner observes EVERY chunk before truncation and carries a tail
+ * of `maxMarkerLen-1` bytes across chunk boundaries so a marker split across two
+ * chunks is still detected.
+ *
+ * @param {string[]} markers  - substrings whose presence flips the hit flag
+ * @returns {{ onChunk(chunk: Buffer): void, hit(): boolean }}
+ */
+export function createMarkerScanner(markers) {
+  const list = (markers || []).map(String).filter(Boolean);
+  let found = false;
+  let carry = "";
+  // Longest marker - 1: the max overlap that could straddle a chunk boundary.
+  const overlap = list.reduce((m, s) => Math.max(m, s.length), 0);
+  return {
+    onChunk(chunk) {
+      if (found || list.length === 0) return;
+      const text = carry + chunk.toString("utf8");
+      for (const marker of list) {
+        if (text.includes(marker)) {
+          found = true;
+          carry = "";
+          return;
+        }
+      }
+      // Keep only the tail that could still begin a marker spanning into the next
+      // chunk; bound carry growth so a flood cannot balloon memory.
+      carry = overlap > 1 ? text.slice(-(overlap - 1)) : "";
+    },
+    hit() {
+      return found;
+    },
+  };
+}
+
+/**
  * Collect one of a child's output streams up to `maxBytes`, then resolve.
+ *
+ * Optionally also runs a marker scanner over the FULL untruncated stream (see
+ * createMarkerScanner) so a security-critical marker that appears AFTER the byte
+ * cap is still detected even though it is dropped from the returned string.
  *
  * @param {import("node:child_process").ChildProcess} child
  * @param {"stdout"|"stderr"} which   - which stream to read
  * @param {number} [maxBytes]         - byte cap (defaults to MAX_OUTPUT_BYTES)
+ * @param {{onChunk:Function}} [scanner] - optional marker scanner fed every chunk
  * @returns {Promise<string>}
  */
-export function collectStream(child, which, maxBytes = MAX_OUTPUT_BYTES) {
+export function collectStream(child, which, maxBytes = MAX_OUTPUT_BYTES, scanner = null) {
   return new Promise((resolve) => {
     const stream = child[which];
     if (!stream) {
@@ -38,6 +122,9 @@ export function collectStream(child, which, maxBytes = MAX_OUTPUT_BYTES) {
     let truncated = false;
 
     stream.on("data", (chunk) => {
+      // Feed the marker scanner on EVERY chunk BEFORE the truncation short-circuit
+      // — a flood must never hide a post-cap marker from the scanner.
+      if (scanner) scanner.onChunk(chunk);
       if (truncated) return;
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
@@ -68,10 +155,11 @@ export function collectOutput(child) {
  * Collect stderr from a child process up to MAX_OUTPUT_BYTES.
  *
  * @param {import("node:child_process").ChildProcess} child
+ * @param {{onChunk:Function}} [scanner] - optional marker scanner (see collectStream)
  * @returns {Promise<string>}
  */
-export function collectStderr(child) {
-  return collectStream(child, "stderr");
+export function collectStderr(child, scanner = null) {
+  return collectStream(child, "stderr", MAX_OUTPUT_BYTES, scanner);
 }
 
 /**
@@ -91,7 +179,16 @@ export function waitForExit(child) {
  * Kill a child process tree as forcefully as possible.
  * On Windows, cmd.exe /c wrappers spawn node as a child; killing only the
  * cmd.exe parent leaves the node child running. Use taskkill /F /T to
- * terminate the entire process tree.
+ * terminate the entire process tree (already unconditional/forceful).
+ *
+ * On POSIX, send SIGTERM first (graceful) but ESCALATE to SIGKILL after a short
+ * grace period: a child that traps or ignores SIGTERM (e.g. a malicious custom
+ * reviewer running `trap '' TERM; sleep 3600`) would otherwise survive the
+ * watchdog kill as a zombie still holding the gate's full permissions — and with
+ * opencode's model-fallback chain, each timed-out model iteration could leak
+ * another. The follow-up SIGKILL is unconditional, so a hung/malicious reviewer
+ * is reliably terminated. The escalation timer is unref()'d so it never holds the
+ * Node event loop open if the gate is otherwise done.
  *
  * @param {import("node:child_process").ChildProcess} child
  */
@@ -103,7 +200,20 @@ export function forceKill(child) {
         windowsHide: true,
       });
     } else {
+      // Graceful first, then an unconditional SIGKILL after the grace period so a
+      // SIGTERM-trapping child cannot survive as a zombie.
       child.kill("SIGTERM");
+      const killTimer = setTimeout(() => {
+        try {
+          // child.killed only reflects that a signal was delivered, not that the
+          // process exited; re-send SIGKILL unconditionally. exitCode === null &&
+          // signalCode === null means it has not yet been reaped.
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+        } catch { /* already gone */ }
+      }, FORCE_KILL_GRACE_MS);
+      if (killTimer && typeof killTimer.unref === "function") killTimer.unref();
     }
   } catch { /* ignore */ }
 }
@@ -158,4 +268,94 @@ export async function runWithTimeout(child, { timeoutMs, captureStderr = false }
   }
   const [stdout, exitCode] = raceResult;
   return { stdout, stderr: "", exitCode };
+}
+
+/**
+ * Run a spawned child under an INACTIVITY watchdog instead of a fixed deadline.
+ *
+ * Unlike runWithTimeout (a single wall-clock timer), this kills the child only
+ * when BOTH liveness checks say it is stuck:
+ *  - inactivity: no stdout/stderr output for `inactivityMs` (the timer RESETS on
+ *    every output chunk, so a reviewer still streaming is never killed); and
+ *  - hard cap: an absolute `hardCapMs` backstop that is NEVER reset, so even a
+ *    reviewer that dribbles output forever is eventually killed (the gate can
+ *    never hang). Whichever fires first force-kills the child tree.
+ *
+ * The activity listeners are attached to BOTH stdout and stderr, which also
+ * DRAINS stderr even when captureStderr is false — a stderr flood can therefore
+ * never deadlock on a full OS pipe buffer.
+ *
+ * On a kill, returns TIMEOUT_SENTINEL (same contract as runWithTimeout) so every
+ * caller's existing fail-closed handling applies unchanged.
+ *
+ * @param {import("node:child_process").ChildProcess} child
+ * @param {object} opts
+ * @param {number} opts.inactivityMs      - max ms of no-output before killing
+ * @param {number} opts.hardCapMs         - absolute ms backstop before killing
+ * @param {boolean} [opts.captureStderr]  - also return stderr (default false;
+ *        stderr is drained either way)
+ * @param {string[]} [opts.stderrMarkers] - substrings to scan for over the FULL
+ *        untruncated stderr stream; the result's `stderrMarkerHit` is true if any
+ *        appeared. Detection cannot be defeated by flooding stderr past the byte
+ *        cap before the marker (the scanner sees every chunk pre-truncation).
+ * @returns {Promise<{stdout:string, stderr:string, exitCode:number|null, stderrMarkerHit:boolean} | typeof TIMEOUT_SENTINEL>}
+ */
+export async function runWithWatchdog(child, { inactivityMs, hardCapMs, captureStderr = false, stderrMarkers = null }) {
+  // Scan the FULL stderr stream for security-critical markers so a flood that
+  // pushes the marker past MAX_OUTPUT_BYTES cannot hide it from the check.
+  const scanner = stderrMarkers && stderrMarkers.length ? createMarkerScanner(stderrMarkers) : null;
+  const collectors = captureStderr
+    ? [collectOutput(child), collectStderr(child, scanner), waitForExit(child)]
+    : [collectOutput(child), waitForExit(child)];
+  // When stderr is NOT captured but markers were requested, attach the scanner
+  // directly to the (drained) stderr stream so detection still works.
+  if (!captureStderr && scanner && child.stderr) {
+    child.stderr.on("data", (chunk) => scanner.onChunk(chunk));
+  }
+  const processPromise = Promise.all(collectors);
+
+  let inactivityTimer;
+  let hardCapTimer;
+  let settled = false;
+  const timeoutPromise = new Promise((resolve) => {
+    const fire = () => { if (!settled) resolve(TIMEOUT_SENTINEL); };
+    const resetInactivity = () => {
+      if (settled) return;
+      clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(fire, inactivityMs);
+      if (inactivityTimer && typeof inactivityTimer.unref === "function") inactivityTimer.unref();
+    };
+    // Any output (stdout OR stderr) is liveness: reset the inactivity window.
+    // Attaching to stderr here also keeps it FLOWING (drained) so a stderr flood
+    // cannot deadlock even when captureStderr is false.
+    if (child.stdout) child.stdout.on("data", resetInactivity);
+    if (child.stderr) child.stderr.on("data", resetInactivity);
+    resetInactivity(); // arm the initial inactivity window
+    hardCapTimer = setTimeout(fire, hardCapMs);
+    if (hardCapTimer && typeof hardCapTimer.unref === "function") hardCapTimer.unref();
+  });
+
+  let raceResult;
+  try {
+    raceResult = await Promise.race([processPromise, timeoutPromise]);
+  } finally {
+    // Clear BOTH timers on every exit path (timeout AND normal completion) so a
+    // pending setTimeout never holds the event loop open after run() returns.
+    settled = true;
+    clearTimeout(inactivityTimer);
+    clearTimeout(hardCapTimer);
+  }
+
+  if (raceResult === TIMEOUT_SENTINEL) {
+    forceKill(child);
+    return TIMEOUT_SENTINEL;
+  }
+
+  const stderrMarkerHit = scanner ? scanner.hit() : false;
+  if (captureStderr) {
+    const [stdout, stderr, exitCode] = raceResult;
+    return { stdout, stderr, exitCode, stderrMarkerHit };
+  }
+  const [stdout, exitCode] = raceResult;
+  return { stdout, stderr: "", exitCode, stderrMarkerHit };
 }

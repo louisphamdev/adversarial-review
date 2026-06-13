@@ -562,6 +562,347 @@ describe("opencode adapter", () => {
     }
   });
 
+  // --- run() — model fallback chain ---
+
+  // Build a stub that dispatches on the `-m <model>` value: a model whose name is
+  // in `rateLimited` emits a rate-limit error to stderr and exits 1 (a transient
+  // failure -> the adapter should advance to the next model); any other model
+  // appends its name to `recModelsPath` and prints a valid verdict.
+  async function writeModelStub(job, { rateLimited = [], recModelsPath = "", agentFallbackModels = [] } = {}) {
+    const dir = await mkdtemp(join(tmpdir(), "ar-oc-model-"));
+    const stubPath = join(dir, "model-stub.cjs");
+    const cfg = { verdictBlock: buildVerdictOutput(job, "pass"), rateLimited, recModelsPath, agentFallbackModels };
+    await writeFile(
+      stubPath,
+      `
+const fs = require("node:fs");
+const CFG = ${JSON.stringify(cfg)};
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("test-stub 1.0.0\\n"); process.exit(0); }
+if (argv[0] === "agent" && argv[1] === "list") { process.stdout.write("adversarial-reviewer\\n"); process.exit(0); }
+if (argv[0] === "run") {
+  const mi = argv.indexOf("-m"); const model = mi >= 0 ? argv[mi + 1] : "";
+  let stdin = ""; process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (c) => { stdin += c; });
+  process.stdin.on("end", () => {
+    if (CFG.recModelsPath) { try { fs.appendFileSync(CFG.recModelsPath, model + "\\n"); } catch {} }
+    if (CFG.agentFallbackModels.includes(model)) { process.stderr.write('agent "adversarial-reviewer" not found. Falling back to default agent\\n'); process.stdout.write(CFG.verdictBlock); process.exit(0); }
+    if (CFG.rateLimited.includes(model)) { process.stderr.write("Error: 429 rate limit exceeded\\n"); process.exit(1); }
+    process.stdout.write(CFG.verdictBlock); process.exit(0);
+  });
+  return;
+}
+process.exit(2);
+`,
+      "utf8"
+    );
+    return { dir, stubPath, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  }
+
+  it("run() falls back to the next model when the first model is rate-limited", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-fb-"));
+    const recModels = join(recDir, "models.txt");
+    const stub = await writeModelStub(job, { rateLimited: ["rl-model"], recModelsPath: recModels });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["rl-model", "good-model"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, true, `Expected fallback to succeed, got error: ${result.error}`);
+      assert.equal(result.verdict.verdict, "pass");
+      // It tried the rate-limited model FIRST, then fell back to the next one.
+      const invoked = (await readFile(recModels, "utf8")).trim().split("\n");
+      assert.deepEqual(invoked, ["rl-model", "good-model"], "tried rl-model then fell back to good-model");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  it("run() fails closed (ok:false) when ALL configured models fail", async () => {
+    const stub = await writeModelStub(job, { rateLimited: ["rl-1", "rl-2"] });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["rl-1", "rl-2"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, false, "all models failing must fail closed");
+      assert.ok(result.error, "should carry the last operational error");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+    }
+  });
+
+  it("run() stops at the FIRST model that returns a valid verdict (no model-shopping)", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-stop-"));
+    const recModels = join(recDir, "models.txt");
+    const stub = await writeModelStub(job, { recModelsPath: recModels });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["good-model", "should-not-run"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, true);
+      const invoked = (await readFile(recModels, "utf8")).trim().split("\n");
+      assert.deepEqual(invoked, ["good-model"], "must not try a second model after a valid verdict");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  // REGRESSION (Finding 2): a model id is validated as a safe single token before
+  // it is passed as the `-m` arg. An UNSAFE model (leading dash => flag injection;
+  // or whitespace/shell-meta) must make run() FAIL CLOSED with "invalid_model" and
+  // must NEVER be forwarded to opencode as an argument.
+  it("run() fails closed (invalid_model) for a leading-dash model and never passes it as an arg", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-badmodel-"));
+    const recArgs = join(recDir, "args.json");
+    const stub = await writeOpencodeStub(job, { verdict: "pass", recordArgsPath: recArgs });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      // A model that starts with '-' would be smuggled in as an injected flag.
+      const config = { reviewers: { opencode: { models: ["--print-and-exit"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, false, "an unsafe model must fail closed");
+      assert.equal(result.error, "invalid_model");
+      // The stub must never have been invoked with the unsafe model as an arg.
+      let recorded = false;
+      try { await readFile(recArgs, "utf8"); recorded = true; } catch { recorded = false; }
+      assert.equal(recorded, false, "run() must reject BEFORE spawning with an unsafe model");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  it("run() fails closed (invalid_model) for a model containing whitespace/shell-meta", async () => {
+    const stub = await writeOpencodeStub(job, { verdict: "pass" });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["a b; rm -rf"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, "invalid_model");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+    }
+  });
+
+  it("run() accepts a realistic safe model id (letters/digits/._/:- )", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-okmodel-"));
+    const recArgs = join(recDir, "args.json");
+    const stub = await writeOpencodeStub(job, { verdict: "pass", recordArgsPath: recArgs });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["anthropic/claude-3.5-sonnet"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
+      const args = JSON.parse(await readFile(recArgs, "utf8"));
+      const mi = args.indexOf("-m");
+      assert.ok(mi >= 0 && args[mi + 1] === "anthropic/claude-3.5-sonnet", `safe model must be passed via -m: ${JSON.stringify(args)}`);
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  // REGRESSION (Finding 3): the silent agent-fallback marker must be detected even
+  // when the reviewer floods stderr past MAX_OUTPUT_BYTES BEFORE printing it. The
+  // adapter passes the markers to the watchdog's incremental scanner, so the
+  // writable-default-agent verdict is rejected as reviewer_agent_fallback even
+  // though the marker is truncated out of the captured stderr string.
+  it("run() rejects fallback even when the marker is flooded past the stderr cap", async () => {
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-oc-floodmark-"));
+    const stubPath = join(stubDir, "flood-marker.cjs");
+    const verdictBlock = buildVerdictOutput(job, "pass");
+    // run: flood >1MB stderr (drain-aware) THEN the fallback marker THEN a pass
+    // verdict on stdout, exit 0. Without flood-proof scanning this would be
+    // ACCEPTED (ok:true) because the marker is truncated from the captured string.
+    await writeFile(
+      stubPath,
+      [
+        "const fs = require('node:fs');",
+        `const VB = ${JSON.stringify(verdictBlock)};`,
+        "const argv = process.argv.slice(2);",
+        "if (argv.includes('--version')) { process.stdout.write('v\\n'); process.exit(0); }",
+        "if (argv[0] === 'agent' && argv[1] === 'list') { process.stdout.write('adversarial-reviewer\\n'); process.exit(0); }",
+        "if (argv[0] === 'run') {",
+        "  let stdin=''; process.stdin.setEncoding('utf8');",
+        "  process.stdin.on('data', c => stdin += c);",
+        "  process.stdin.on('end', () => {",
+        "    const total = 1024*1024 + 65536; let written = 0; const chunk = Buffer.alloc(16*1024, 0x45);",
+        "    function pump(){ while (written < total){ const ok = process.stderr.write(chunk); written += chunk.length; if (!ok){ process.stderr.once('drain', pump); return; } }",
+        "      process.stderr.write('Falling back to default agent\\n', () => process.stdout.write(VB, () => process.exit(0))); }",
+        "    pump();",
+        "  });",
+        "  return;",
+        "}",
+        "process.exit(2);",
+      ].join("\n"),
+      "utf8"
+    );
+    const shim = await createOpencodeShim(stubPath);
+    try {
+      const config = { reviewers: { opencode: { timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, false, "a flooded-then-fallback run must be rejected");
+      assert.equal(result.error, "reviewer_agent_fallback");
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  it("run() does NOT retry other models on a security agent-fallback (stops immediately)", async () => {
+    const recDir = await mkdtemp(join(tmpdir(), "ar-oc-afb-"));
+    const recModels = join(recDir, "models.txt");
+    const stub = await writeModelStub(job, { agentFallbackModels: ["m1"], recModelsPath: recModels });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { models: ["m1", "m2"], timeoutSec: 10 } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.run(job, { env: shim.env });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, "reviewer_agent_fallback", "agent fallback is a hard security stop");
+      const invoked = (await readFile(recModels, "utf8")).trim().split("\n");
+      assert.deepEqual(invoked, ["m1"], "must NOT try m2 after a writable-agent fallback");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+      await rm(recDir, { recursive: true, force: true });
+    }
+  });
+
+  // --- #37: agent-existence check must be exact, not a substring ---
+
+  // A WRITABLE superstring agent name (e.g. "adversarial-reviewer-evil") must NOT
+  // satisfy the bundled-agent existence check; the old `stdout.includes()` would
+  // wrongly accept it.
+  it("verify() rejects a superstring agent name (no substring match)", async () => {
+    const stub = await writeOpencodeStub(job, { agents: ["adversarial-reviewer-evil", "build"] });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { readOnlyConfig: true } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.verify(shim.env);
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "reviewer_agent_missing");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+    }
+  });
+
+  // --- ASYNC-1: verify() bounds the `opencode --version` probe with a timeout ---
+
+  // A hung `opencode --version` must NOT hang the gate forever. verify() wraps
+  // the probe in runWithTimeout; with an injected short timeout it resolves
+  // promptly with reason "version_check_timeout" (the child is force-killed).
+  it("verify() returns version_check_timeout when --version hangs past the verify timeout", async () => {
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-oc-hang-ver-"));
+    const stubPath = join(stubDir, "hang-version.cjs");
+    // Dispatch on argv: hang on --version, behave normally otherwise (unreached).
+    await writeFile(
+      stubPath,
+      [
+        "const argv = process.argv.slice(2);",
+        'if (argv.includes("--version")) { setTimeout(() => {}, 60000); }',
+        'else { process.stdout.write("adversarial-reviewer\\n"); process.exit(0); }',
+      ].join("\n"),
+      "utf8"
+    );
+    const shim = await createOpencodeShim(stubPath);
+    try {
+      const adapter = createAdapter({});
+      const start = Date.now();
+      const result = await adapter.verify(shim.env, { verifyTimeoutMs: 200 });
+      const elapsed = Date.now() - start;
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "version_check_timeout");
+      assert.ok(elapsed < 5000, `verify() should resolve promptly on timeout, took ${elapsed}ms`);
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  // --- ASYNC-1: verify() bounds the `opencode agent list` probe with a timeout ---
+
+  // The agent-list probe is the SECOND verify() spawn; it must be bounded too.
+  // --version answers normally; `agent list` hangs -> agent_list_timeout.
+  it("verify() returns agent_list_timeout when `agent list` hangs past the verify timeout", async () => {
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-oc-hang-agent-"));
+    const stubPath = join(stubDir, "hang-agent.cjs");
+    await writeFile(
+      stubPath,
+      [
+        "const argv = process.argv.slice(2);",
+        'if (argv.includes("--version")) { process.stdout.write("test-stub 1.0.0\\n"); process.exit(0); }',
+        'if (argv[0] === "agent" && argv[1] === "list") { setTimeout(() => {}, 60000); }',
+        "else { process.exit(2); }",
+      ].join("\n"),
+      "utf8"
+    );
+    const shim = await createOpencodeShim(stubPath);
+    try {
+      const adapter = createAdapter({});
+      const start = Date.now();
+      const result = await adapter.verify(shim.env, { verifyTimeoutMs: 200 });
+      const elapsed = Date.now() - start;
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "agent_list_timeout");
+      assert.ok(elapsed < 5000, `verify() should resolve promptly on timeout, took ${elapsed}ms`);
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  // --- ASYNC-2: verify() drains stderr so a stderr flood cannot deadlock ---
+
+  // A binary flooding >70KB to stderr fills the OS pipe buffer and DEADLOCKS
+  // verify() forever unless stderr is drained. The probe uses captureStderr, so
+  // a --version (and agent list) that flood >70KB to stderr then exit 0 still
+  // complete and verify() succeeds.
+  it("verify() completes (no deadlock) when probes flood >70KB to stderr then exit 0", async () => {
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-oc-flood-"));
+    const stubPath = join(stubDir, "flood.cjs");
+    await writeFile(
+      stubPath,
+      [
+        "const argv = process.argv.slice(2);",
+        'process.stderr.write("E".repeat(70 * 1024));',
+        'if (argv.includes("--version")) { process.stdout.write("test-stub 1.0.0\\n"); process.exit(0); }',
+        'if (argv[0] === "agent" && argv[1] === "list") { process.stdout.write("adversarial-reviewer\\n"); process.exit(0); }',
+        "process.exit(2);",
+      ].join("\n"),
+      "utf8"
+    );
+    const shim = await createOpencodeShim(stubPath);
+    try {
+      const adapter = createAdapter({});
+      const start = Date.now();
+      const result = await adapter.verify(shim.env, { verifyTimeoutMs: 10000 });
+      const elapsed = Date.now() - start;
+      assert.equal(result.ok, true, `verify failed: ${result.reason}`);
+      assert.ok(elapsed < 5000, `verify() deadlocked on stderr flood (took ${elapsed}ms)`);
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
+
   // --- Windows .cmd resolution ---
 
   it("verify() resolves opencode.cmd via PATHEXT on Windows", async () => {

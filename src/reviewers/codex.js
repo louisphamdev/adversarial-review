@@ -10,12 +10,20 @@ import { tmpdir } from "node:os";
 import { resolveExecutable, spawnResolved } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
 import {
-  collectOutput,
-  waitForExit,
   runWithTimeout,
+  runWithWatchdog,
+  sanePositiveSec,
   TIMEOUT_SENTINEL,
-  DEFAULT_TIMEOUT_SEC,
+  DEFAULT_INACTIVITY_SEC,
+  DEFAULT_HARDCAP_SEC,
 } from "./_shared.js";
+
+// Bounded timeout (ms) for the verify() probe spawn (`codex --version`). run()
+// is protected by runWithTimeout, but verify() was not — a hung reviewer binary
+// would hang the gate FOREVER. This default applies unless a caller injects a
+// shorter value via verify()'s options (tests use a short value so the timeout
+// path can be exercised quickly).
+const DEFAULT_VERIFY_TIMEOUT_MS = 15000;
 
 /**
  * Build the hardened prompt text for the Codex reviewer.
@@ -84,7 +92,11 @@ function buildPrompt(job, diffPath) {
  */
 export function createAdapter(config) {
   const reviewerConfig = config?.reviewers?.codex || {};
-  const timeoutSec = reviewerConfig.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+  // timeoutSec is the INACTIVITY window (no-output liveness) for the review run,
+  // not a fixed wall-clock deadline; maxTimeoutSec is the absolute hard-cap
+  // backstop. A reviewer still streaming output is never killed mid-review.
+  const inactivitySec = sanePositiveSec(reviewerConfig.timeoutSec, DEFAULT_INACTIVITY_SEC);
+  const hardCapSec = sanePositiveSec(reviewerConfig.maxTimeoutSec, DEFAULT_HARDCAP_SEC);
 
   return {
     id: "codex",
@@ -98,24 +110,36 @@ export function createAdapter(config) {
      * { requireAgent: false } to every adapter without special-casing opencode.
      *
      * @param {object} [env]  - environment variables (defaults to process.env)
-     * @param {object} [_options]  - accepted for call-site uniformity; ignored
+     * @param {object} [options]  - the requireAgent flag is accepted for
+     *        call-site uniformity and ignored (codex has no agent phase);
+     *        options.verifyTimeoutMs injects the probe timeout (tests use a short
+     *        value to exercise the timeout path quickly).
      * @returns {Promise<{ok:boolean, resolvedPath?:string, version?:string, capabilities?:object, reason?:string}>}
      */
-    async verify(env = process.env, _options = {}) {
+    async verify(env = process.env, { verifyTimeoutMs = DEFAULT_VERIFY_TIMEOUT_MS } = {}) {
       const resolvedPath = await resolveExecutable("codex", env);
       if (!resolvedPath) {
         return { ok: false, reason: "missing_binary" };
       }
 
       // Run `codex --version` to confirm the binary is functional.
+      //
+      // ASYNC-1/ASYNC-2: this probe is bounded by runWithTimeout — a hung binary
+      // is force-killed after verifyTimeoutMs (version_check_timeout) instead of
+      // hanging the gate forever, and captureStderr drains BOTH stdout and stderr
+      // so a binary flooding >64KB to stderr cannot deadlock on a full OS pipe
+      // buffer.
       let versionOutput = "";
       try {
-        const child = spawnResolved(resolvedPath, ["--version"], { env });
-        const [output, code] = await Promise.all([collectOutput(child), waitForExit(child)]);
-        if (code !== 0) {
+        const child = spawnResolved(resolvedPath, ["--version"], { env, stdio: ["ignore", "pipe", "pipe"] });
+        const raceResult = await runWithTimeout(child, { timeoutMs: verifyTimeoutMs, captureStderr: true });
+        if (raceResult === TIMEOUT_SENTINEL) {
+          return { ok: false, reason: "version_check_timeout" };
+        }
+        if (raceResult.exitCode !== 0) {
           return { ok: false, reason: "version_check_failed" };
         }
-        versionOutput = output.trim();
+        versionOutput = raceResult.stdout.trim();
       } catch {
         return { ok: false, reason: "version_check_error" };
       }
@@ -144,7 +168,9 @@ export function createAdapter(config) {
     async run(job, io = {}) {
       const env = io.env || process.env;
       const cwd = io.cwd || job.cwd || process.cwd();
-      const effectiveTimeout = (io.timeoutSec ?? timeoutSec) * 1000;
+      // Inactivity window + absolute hard cap for the run watchdog (ms).
+      const inactivityMs = sanePositiveSec(io.timeoutSec, inactivitySec) * 1000;
+      const hardCapMs = sanePositiveSec(io.maxTimeoutSec, hardCapSec) * 1000;
 
       // Resolve the binary path.
       const resolvedPath = await resolveExecutable("codex", env);
@@ -209,10 +235,13 @@ export function createAdapter(config) {
           child.stdin.end(prompt);
         }
 
-        // Race the process completion against the timeout. On timeout, the child
-        // process tree is force-killed inside runWithTimeout.
-        const raceResult = await runWithTimeout(child, {
-          timeoutMs: effectiveTimeout,
+        // Inactivity watchdog: kill only after no output for inactivityMs (the
+        // timer resets on every chunk) or the hardCapMs backstop, whichever fires
+        // first. The child process tree is force-killed inside runWithWatchdog,
+        // which also drains stderr so a flood cannot deadlock the pipe.
+        const raceResult = await runWithWatchdog(child, {
+          inactivityMs,
+          hardCapMs,
         });
 
         if (raceResult === TIMEOUT_SENTINEL) {

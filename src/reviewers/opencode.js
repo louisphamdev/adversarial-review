@@ -10,12 +10,20 @@ import { tmpdir } from "node:os";
 import { resolveExecutable, spawnResolved } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
 import {
-  collectOutput,
-  waitForExit,
   runWithTimeout,
+  runWithWatchdog,
+  sanePositiveSec,
   TIMEOUT_SENTINEL,
-  DEFAULT_TIMEOUT_SEC,
+  DEFAULT_INACTIVITY_SEC,
+  DEFAULT_HARDCAP_SEC,
 } from "./_shared.js";
+
+// Bounded timeout (ms) for verify() probe spawns (`opencode --version`,
+// `opencode agent list`). run() is protected by runWithTimeout, but verify() was
+// not — a hung reviewer binary would hang the gate FOREVER. This default applies
+// unless a caller injects a shorter value via verify()'s options (tests use a
+// short value so the timeout path can be exercised quickly).
+const DEFAULT_VERIFY_TIMEOUT_MS = 15000;
 
 // The bundled, read-only opencode agent that delivers reviewer isolation. In
 // enforced / strict-ci modes this name is ALWAYS used: a project-supplied agent
@@ -31,6 +39,53 @@ const BUNDLED_READONLY_AGENT = "adversarial-reviewer";
 // We match the common suffix so EVERY fallback reason is caught: a read-only
 // gate must never accept a review produced by the writable default agent.
 const AGENT_FALLBACK_MARKER = "Falling back to default agent";
+
+// A model id is passed as the value of opencode's `-m` flag. The config trust
+// floor already strips PROJECT-supplied models, so the list is user/default
+// controlled — but as DEFENSE-IN-DEPTH for argument safety we still require each
+// model to be a safe single token before handing it to spawnResolved:
+//  - it must be a non-empty string;
+//  - it must NOT begin with '-' (a leading dash would smuggle an extra FLAG into
+//    the opencode invocation — argument injection — on EVERY platform, not just
+//    cmd.exe batch wrappers); and
+//  - it must contain no whitespace or shell/cmd metacharacters (so it can never
+//    expand into multiple args or break out of a batch wrapper).
+// Allow the realistic model-id alphabet: letters, digits, and . _ - / : (e.g.
+// "anthropic/claude-3.5-sonnet", "openrouter:meta-llama/llama-3.1-70b"). A model
+// that fails this check makes run() FAIL CLOSED (the gate blocks) rather than
+// silently passing an attacker-shaped token through.
+const SAFE_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._/:-]*$/;
+
+/**
+ * Whether `model` is a safe single token to pass as the `-m` argument value.
+ * Rejects empty strings, a leading dash (flag injection), and any whitespace or
+ * shell/cmd metacharacter.
+ *
+ * @param {*} model
+ * @returns {boolean}
+ */
+function isSafeModelToken(model) {
+  return typeof model === "string" && model.length > 0 && SAFE_MODEL_RE.test(model);
+}
+
+/**
+ * Whether `name` appears as a WHOLE agent entry in `opencode agent list` output.
+ *
+ * The list prints one agent per line (optionally a leading bullet and a trailing
+ * description). A naive `stdout.includes(name)` substring test would also match a
+ * DIFFERENT, possibly WRITABLE, superstring agent (e.g. "adversarial-reviewer-x"
+ * contains "adversarial-reviewer"), letting the enforced isolation check pass for
+ * an agent run() will never use. Match the line's first token EXACTLY instead.
+ *
+ * @param {string} stdout  - `opencode agent list` output
+ * @param {string} name    - the exact agent name to require
+ * @returns {boolean}
+ */
+function agentListed(stdout, name) {
+  return String(stdout)
+    .split(/\r?\n/)
+    .some((line) => line.trim().replace(/^[-*•\s]+/, "").split(/\s+/)[0] === name);
+}
 
 /**
  * Build the brief text delivered to opencode via STDIN.
@@ -67,7 +122,23 @@ function buildBrief(job) {
  */
 export function createAdapter(config) {
   const reviewerConfig = config?.reviewers?.opencode || {};
-  const timeoutSec = reviewerConfig.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+  // timeoutSec is now the INACTIVITY window (no-output liveness threshold) for
+  // the review run, NOT a fixed wall-clock deadline — a reviewer that is still
+  // streaming output is never killed mid-review. maxTimeoutSec is the absolute
+  // hard-cap backstop so a runaway can never hang the gate forever.
+  const inactivitySec = sanePositiveSec(reviewerConfig.timeoutSec, DEFAULT_INACTIVITY_SEC);
+  const hardCapSec = sanePositiveSec(reviewerConfig.maxTimeoutSec, DEFAULT_HARDCAP_SEC);
+  // Optional, model-AGNOSTIC fallback chain. Each model is tried in order; on a
+  // transient/operational failure (rate-limit, crash, empty/garbled output) the
+  // next model is tried, so a single rate-limited model no longer false-blocks
+  // the gate. A real verdict or a SECURITY stop ends the chain immediately. The
+  // list is user/default-controlled — the load-config trust floor strips any
+  // PROJECT-supplied models so a hostile repo cannot redirect the gate to a weak
+  // rubber-stamp model. Empty/unset -> a single default attempt with NO -m flag
+  // (unchanged behavior); the plugin ships NO vendor defaults.
+  const models = Array.isArray(reviewerConfig.models) && reviewerConfig.models.length
+    ? reviewerConfig.models.slice()
+    : [null];
   // The readOnly capability is asserted when the config explicitly uses the
   // bundled read-only opencode configuration.
   const usesBundledReadOnlyConfig = reviewerConfig.readOnlyConfig === true;
@@ -118,23 +189,35 @@ export function createAdapter(config) {
      * @param {object} [options]
      * @param {boolean} [options.requireAgent=true] - when false, skip the
      *        `opencode agent list` / `reviewer_agent_missing` check.
+     * @param {number} [options.verifyTimeoutMs] - bounded timeout (ms) for each
+     *        probe spawn; defaults to DEFAULT_VERIFY_TIMEOUT_MS. Injectable so
+     *        tests can exercise the timeout path quickly.
      * @returns {Promise<{ok:boolean, resolvedPath?:string, version?:string, capabilities?:object, reason?:string}>}
      */
-    async verify(env = process.env, { requireAgent = true } = {}) {
+    async verify(env = process.env, { requireAgent = true, verifyTimeoutMs = DEFAULT_VERIFY_TIMEOUT_MS } = {}) {
       const resolvedPath = await resolveExecutable("opencode", env);
       if (!resolvedPath) {
         return { ok: false, reason: "missing_binary" };
       }
 
       // Run `opencode --version` to confirm the binary is functional.
+      //
+      // ASYNC-1/ASYNC-2: this probe is bounded by runWithTimeout — a hung binary
+      // is force-killed after verifyTimeoutMs (returns TIMEOUT_SENTINEL) instead
+      // of hanging the gate forever, and captureStderr drains BOTH stdout and
+      // stderr so a binary flooding >64KB to stderr cannot deadlock on a full
+      // OS pipe buffer.
       let versionOutput = "";
       try {
-        const child = spawnResolved(resolvedPath, ["--version"], { env });
-        const [output, code] = await Promise.all([collectOutput(child), waitForExit(child)]);
-        if (code !== 0) {
+        const child = spawnResolved(resolvedPath, ["--version"], { env, stdio: ["ignore", "pipe", "pipe"] });
+        const raceResult = await runWithTimeout(child, { timeoutMs: verifyTimeoutMs, captureStderr: true });
+        if (raceResult === TIMEOUT_SENTINEL) {
+          return { ok: false, reason: "version_check_timeout" };
+        }
+        if (raceResult.exitCode !== 0) {
           return { ok: false, reason: "version_check_failed" };
         }
-        versionOutput = output.trim();
+        versionOutput = raceResult.stdout.trim();
       } catch {
         return { ok: false, reason: "version_check_error" };
       }
@@ -150,15 +233,18 @@ export function createAdapter(config) {
       // agent, so a missing agent here is expected and must not block install.
       if (requireAgent) {
         try {
-          const child = spawnResolved(resolvedPath, ["agent", "list"], { env });
-          const [agentOutput, code] = await Promise.all([
-            collectOutput(child),
-            waitForExit(child),
-          ]);
-          if (code !== 0) {
+          // ASYNC-1/ASYNC-2: bound this probe too. A hung `agent list` is
+          // force-killed after verifyTimeoutMs (agent_list_timeout) and stderr is
+          // drained alongside stdout so a stderr flood cannot deadlock verify().
+          const child = spawnResolved(resolvedPath, ["agent", "list"], { env, stdio: ["ignore", "pipe", "pipe"] });
+          const raceResult = await runWithTimeout(child, { timeoutMs: verifyTimeoutMs, captureStderr: true });
+          if (raceResult === TIMEOUT_SENTINEL) {
+            return { ok: false, reason: "agent_list_timeout" };
+          }
+          if (raceResult.exitCode !== 0) {
             return { ok: false, reason: "agent_list_failed" };
           }
-          if (!agentOutput.includes(effectiveAgent)) {
+          if (!agentListed(raceResult.stdout, effectiveAgent)) {
             return { ok: false, reason: "reviewer_agent_missing" };
           }
         } catch {
@@ -195,7 +281,9 @@ export function createAdapter(config) {
     async run(job, io = {}) {
       const env = io.env || process.env;
       const cwd = io.cwd || job.cwd || process.cwd();
-      const effectiveTimeout = (io.timeoutSec ?? timeoutSec) * 1000;
+      // Inactivity window + absolute hard cap for the run watchdog (ms).
+      const inactivityMs = sanePositiveSec(io.timeoutSec, inactivitySec) * 1000;
+      const hardCapMs = sanePositiveSec(io.maxTimeoutSec, hardCapSec) * 1000;
 
       // Resolve the binary path (handles .cmd on Windows).
       const resolvedPath = await resolveExecutable("opencode", env);
@@ -219,101 +307,134 @@ export function createAdapter(config) {
 
         const brief = buildBrief(job);
 
-        // SECURITY (Layer A): never pass the brief as a free-text command-line
-        // argument. cmd.exe-wrapped batch targets re-parse trailing args, so an
-        // attacker-influenced brief could inject commands — and spawnResolved
-        // FAILS CLOSED on cmd-metacharacter args when wrapping opencode.cmd. The
-        // brief contains free text, so it is delivered exclusively via the child's
-        // STDIN. Every arg handed to spawnResolved is a flag or an mkdtemp diff
-        // path — none free-text.
-        //
-        // SECURITY (Layer A): the --agent value is the EFFECTIVE agent, which in
-        // enforced / strict-ci is ALWAYS the bundled read-only agent regardless of
-        // any project-supplied agent name. This is the same name verify() asserted
-        // exists, so the run cannot be redirected to a writable agent.
-        //
-        // Command: opencode run --pure --agent <effectiveAgent> -f <diffPath>
-        //          (prompt/brief delivered via stdin)
-        const args = [
-          "run",
-          "--pure",
-          "--agent", effectiveAgent,
-          "-f", diffPath,
-        ];
+        // MODEL FALLBACK CHAIN. `models` is [null] when unconfigured (a single
+        // attempt with NO -m flag — unchanged behavior). Each model is tried in
+        // order; a transient/operational failure advances to the next, while a
+        // real verdict or a SECURITY stop returns immediately. After the chain is
+        // exhausted the last operational error is returned so the gate blocks
+        // (fail-closed) in enforced / strict-ci.
+        let lastError = "empty_output";
+        for (const model of models) {
+          // SECURITY (Layer A): never pass the brief as a free-text command-line
+          // argument. cmd.exe-wrapped batch targets re-parse trailing args, so an
+          // attacker-influenced brief could inject commands — and spawnResolved
+          // FAILS CLOSED on cmd-metacharacter args when wrapping opencode.cmd. The
+          // brief contains free text, so it is delivered exclusively via the
+          // child's STDIN. Every arg handed to spawnResolved is a flag, the model
+          // id, or an mkdtemp diff path — none free-text.
+          //
+          // SECURITY (Layer A): the --agent value is the EFFECTIVE agent, which in
+          // enforced / strict-ci is ALWAYS the bundled read-only agent regardless
+          // of any project-supplied agent name (and regardless of which model
+          // runs). This is the same name verify() asserted exists, so the run can
+          // never be redirected to a writable agent.
+          //
+          // Command: opencode run --pure --agent <effectiveAgent> [-m <model>]
+          //          -f <diffPath>   (prompt/brief delivered via stdin)
+          //
+          // SECURITY (defense-in-depth): a configured model is only passed as an
+          // arg when it is a SAFE single token. A leading-dash or whitespace/
+          // shell-meta model would otherwise be smuggled in as an injected flag or
+          // extra args; reject it and FAIL CLOSED (no -m flag is ever built from an
+          // unsafe value). model === null means "no model configured" (unchanged
+          // single default attempt) and skips the flag entirely.
+          const args = ["run", "--pure", "--agent", effectiveAgent];
+          if (model !== null) {
+            if (!isSafeModelToken(model)) {
+              return { ok: false, error: "invalid_model" };
+            }
+            args.push("-m", model);
+          }
+          args.push("-f", diffPath);
 
-        // spawnResolved fails closed on cmd-metacharacter args for batch wrappers;
-        // convert that throw into an operational failure so the gate blocks.
-        let child;
-        try {
-          child = spawnResolved(resolvedPath, args, {
-            cwd,
-            env,
-            stdio: ["pipe", "pipe", "pipe"],
+          // spawnResolved fails closed on cmd-metacharacter args for batch
+          // wrappers; convert that throw into an operational failure. A spawn
+          // failure is config/platform-level and model-INDEPENDENT, so retrying
+          // other models cannot help — stop and fail closed.
+          let child;
+          try {
+            child = spawnResolved(resolvedPath, args, {
+              cwd,
+              env,
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+          } catch (err) {
+            return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
+          }
+          if (child.stdin) {
+            // ROBUSTNESS: a child that exits early closes its stdin, so the
+            // subsequent end(brief) write triggers an EPIPE 'error' event. Without
+            // a listener that error is unhandled and crashes the gate process.
+            // Attach a no-op handler so an early-exit child is handled gracefully.
+            child.stdin.on("error", () => { /* ignore EPIPE on early child exit */ });
+            child.stdin.end(brief);
+          }
+
+          // Inactivity watchdog: kill only after no output for inactivityMs (the
+          // timer resets on every chunk) or the hardCapMs backstop, whichever
+          // fires first. Capture stderr so we can detect the silent agent-fallback
+          // warning (it is also drained either way to avoid a pipe deadlock).
+          //
+          // SECURITY: also pass the fallback markers to the watchdog's INCREMENTAL
+          // stderr scanner. The scanner observes the FULL untruncated stream, so a
+          // reviewer that floods stderr past MAX_OUTPUT_BYTES BEFORE printing the
+          // fallback warning can no longer truncate the marker out of the captured
+          // string and slip a writable-default-agent verdict past the check below.
+          const raceResult = await runWithWatchdog(child, {
+            inactivityMs,
+            hardCapMs,
+            captureStderr: true,
+            stderrMarkers: [AGENT_FALLBACK_MARKER, `agent "${effectiveAgent}" not found`],
           });
-        } catch (err) {
-          return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
-        }
-        if (child.stdin) {
-          // ROBUSTNESS: a child that exits early closes its stdin, so the
-          // subsequent end(brief) write triggers an EPIPE 'error' event. Without
-          // a listener that error is unhandled and crashes the gate process.
-          // Attach a no-op handler so an early-exit child is handled gracefully.
-          child.stdin.on("error", () => { /* ignore EPIPE on early child exit */ });
-          child.stdin.end(brief);
-        }
 
-        // Race the process completion against the timeout. Capture stderr too so
-        // we can detect the silent agent-fallback warning.
-        const raceResult = await runWithTimeout(child, {
-          timeoutMs: effectiveTimeout,
-          captureStderr: true,
-        });
-
-        if (raceResult === TIMEOUT_SENTINEL) {
-          return { ok: false, error: "timeout" };
-        }
-
-        const { stdout, stderr, exitCode } = raceResult;
-
-        // SECURITY: opencode silently falls back to the full-permission DEFAULT
-        // agent when the requested read-only agent is missing, printing a warning
-        // to stderr. NEVER accept a review from the fallback agent — treat it as an
-        // operational failure even if a verdict block was printed. This check runs
-        // BEFORE accepting any verdict so a fallback-agent review is always rejected.
-        if (
-          stderr.includes(AGENT_FALLBACK_MARKER) ||
-          stderr.includes(`agent "${effectiveAgent}" not found`)
-        ) {
-          return { ok: false, error: "reviewer_agent_fallback" };
-        }
-
-        // ROBUSTNESS: PARSE stdout for a valid verdict BEFORE consulting the exit
-        // code. Real CLIs frequently print a perfectly valid verdict block and
-        // STILL exit nonzero (review found issues, telemetry/cleanup hiccup, etc).
-        // Returning nonzero_exit first would drop that valid verdict. So: if a
-        // valid verdict is present, honor it regardless of exit code; only return
-        // nonzero_exit / empty_output when NO valid verdict was produced. (The
-        // fallback-agent check above already ran, so an accepted verdict can never
-        // be from the writable default agent.)
-        if (stdout) {
-          const parsed = parseVerdict(stdout, job);
-          if (parsed.ok) {
-            // A valid fail verdict is NOT an operational failure.
-            return { ok: true, verdict: parsed.verdict };
+          if (raceResult === TIMEOUT_SENTINEL) {
+            // A hung/stuck model: record and try the next configured model.
+            lastError = "timeout";
+            continue;
           }
-          // No valid verdict: surface the exit code first (more actionable than a
-          // parse error), else the parse failure reason.
-          if (exitCode !== 0) {
-            return { ok: false, error: `nonzero_exit:${exitCode}` };
+
+          const { stdout, stderr, exitCode, stderrMarkerHit } = raceResult;
+
+          // SECURITY: opencode silently falls back to the full-permission DEFAULT
+          // agent when the requested read-only agent is missing, printing a
+          // warning to stderr. NEVER accept a review from the fallback agent —
+          // treat it as an operational failure even if a verdict block was
+          // printed. This is model-INDEPENDENT (the agent is missing/mis-typed),
+          // so retrying other models cannot fix it — stop and fail closed. The
+          // check runs BEFORE accepting any verdict.
+          //
+          // stderrMarkerHit comes from the incremental scanner over the FULL
+          // stream (flood-proof); the string .includes() checks remain as a
+          // belt-and-suspenders for the common, un-truncated case.
+          if (
+            stderrMarkerHit ||
+            stderr.includes(AGENT_FALLBACK_MARKER) ||
+            stderr.includes(`agent "${effectiveAgent}" not found`)
+          ) {
+            return { ok: false, error: "reviewer_agent_fallback" };
           }
-          return { ok: false, error: parsed.error };
+
+          // ROBUSTNESS: PARSE stdout for a valid verdict BEFORE consulting the
+          // exit code. Real CLIs frequently print a perfectly valid verdict block
+          // and STILL exit nonzero. A real verdict (pass OR fail) ends the chain —
+          // we never "shop" models for a passing review. (The fallback-agent check
+          // above already ran, so an accepted verdict can never be from the
+          // writable default agent.)
+          if (stdout) {
+            const parsed = parseVerdict(stdout, job);
+            if (parsed.ok) {
+              return { ok: true, verdict: parsed.verdict };
+            }
+            lastError = exitCode !== 0 ? `nonzero_exit:${exitCode}` : parsed.error;
+          } else {
+            lastError = exitCode !== 0 ? `nonzero_exit:${exitCode}` : "empty_output";
+          }
+          // A non-verdict, non-security result is a transient/operational failure
+          // (rate-limit, crash, refusal). Fall through to the next model, if any.
         }
 
-        // No stdout at all.
-        if (exitCode !== 0) {
-          return { ok: false, error: `nonzero_exit:${exitCode}` };
-        }
-        return { ok: false, error: "empty_output" };
+        // Every configured model failed without producing a valid verdict.
+        return { ok: false, error: lastError };
       } finally {
         if (tempDir) {
           try { await rm(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 
 import { checkCommand } from "../../src/cli/check.js";
 import { resolveStateDir } from "../../src/core/load-config.js";
+import { git } from "../../src/core/git.js";
 import { makeIsolatedEnv } from "../helpers/isolated-env.js";
 
 // Collect stdout/stderr into strings; provide an injected io object matching the
@@ -75,6 +76,71 @@ describe("check command", () => {
       const printed = JSON.parse(out.join("").trim());
       // No edits between baseline capture and diff -> allow.
       assert.equal(printed.action, "allow");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await iso.cleanup();
+    }
+  });
+
+  it("fail-closed: when evaluateGate throws with a live edit, block (not fail_open) in enforced (finding 1)", async () => {
+    // Repro for the check.js:50 finding: `baseline` was declared INSIDE the try,
+    // so the catch could not forward it to failClosedDecision. With an empty
+    // transcript AND no forwarded baseline, hasEditEvidence() returned false and
+    // the gate FAILED OPEN (`fail_open_no_evidence`) even though the workspace
+    // really changed. Here the workspace is a git repo with a committed baseline
+    // and an UNTRACKED reviewable code file (a real diff vs HEAD). We force
+    // evaluateGate to throw by pointing the state dir at a path whose PARENT is a
+    // regular file (writeSessionState's mkdir then throws ENOTDIR), so the
+    // fail-closed catch runs while a real edit is present.
+    const cwd = await tmpDir("ar-check-failclosed-");
+    const iso = await makeIsolatedEnv();
+    try {
+      // Initialize a git repo with one committed baseline file.
+      const runGit = async (...args) => {
+        const r = await git(args, cwd);
+        assert.equal(r.code, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+      };
+      if ((await git(["--version"], cwd)).code !== 0) return; // git unavailable: skip.
+      await runGit("init", "-q");
+      await runGit("config", "user.email", "t@t.t");
+      await runGit("config", "user.name", "t");
+      await runGit("config", "commit.gpgsign", "false");
+      await writeFile(join(cwd, "base.txt"), "baseline\n");
+      await runGit("add", "base.txt");
+      await runGit("commit", "-q", "-m", "baseline");
+
+      // Enforced project config + an UNTRACKED reviewable code file (diff vs HEAD).
+      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(cwd, ".adversarial-review", "config.json"),
+        JSON.stringify({ policy: { mode: "enforced" } })
+      );
+      await writeFile(
+        join(cwd, "feature.js"),
+        "export function feature() { return 42; }\n"
+      );
+
+      // A regular file standing where the state dir's PARENT should be a dir, so
+      // writeSessionState(stateDir) -> mkdir(parent) throws and evaluateGate
+      // bubbles the error up into checkCommand's fail-closed catch.
+      const stateFileBlocker = join(cwd, "state-blocker");
+      await writeFile(stateFileBlocker, "not a directory");
+      const badStateDir = join(stateFileBlocker, "state");
+
+      const { io, out } = makeIo(cwd, {
+        ...iso.env,
+        ADVERSARIAL_REVIEW_STATE_DIR: badStateDir,
+      });
+      process.exitCode = 0;
+      const decision = await checkCommand(["--json"], io);
+
+      // Must FAIL CLOSED: a real edit + enforced mode => block, NOT fail_open.
+      assert.equal(decision.action, "block", `expected block, got: ${JSON.stringify(decision)}`);
+      assert.notEqual(decision.reason, "fail_open_no_evidence", "must not fail open with a live edit");
+      assert.equal(process.exitCode, 1);
+      const printed = JSON.parse(out.join("").trim());
+      assert.equal(printed.action, "block");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

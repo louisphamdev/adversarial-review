@@ -233,28 +233,49 @@ export function collectReviewOutputs(entries, afterKey = 0) {
 // ---- isSubagentTranscript ---------------------------------------------------
 
 /**
- * Return true when the transcript belongs to a workflow-spawned subagent that
- * should NOT be gated (to avoid serializing parallel pipelines).
+ * Return true ONLY when this Stop event authoritatively belongs to a Claude Code
+ * subagent (so it must NOT be gated, to avoid serializing parallel pipelines).
  *
- * Mirrors the Python check in guard.py main():
- *   session_id.startswith("g-")  OR
- *   "/subagents/" in tp          OR
- *   basename(tp).startswith("agent-")
+ * SECURITY (fail-closed). The previous implementation skipped the whole gate
+ * whenever the UNTRUSTED host payload happened to carry a `g-`-prefixed
+ * session_id, a transcript_path under `/subagents/`, or a basename starting with
+ * `agent-`. Every one of those fields is attacker-influencable (the session_id
+ * and the transcript_path are supplied in the Stop-hook stdin payload / derived
+ * from repo-adjacent state), so a malicious repo could disable the gate by
+ * naming its transcript `.../subagents/x` or `agent-x.jsonl`. That is fail-OPEN
+ * of a security gate.
+ *
+ * The only AUTHORITATIVE subagent signal — set by Claude Code itself, not by
+ * repo content — is the hook event name: a genuine subagent Stop arrives as
+ * `hook_event_name === "SubagentStop"`. We therefore gate the skip on that
+ * signal alone. The path/session-id heuristics are kept ONLY as a corroborating
+ * factor: they may NARROW a SubagentStop, never WIDEN a plain Stop into a skip.
+ * When the event is ambiguous (no explicit SubagentStop), we default to
+ * REVIEWING (return false) so the gate stays armed.
+ *
+ * Note: adversarial-review registers ONLY the SessionStart and Stop hooks (never
+ * SubagentStop), so under normal operation this returns false and the main-agent
+ * Stop is always gated. The SubagentStop branch exists for the Claude Code
+ * frontmatter quirk where a Stop hook declared inside a subagent fires with
+ * `hook_event_name === "SubagentStop"`.
  *
  * Works on Windows paths (backslashes are normalised first).
  *
  * @param {string} transcriptPath
  * @param {string} [sessionId=""]
+ * @param {string} [hookEventName=""] - AUTHORITATIVE Claude Code event name
+ *   ("Stop" | "SubagentStop"). Only "SubagentStop" can skip the gate.
  * @returns {boolean}
  */
-export function isSubagentTranscript(transcriptPath, sessionId = "") {
-  const normalized = String(transcriptPath || "").replace(/\\/g, "/");
-  const base = normalized.split("/").at(-1) || "";
-  return (
-    String(sessionId).startsWith("g-") ||
-    normalized.includes("/subagents/") ||
-    base.startsWith("agent-")
-  );
+export function isSubagentTranscript(transcriptPath, sessionId = "", hookEventName = "") {
+  // Authoritative, host-set signal is REQUIRED to skip the gate. Anything else
+  // (a plain "Stop", an empty/unknown event) keeps the gate armed (fail-closed).
+  if (String(hookEventName) !== "SubagentStop") return false;
+
+  // We have a genuine SubagentStop. The untrusted path/session-id heuristics may
+  // still be consulted as a sanity corroboration, but since the event itself is
+  // authoritative we honour the subagent skip regardless of their value.
+  return true;
 }
 
 // ---- lastUserText -----------------------------------------------------------

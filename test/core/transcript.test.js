@@ -342,38 +342,58 @@ describe("collectReviewOutputs", () => {
 // ---------------------------------------------------------------------------
 
 describe("isSubagentTranscript", () => {
-  it("returns true for a Windows backslash subagents path", () => {
-    // Windows path with \subagents\ — normalized to /subagents/ internally.
+  // SECURITY (fail-closed): the skip is now gated on the AUTHORITATIVE host-set
+  // hook_event_name === "SubagentStop". The untrusted transcript_path/session_id
+  // heuristics (`/subagents/`, `agent-*` basename, `g-` prefix) can NO LONGER
+  // silently disable the gate — that was a fail-OPEN bypass. When the event is
+  // not an explicit SubagentStop we default to REVIEWING (return false).
+
+  it("returns true ONLY when hook_event_name is SubagentStop (authoritative)", () => {
+    assert.equal(
+      isSubagentTranscript(
+        "/home/foo/.claude/projects/proj/subagents/abc.jsonl",
+        "g-abc123",
+        "SubagentStop",
+      ),
+      true,
+    );
+  });
+
+  it("returns true for a SubagentStop even with an ordinary path/session id", () => {
+    assert.equal(
+      isSubagentTranscript("/home/foo/.claude/projects/proj/main.jsonl", "abc123", "SubagentStop"),
+      true,
+    );
+  });
+
+  // --- The old untrusted-heuristic bypass paths now FAIL CLOSED (return false) ---
+
+  it("FAIL-CLOSED: a /subagents/ path does NOT skip the gate without SubagentStop", () => {
+    // Previously returned true (silent allow) — that was the fail-OPEN bypass.
     assert.equal(
       isSubagentTranscript("C:\\Users\\foo\\.claude\\projects\\proj\\subagents\\abc.jsonl"),
-      true,
+      false,
+    );
+    assert.equal(
+      isSubagentTranscript("/home/foo/.claude/projects/proj/subagents/abc.jsonl", "", "Stop"),
+      false,
     );
   });
 
-  it("returns true for a forward-slash subagents path", () => {
-    assert.equal(
-      isSubagentTranscript("/home/foo/.claude/projects/proj/subagents/abc.jsonl"),
-      true,
-    );
+  it("FAIL-CLOSED: an agent- basename does NOT skip the gate without SubagentStop", () => {
+    assert.equal(isSubagentTranscript("/some/path/agent-01234567.jsonl"), false);
+    assert.equal(isSubagentTranscript("/some/path/agent-01234567.jsonl", "", "Stop"), false);
   });
 
-  it("returns true for an agent- basename", () => {
-    assert.equal(
-      isSubagentTranscript("/some/path/agent-01234567.jsonl"),
-      true,
-    );
+  it("FAIL-CLOSED: a g- session id does NOT skip the gate without SubagentStop", () => {
+    // The attacker-influencable session_id alone must never turn the gate off.
+    assert.equal(isSubagentTranscript("/normal/path/session.jsonl", "g-abc123"), false);
+    assert.equal(isSubagentTranscript("/normal/path/session.jsonl", "g-abc123", "Stop"), false);
   });
 
-  it("returns true for a g- session id regardless of path", () => {
+  it("returns false for a normal main-session transcript path / Stop event", () => {
     assert.equal(
-      isSubagentTranscript("/normal/path/session.jsonl", "g-abc123"),
-      true,
-    );
-  });
-
-  it("returns false for a normal main-session transcript path", () => {
-    assert.equal(
-      isSubagentTranscript("/home/foo/.claude/projects/proj/main-session.jsonl", "abc123"),
+      isSubagentTranscript("/home/foo/.claude/projects/proj/main-session.jsonl", "abc123", "Stop"),
       false,
     );
   });
@@ -388,6 +408,11 @@ describe("isSubagentTranscript", () => {
 
   it("handles null transcriptPath without throwing", () => {
     assert.equal(isSubagentTranscript(null, ""), false);
+  });
+
+  it("an unknown/empty event name keeps the gate armed (ambiguous -> review)", () => {
+    assert.equal(isSubagentTranscript("/p/subagents/x.jsonl", "g-x", ""), false);
+    assert.equal(isSubagentTranscript("/p/subagents/x.jsonl", "g-x", "Notification"), false);
   });
 });
 

@@ -118,10 +118,29 @@ ones, and the policy floor is applied last and can only ever tighten:
 
 ```text
 DEFAULT_CONFIG
-  <  userConfig    (~/.adversarial-review/config.json)   # override layer (loosen or tighten)
-  <  projectConfig (.adversarial-review/config.json)     # override layer (loosen or tighten)
+  <  userConfig    (~/.adversarial-review/config.json)   # trusted: may loosen or tighten
+  <  projectConfig (.adversarial-review/config.json)     # UNTRUSTED: may only TIGHTEN security
   <  policyFloor   (~/.adversarial-review/policy.json)   # tighten-only, applied last
 ```
+
+The **project** layer is treated as **untrusted** (a cloned repo's committed
+config is attacker-controlled). It may freely override non-security tuning
+(thresholds, sensitivity), but for security it can only ever make the gate
+**stricter**, never looser:
+
+- `policy.mode` / `onReviewerError` / `onInternalError` / `onBlockCap` /
+  `allowSkip` / `allowAdvisoryHosts` / `reviewScope` and the `privacy.*`
+  controls are clamped to (at least) the trusted user/default baseline — a
+  project can tighten `enforced → strict-ci`, but never loosen `enforced → soft`
+  or `block → allow`.
+- The `hosts.<host>.reviewer` mapping is **pinned** to the trusted baseline — a
+  project can never redirect or downgrade which reviewer runs.
+- A reviewer's `models`, `requiredDimensions`, and `timeoutSec` come from the
+  **user** config only — a project can never pin a weak model, shrink the
+  required review dimensions, or set a 0-second timeout.
+- A malformed sub-object (e.g. `{"policy": null}` or `{"privacy": "x"}`) is
+  coerced back to a safe default rather than crashing the gate, and a
+  non-canonical `mode` (`"Enforced"`, garbage) falls closed to `enforced`.
 
 Example `~/.adversarial-review/config.json`:
 
@@ -146,9 +165,37 @@ Example `~/.adversarial-review/config.json`:
 
 With this in place, a new project inherits the host/reviewer mapping and the
 `enforced` mode without re-running install per project. A project may still ship
-its own `.adversarial-review/config.json` to override these defaults, but it can
-never go below the policy floor in `~/.adversarial-review/policy.json` (see
-[Policy Modes](#policy-modes)).
+its own `.adversarial-review/config.json` to override **non-security** defaults,
+but it can never loosen the security policy or redirect the reviewer (see the
+trust note above), nor go below the policy floor in
+`~/.adversarial-review/policy.json` (see [Policy Modes](#policy-modes)).
+
+### Reviewer options (user config only)
+
+Each entry under `reviewers.<id>` accepts these security-relevant options, which
+are honored **only from the user-level config** (a project config cannot set
+them):
+
+| Key | Meaning |
+|---|---|
+| `models` | Optional ordered **model fallback chain** (model-agnostic strings passed to the reviewer tool, e.g. `-m`). On a transient/rate-limit failure the gate retries the next model; a real verdict or a security stop ends the chain. The plugin ships **no** vendor defaults — empty/unset means a single default invocation. |
+| `requiredDimensions` | The review dimensions the verdict must cover. A project cannot shrink this. |
+| `timeoutSec` | **Inactivity** window (seconds): the reviewer is killed only after this long with **no output** (a liveness check, reset on every chunk), so a slow-but-streaming reviewer is never killed mid-review. Defaults to 120. |
+| `maxTimeoutSec` | Absolute hard-cap backstop (seconds): even a reviewer that keeps emitting output is killed after this long, so the gate can never hang. Defaults to 1800. |
+
+```json
+{
+  "reviewers": {
+    "opencode": {
+      "readOnlyConfig": true,
+      "agent": "adversarial-reviewer",
+      "models": ["primary-model", "fallback-model"],
+      "timeoutSec": 120,
+      "maxTimeoutSec": 1800
+    }
+  }
+}
+```
 
 ---
 

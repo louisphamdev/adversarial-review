@@ -31,7 +31,7 @@ import {
   lastUserText,
   wantsSkip,
 } from "./transcript.js";
-import { parseVerdict } from "./verdict.js";
+import { parseVerdict, validateVerdict } from "./verdict.js";
 import { sha256, stableJson, reviewCacheKey } from "./hash.js";
 import { readSessionState, writeSessionState } from "./state.js";
 
@@ -176,6 +176,36 @@ function reviewableChangedPaths(changedFiles, config) {
     .map((f) => String(f.path).replace(/\\/g, "/"));
 }
 
+// The marker capForDiff (diff.js) inlines when a file's diff text is truncated
+// at the per-file size cap. The full content is still HASHED (so change
+// detection/freshness is intact), but the reviewer never SAW the post-cap bytes.
+const TRUNCATION_MARKER = "coverage limitation: diff text capped at";
+
+// Reviewable changed files whose diff text was truncated at the size cap, so the
+// reviewer could not have seen the full change. A "pass" cannot be trusted for
+// such a file (a malicious payload could hide past the cap) even though the
+// diff/payload hashes and coverage citations stay self-consistent. The diff text
+// is split into per-file sections at each `diff --git ` header; a section bearing
+// the cap marker whose path is reviewable is reported. (audit #22)
+function truncatedReviewablePaths(diffText, reviewablePaths) {
+  if (!diffText || !reviewablePaths || reviewablePaths.length === 0) return [];
+  const reviewable = new Set(reviewablePaths.map((p) => String(p).replace(/\\/g, "/")));
+  const out = [];
+  for (const section of String(diffText).split(/(?=^diff --git )/m)) {
+    if (!section.includes(TRUNCATION_MARKER)) continue;
+    // Extract the path from the `diff --git a/<p> b/<p>` header. The synthesized
+    // truncation blocks always repeat the SAME path on both sides, so a
+    // BACKREFERENCE (a/<p> b/<p>) extracts it unambiguously even when the path
+    // itself contains " b/" (e.g. a real file literally named `foo b/bar.js`),
+    // which a non-greedy `a/(.+?) b/` would mis-split and miss (fail-open).
+    const m = /^diff --git a\/(.+) b\/\1(?:\s|$)/m.exec(section);
+    if (!m) continue;
+    const path = m[1].replace(/\\/g, "/");
+    if (reviewable.has(path) && !out.includes(path)) out.push(path);
+  }
+  return out;
+}
+
 // True when any reviewable changed file is also sensitive.
 function anySensitiveChange(changedFiles, config) {
   return (changedFiles || []).some((f) => classifyPath(f.path, config).sensitive);
@@ -268,30 +298,90 @@ function cacheKeyFor(job, config) {
 
 // Above this many reviewable changed files we stop requiring per-file coverage.
 // A reviewer cannot reliably enumerate 40+ paths, so demanding an exact match of
-// every one turns real PASSes into spurious BLOCKs. Over the cap we accept any
-// non-empty coverage and record a coverage limitation instead of hard-failing.
+// every one turns real PASSes into spurious BLOCKs. Over the cap we relax the
+// per-file requirement but still demand a minimum PROOF of work (see below) so a
+// single citation cannot rubber-stamp an arbitrarily large unexamined diff.
 const COVERAGE_FILE_CAP = 40;
 
-// Canonicalize a path citation so coverage comparison is robust to the many FORMS
-// a reviewer may use for the same file. Lower-risk normalizations only:
+// HARDENING (finding: large diffs can pass with 40+ unexamined reviewable files):
+// over the cap we no longer accept a SINGLE real citation. A pass must cite a
+// minimum number of DISTINCT real reviewable paths — at least
+// `max(COVERAGE_MIN_OVER_CAP_REAL, ceil(COVERAGE_OVER_CAP_RATIO * total))`. This
+// keeps the cap's usability relaxation (no exact 40+ enumeration) while closing the
+// fail-open where coverage of one file "covered" the whole diff. The ratio is
+// deliberately small (genuine sampling of a huge mechanical diff is legitimate) but
+// scales with the diff size so the larger the diff, the more files must be cited.
+const COVERAGE_OVER_CAP_RATIO = 0.05;
+const COVERAGE_MIN_OVER_CAP_REAL = 2;
+
+// Canonicalize a path so coverage comparison is robust to the many FORMS the same
+// file may take. Lower-risk, form-only normalizations:
 //   - POSIX slashes (backslash -> slash);
 //   - trim surrounding whitespace;
-//   - strip a leading "a/" or "b/" git-diff prefix;
-//   - strip a leading "./";
-//   - strip a trailing ":<digits>" line-number suffix (e.g. "src/x.js:42").
+//   - collapse one or more leading "./" segments;
+//   - collapse any run of "/" into a single "/".
+// This function does NOT strip a leading "a/"/"b/" git-diff prefix and does NOT
+// strip a trailing ":<line>" suffix — those are reviewer-citation-only relaxations
+// applied separately (see citationVariants). Reviewable changed-file paths come
+// from the filesystem and NEVER carry git a//b/ prefixes or :line suffixes, so
+// canonicalizing them here without those strips prevents 'a/x.js' and 'x.js' (or
+// 'a/x.js' and 'b/x.js') from collapsing onto each other — a coverage collision
+// that could let one citation "cover" a DIFFERENT unexamined file.
 // Returns "" for empty/non-string input.
-function canonicalizePath(p) {
+// Exported for unit tests of the COLLISION-2 leading-'./'/'//' normalization.
+export function canonicalizePath(p) {
   let s = String(p == null ? "" : p)
     .replace(/\\/g, "/")
     .trim();
   if (!s) return "";
-  // Strip a trailing ":<digits>" line/column suffix before anything else.
-  s = s.replace(/:\d+$/, "");
-  // Strip git-diff prefixes "a/" or "b/".
-  if (s.startsWith("a/") || s.startsWith("b/")) s = s.slice(2);
-  // Strip a leading "./".
-  while (s.startsWith("./")) s = s.slice(2);
+  // Collapse any run of slashes into a single slash FIRST (handles ".//src/x.js"
+  // -> "./src/x.js" and internal "src//x.js" -> "src/x.js"). Doing this before the
+  // leading-"./" strip prevents a stray leading "/" surviving for inputs like
+  // ".//src/x.js".
+  s = s.replace(/\/{2,}/g, "/");
+  // Then collapse one or more leading "./" segments robustly (handles "./",
+  // "././", etc.).
+  s = s.replace(/^(?:\.\/)+/, "");
   return s;
+}
+
+// Expand a REVIEWER citation into the canonical FORMS the SAME path may take.
+// These are the only citation-side relaxations, and they NEVER cross to a
+// different file:
+//   - the citation as-is, canonicalized;
+//   - if it ends with a ":<digits>" line/column suffix, the suffix-stripped form
+//     too (the un-stripped exact form is kept and listed first so a real filename
+//     like 'src/weird:12' is never silently mangled into 'src/weird').
+//
+// HARDENING (audit COLLISION-1/3a, gate-coverage): this function NO LONGER emits a
+// git-diff "a/"/"b/"-prefix-STRIPPED variant. A stripped 'a/x.js' -> 'x.js' variant
+// is GLOBALLY matchable and would let a citation for one file (or for a file under a
+// real top-level dir literally named 'a'/'b') "cover" a DISTINCT unexamined
+// reviewable file. The legitimate git-diff header form ('a/'+p / 'b/'+p) is handled
+// PATH-SPECIFICALLY in coverageFailure instead, where the prefix is only accepted
+// when it resolves to the exact reviewable path p. The ':<line>' strip is likewise
+// no longer combined with any prefix strip, so no malformed "x.js:12" variant (a
+// prefix-stripped-but-line-retained form) is ever produced.
+//
+// Returns a de-duplicated array of non-empty canonical variants.
+// Exported for unit tests of the COLLISION-1/COLLISION-3a citation relaxations.
+export function citationVariants(raw) {
+  const variants = [];
+  const add = (v) => {
+    const c = canonicalizePath(v);
+    if (c && !variants.includes(c)) variants.push(c);
+  };
+  const base = String(raw == null ? "" : raw)
+    .replace(/\\/g, "/")
+    .trim();
+  if (!base) return variants;
+  // Always include the exact (un-stripped) form first so an exact match against a
+  // real ':<digits>'-bearing filename is preferred over the :line-stripped form.
+  add(base);
+  // ':<line>'-stripped form, only when a trailing ":<digits>" suffix is present.
+  const stripped = base.replace(/:\d+$/, "");
+  if (stripped !== base) add(stripped);
+  return variants;
 }
 
 // The basename (last POSIX path segment) of an already-canonicalized path.
@@ -300,19 +390,46 @@ function baseNameOf(canonical) {
   return idx >= 0 ? canonical.slice(idx + 1) : canonical;
 }
 
+// True when a single reviewable path `canon` is covered by the examined-citation
+// variant sets. Matching is PATH-SPECIFIC so a citation can never cover a DIFFERENT
+// reviewable file than the one it literally references:
+//   - full-path match: a citation variant equals `canon`;
+//   - git-diff header match: a citation variant equals the legitimate header form
+//     "a/"+canon / "b/"+canon — accepted ONLY when that prefixed form is NOT itself a
+//     distinct reviewable changed path. This closes COLLISION-1: if "a/foo.js" is a
+//     real reviewable file, a citation of "a/foo.js" must cover ONLY "a/foo.js" and
+//     never the top-level "foo.js" via the "a/"+canon header rule;
+//   - basename match: a citation variant's basename equals `canon`'s basename AND
+//     that basename is UNIQUE among the reviewable changed files (ambiguous
+//     basenames require the full-path match).
+// `reviewableSet` is the set of all canonicalized reviewable changed paths.
+function pathCovered(canon, base, baseUnique, examinedFull, examinedBase, reviewableSet) {
+  if (examinedFull.has(canon)) return true;
+  // Path-specific git-diff header acceptance: a reviewer reading the raw `git diff`
+  // sees every path as "a/<p>" / "b/<p>". Accept those forms against THIS path p, but
+  // suppress the rule when the prefixed form is itself a real reviewable changed file
+  // (then the citation belongs to THAT file, not to p).
+  const aForm = `a/${canon}`;
+  const bForm = `b/${canon}`;
+  if (examinedFull.has(aForm) && !reviewableSet.has(aForm)) return true;
+  if (examinedFull.has(bForm) && !reviewableSet.has(bForm)) return true;
+  if (baseUnique && examinedBase.has(base)) return true;
+  return false;
+}
+
 // In enforced/strict, a pass must demonstrate coverage of every reviewable
 // changed file. Returns null when coverage is acceptable, or an error reason.
 //
 // Both the verdict's `coverage.files_examined` citations and the reviewable
 // changed-file paths are CANONICALIZED before comparison (see canonicalizePath).
-// A changed file is considered covered if its full canonical path appears in the
-// examined set, OR its basename appears AND that basename is UNIQUE among the
-// reviewable changed files. A basename shared by multiple reviewable files is
-// AMBIGUOUS (e.g. src/a/index.js and test/b/index.js both basename "index.js"),
-// so a bare-basename citation cannot prove which file was examined — for those we
-// require the full-path match. This both tolerates differing path FORMS for an
-// unambiguous file and prevents one ambiguous basename from "covering" several
-// distinct files.
+// A changed file is considered covered if its full canonical path (or its
+// path-specific git "a/"/"b/" header form) appears in the examined set, OR its
+// basename appears AND that basename is UNIQUE among the reviewable changed files.
+// A basename shared by multiple reviewable files is AMBIGUOUS (e.g. src/a/index.js
+// and test/b/index.js both basename "index.js"), so a bare-basename citation cannot
+// prove which file was examined — for those we require the full-path match. This
+// both tolerates differing path FORMS for an unambiguous file and prevents one
+// ambiguous basename from "covering" several distinct files.
 function coverageFailure(verdict, reviewablePaths) {
   const coverage = verdict.coverage || {};
   const examined = Array.isArray(coverage.files_examined) ? coverage.files_examined : [];
@@ -320,36 +437,65 @@ function coverageFailure(verdict, reviewablePaths) {
   if (reviewablePaths.length > 0 && examined.length === 0) {
     return "empty_coverage";
   }
-  // Per-file cap: with too many changed files, accept any non-empty coverage
-  // rather than demanding an exact per-file enumeration that no reviewer can
-  // reliably produce. The non-empty check above already handled the empty case.
-  if (reviewablePaths.length > COVERAGE_FILE_CAP) {
-    return null;
-  }
   // Count how often each basename occurs among the canonicalized reviewable
-  // changed files so we can tell unique basenames from ambiguous ones.
+  // changed files so we can tell unique basenames from ambiguous ones. Also build the
+  // set of canonical reviewable paths so the git "a/"/"b/" header rule can be
+  // suppressed when a prefixed citation is itself a distinct reviewable file.
   const baseCounts = new Map();
+  const reviewableSet = new Set();
   for (const path of reviewablePaths) {
-    const base = baseNameOf(canonicalizePath(path));
+    const canon = canonicalizePath(path);
+    reviewableSet.add(canon);
+    const base = baseNameOf(canon);
     baseCounts.set(base, (baseCounts.get(base) || 0) + 1);
   }
-  // Build canonical full-path and basename lookup sets from the citations.
+  // Build canonical full-path and basename lookup sets from the citations. Each
+  // citation expands only into FORMS OF THE SAME path (as-is and ':<line>'-stripped;
+  // see citationVariants). The reviewable changed paths, by contrast, are
+  // canonicalized WITHOUT any prefix/suffix stripping (see canonicalizePath) so a
+  // real top-level 'a/' file is never collapsed onto a prefix-stripped name. The
+  // git "a/"/"b/" header form is matched path-specifically in pathCovered.
   const examinedFull = new Set();
   const examinedBase = new Set();
   for (const raw of examined) {
-    const canon = canonicalizePath(raw);
-    if (!canon) continue;
-    examinedFull.add(canon);
-    examinedBase.add(baseNameOf(canon));
+    for (const variant of citationVariants(raw)) {
+      examinedFull.add(variant);
+      examinedBase.add(baseNameOf(variant));
+    }
+  }
+  // Per-file cap: with too many changed files we no longer demand an exact per-file
+  // enumeration (no reviewer can reliably produce 40+ exact paths). HARDENING
+  // (finding: large diffs can pass with 40+ unexamined reviewable files): above the
+  // cap we still must not accept a token citation rubber-stamping the whole diff.
+  // Count how many DISTINCT reviewable changed paths are actually covered and require
+  // that count to meet a minimum proof-of-work threshold that scales with the diff
+  // size (max(MIN, ceil(ratio*total))). The non-empty check above handled the empty
+  // case; a single real citation over a 41-file diff no longer suffices.
+  if (reviewablePaths.length > COVERAGE_FILE_CAP) {
+    let realCovered = 0;
+    for (const path of reviewablePaths) {
+      const canon = canonicalizePath(path);
+      const base = baseNameOf(canon);
+      if (pathCovered(canon, base, baseCounts.get(base) === 1, examinedFull, examinedBase, reviewableSet)) {
+        realCovered += 1;
+      }
+    }
+    if (realCovered === 0) {
+      return "coverage_no_real_path";
+    }
+    const requiredReal = Math.max(
+      COVERAGE_MIN_OVER_CAP_REAL,
+      Math.ceil(COVERAGE_OVER_CAP_RATIO * reviewablePaths.length)
+    );
+    if (realCovered < requiredReal) {
+      return `coverage_below_min_ratio:${realCovered}/${requiredReal}`;
+    }
+    return null;
   }
   for (const path of reviewablePaths) {
     const canon = canonicalizePath(path);
     const base = baseNameOf(canon);
-    // Full-path citation always counts. A basename citation only counts when that
-    // basename is UNIQUE among the reviewable changed files; an ambiguous basename
-    // (occurs >1) requires the full-path match.
-    if (examinedFull.has(canon)) continue;
-    if (baseCounts.get(base) === 1 && examinedBase.has(base)) continue;
+    if (pathCovered(canon, base, baseCounts.get(base) === 1, examinedFull, examinedBase, reviewableSet)) continue;
     return `missing_coverage:${canon}`;
   }
   return null;
@@ -388,14 +534,34 @@ function deferredCheckFailure(verdict, job, reviewablePaths) {
 //   - has job_id / diff_hash / reviewer / level all matching selfJob (so a STALE
 //     verdict whose diff_hash differs from the CURRENT diffHash is rejected —
 //     this is the freshness guarantee); and
-//   - in enforced/strict, passes the SAME deferred checks as the external path
-//     (payload_hash match + non-empty coverage of every reviewable changed file).
+//   - passes the SAME deferred checks as the external path (payload_hash match +
+//     non-empty coverage of every reviewable changed file). HARDENING (audit
+//     gate-decision): these binding checks now run in EVERY mode, not just
+//     enforced/strict. A soft self-review pass that cites empty coverage and a
+//     mismatched payload_hash is no longer accepted, so the only fail-open that a
+//     non-canonical/loosened mode could exploit is also closed here.
 // For the debate level the verdict's level must also be "debate".
 //
-// Acceptance is decided solely by parseVerdict against `selfJob`: the verdict
-// block's own sentinel (<<<ADVERSARIAL-REVIEW-VERDICT>>>) gates parsing, and a
-// no-op Task that cannot produce a valid, matching verdict block is rejected.
+// RESIDUAL RISK (audit rt-bypass, finding "self-review verdict is forgeable"):
+// acceptance is decided by parseVerdict against `selfJob`. Every binding value
+// (job_id / diff_hash / payload_hash / reviewable file list) is a DETERMINISTIC
+// function of the current diff AND must be disclosed to the orchestrator via
+// selfReviewBlockReason so an HONEST reviewer subagent can echo it. Because the
+// native self-review verdict is authored by a host subagent inside the same
+// transcript, the gate cannot cryptographically distinguish an honest reviewer
+// from a colluding/no-op Task that simply re-emits those public values: any secret
+// strong enough to prevent forgery would also have to be withheld from the honest
+// reviewer, which would break legitimate self-review. The strongest FEASIBLE
+// binding is enforced here — the forged verdict must reproduce the exact payload
+// bytes (payload_hash) and enumerate coverage of every reviewable changed file —
+// but native self-review ultimately TRUSTS host/reviewer honesty (see README
+// "Residual Risks"). The external-reviewer path (run out-of-process) does not share
+// this limitation. This closes the FRESHNESS bypass, not forgery.
+//
+// `enforced` is retained for signature stability; the deferred checks no longer
+// depend on it (they apply in all modes).
 function selfReviewSatisfied(entries, lastEditKey, selfJob, reviewablePaths, enforced) {
+  void enforced;
   if (lastEditKey <= 0) return false;
   const outputs = collectReviewOutputs(entries, lastEditKey);
   for (const output of outputs) {
@@ -406,9 +572,8 @@ function selfReviewSatisfied(entries, lastEditKey, selfJob, reviewablePaths, enf
     if (verdict.verdict !== "pass") continue;
     // job_id / diff_hash / reviewer / level are already enforced by
     // validateVerdict; for debate, level equality already requires "debate".
-    if (enforced) {
-      if (deferredCheckFailure(verdict, selfJob, reviewablePaths)) continue;
-    }
+    // Deferred checks (payload_hash match + coverage) apply in EVERY mode.
+    if (deferredCheckFailure(verdict, selfJob, reviewablePaths)) continue;
     return true;
   }
   return false;
@@ -451,6 +616,8 @@ function reviewerErrorDecision(config, level, detail) {
  * @param {string} [input.sessionId]       - session id for state keying.
  * @param {string} [input.stateDir]        - directory for per-session state.
  * @param {boolean} [input.stopHookActive] - host recursion guard.
+ * @param {string} [input.hookEventName]   - authoritative host event name
+ *        (e.g. "Stop"/"SubagentStop"); only "SubagentStop" skips the gate.
  * @returns {Promise<object>} decision
  */
 export async function evaluateGate(input) {
@@ -464,10 +631,14 @@ export async function evaluateGate(input) {
     sessionId = "default",
     stateDir,
     transcriptPath = "",
+    hookEventName = "",
   } = input;
 
   // (1) Subagent transcripts never trigger the gate (avoid serializing pipelines).
-  if (isSubagentTranscript(transcriptPath, sessionId)) {
+  // The decision is gated on the AUTHORITATIVE host signal (hook_event_name ===
+  // "SubagentStop", set by the host itself) — the untrusted session-id / path
+  // heuristics alone can no longer turn the gate off (fail closed when ambiguous).
+  if (isSubagentTranscript(transcriptPath, sessionId, hookEventName)) {
     return allow({ reason: "subagent_transcript" });
   }
 
@@ -510,9 +681,31 @@ export async function evaluateGate(input) {
     );
   }
 
-  // Docs-only changes are allowed (no reviewable/sensitive files).
+  // The FULL changed-path list (POSIX-normalized), independent of classifier
+  // reviewability. HARDENING (audit diff-classify-secrets): the path-based secret
+  // check must scan EVERY changed path, not only the classifier-reviewable subset —
+  // a path the classifier drops (e.g. a docs-extension file whose name matches a
+  // sensitive pattern, or a unicode-cloaked/quotePath-mangled path) would otherwise
+  // escape the sensitive-path scan.
+  const allChangedPaths = (changedFiles || []).map((f) => String(f.path).replace(/\\/g, "/"));
+
+  // Docs-only changes are allowed (no reviewable/sensitive files) — BUT a change
+  // whose paths include a sensitive file (e.g. a *.md whose NAME matches a secret
+  // pattern that the docs classifier treats as non-reviewable) must NOT slip through
+  // the docs-only early-allow without a secret path scan. Run the path-based scan on
+  // the full changed-path list first; a sensitive path is an operational BLOCK in
+  // all modes (remove the sensitive file before review can proceed). The message
+  // names only the finding type/path — never any secret value.
   if (allDocsOnly(changedFiles, config)) {
-    return allow({ reason: "docs_only" });
+    const docsSecretFindings = scanSecrets("", allChangedPaths);
+    if (docsSecretFindings.length === 0) {
+      return allow({ reason: "docs_only" });
+    }
+    return block(
+      "Sensitive file detected in an otherwise docs-only change; remove or review it before completion " +
+        `(${summarizeSecretFindings(docsSecretFindings)}).`,
+      { secretBlocked: true, secretScan: "sensitive_path" }
+    );
   }
 
   // (5) Determine required review level.
@@ -540,6 +733,28 @@ export async function evaluateGate(input) {
   const state = stateDir ? await readSessionState(stateDir, sessionId) : {};
   const cache = state.cache || {};
   const enforced = config.policy.mode === "enforced" || isStrict(config);
+
+  // (6b) TRUNCATED REVIEWABLE CONTENT (audit #22): a reviewable file whose diff
+  // text was capped at the per-file size limit means the reviewer NEVER SAW the
+  // post-cap payload — a "pass" cannot be trusted for it, yet the diff/payload
+  // hashes and coverage citations stay self-consistent. Fail closed: block in
+  // enforced/strict, advisory in soft. (Full content is still hashed, so
+  // freshness is intact; only the COMPLETENESS of the review is at stake.)
+  const truncated = truncatedReviewablePaths(diff.text, reviewablePaths);
+  if (truncated.length > 0) {
+    const list = truncated.slice(0, 5).join(", ") + (truncated.length > 5 ? ", …" : "");
+    if (enforced) {
+      return block(
+        `Adversarial review could not complete: ${truncated.length} reviewable file(s) had their diff ` +
+          `truncated at the size cap, so the reviewer could not see the full change (fail-closed): ${list}.`,
+        { truncated: true, truncatedPaths: truncated }
+      );
+    }
+    return advisory(
+      `Reviewable file(s) were truncated at the size cap; the reviewer saw incomplete content: ${list}.`,
+      { truncated: true, truncatedPaths: truncated }
+    );
+  }
 
   // (7) Native self-review detection (verdict-based). A timestamp or a forgeable
   // sentinel is NOT sufficient: a completed review Task whose FINAL OUTPUT does
@@ -657,9 +872,11 @@ export async function evaluateGate(input) {
     });
   }
 
-  // Secret scan on the EXACT payload about to be sent (diff text + reviewable
-  // changed-file paths). Only reached when externalReview === "allow".
-  const secretFindings = scanSecrets(diff.text, reviewablePaths);
+  // Secret scan on the EXACT payload about to be sent. The diff text plus ALL
+  // changed-file paths (not just the classifier-reviewable subset) are scanned so a
+  // sensitive path the classifier dropped is still caught before any external
+  // dispatch. Only reached when externalReview === "allow".
+  const secretFindings = scanSecrets(diff.text, allChangedPaths);
   if (secretFindings.length > 0) {
     const findingSummary = summarizeSecretFindings(secretFindings);
     if (secretScanPolicy === "block-all") {
@@ -763,7 +980,25 @@ export async function evaluateGate(input) {
     );
   }
 
-  const verdict = result.verdict;
+  // HARDENING (audit gate-decision advisory): re-validate the runner's verdict in
+  // the gate itself rather than trusting its shape. The shipped adapters call
+  // parseVerdict, but the gate's documented contract is to FAIL CLOSED even if a
+  // future/third-party/compromised runner returns a malformed object. validateVerdict
+  // (idempotent on an already-validated verdict) re-binds job_id/diff_hash/reviewer/
+  // level, requires verdict to be exactly "pass"/"fail", and FORCES "fail" on any
+  // Critical/Important finding. Anything that fails validation is an operational
+  // failure routed through reviewerErrorDecision (block in enforced/strict).
+  const validated = validateVerdict(result.verdict, job);
+  if (!validated.ok) {
+    return await blockWithCap(
+      stateDir,
+      sessionId,
+      state,
+      config,
+      reviewerErrorDecision(config, level, `invalid_verdict:${validated.error}`)
+    );
+  }
+  const verdict = validated.verdict;
 
   // A valid fail is NOT an operational failure: block with findings, do not
   // fall back to self-review.

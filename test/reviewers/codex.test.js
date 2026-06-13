@@ -246,4 +246,65 @@ describe("codex adapter", () => {
     assert.equal(result.ok, false);
     assert.equal(result.error, "missing_binary");
   });
+
+  // --- ASYNC-1: verify() bounds the `codex --version` probe with a timeout ---
+
+  // A reviewer binary whose --version hangs must NOT hang the gate forever.
+  // verify() wraps the probe in runWithTimeout; with an injected short timeout it
+  // resolves promptly with reason "version_check_timeout" (the child is killed).
+  it("verify() returns version_check_timeout when the binary hangs past the verify timeout", async () => {
+    // Stub that NEVER exits (simulates a hung `codex --version`). forwardArgs is
+    // false for the codex shim, so this stub runs for the --version probe too.
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-codex-hang-"));
+    const stubPath = join(stubDir, "hang.cjs");
+    await writeFile(stubPath, "setTimeout(() => {}, 60000);\n", "utf8");
+    const shim = await createCodexShim(stubPath);
+    try {
+      const adapter = createAdapter({});
+      const start = Date.now();
+      // Inject a short verify timeout so the test does not wait the real 15s.
+      const result = await adapter.verify(shim.env, { verifyTimeoutMs: 200 });
+      const elapsed = Date.now() - start;
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "version_check_timeout");
+      assert.ok(elapsed < 5000, `verify() should resolve promptly on timeout, took ${elapsed}ms`);
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  // --- ASYNC-2: verify() drains stderr so a stderr flood cannot deadlock ---
+
+  // The probe spawns the child with stderr 'pipe'. A binary writing >64KB to
+  // stderr fills the OS pipe buffer and DEADLOCKS verify() forever unless stderr
+  // is drained. runWithTimeout({captureStderr:true}) drains both streams, so a
+  // version probe that floods >70KB to stderr then exits 0 still completes.
+  it("verify() completes (no deadlock) when the binary floods >70KB to stderr then exits 0", async () => {
+    const stubDir = await mkdtemp(join(tmpdir(), "ar-codex-flood-"));
+    const stubPath = join(stubDir, "flood.cjs");
+    // Write 70KB+ to stderr, print a version to stdout, exit 0.
+    await writeFile(
+      stubPath,
+      [
+        'process.stderr.write("E".repeat(70 * 1024));',
+        'process.stdout.write("test-stub 1.0.0\\n");',
+        "process.exit(0);",
+      ].join("\n"),
+      "utf8"
+    );
+    const shim = await createCodexShim(stubPath);
+    try {
+      const adapter = createAdapter({});
+      const start = Date.now();
+      const result = await adapter.verify(shim.env, { verifyTimeoutMs: 10000 });
+      const elapsed = Date.now() - start;
+      // It must finish well under the timeout (no deadlock) and report ok.
+      assert.equal(result.ok, true, `verify failed: ${result.reason}`);
+      assert.ok(elapsed < 5000, `verify() deadlocked on stderr flood (took ${elapsed}ms)`);
+    } finally {
+      await shim.cleanup();
+      await rm(stubDir, { recursive: true, force: true });
+    }
+  });
 });

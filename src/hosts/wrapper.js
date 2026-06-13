@@ -18,7 +18,13 @@
  * @returns {{ host: string, wrapperCommand: string, enforcement: string, residualRisk: string }}
  */
 export function wrapperInstructions({ host, reviewer, binPath }) {
-  const bin = binPath || "npx adversarial-review-gate";
+  // Quote a binPath that contains whitespace so the printed wrapper command is
+  // copy-pasteable and does not shell-split mid-path (e.g. "C:\Program Files\..").
+  // The default ("npx adversarial-review-gate") is a command + arg, not a single
+  // path, so it is left unquoted.
+  const bin = binPath
+    ? (/\s/.test(binPath) ? `"${String(binPath).replace(/"/g, '\\"')}"` : binPath)
+    : "npx adversarial-review-gate";
   const reviewerNote = reviewer && reviewer !== "none" ? ` (reviewer: ${reviewer})` : "";
 
   // Build a representative wrapper command.  The user substitutes their actual

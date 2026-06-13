@@ -86,6 +86,22 @@ Attack dimensions the reviewer must evaluate and report on:
 - **Accessibility** *(only for UI diffs)*: missing alt text, incorrect ARIA,
   keyboard handler gaps.
 
+**Adversarial invariant lenses** (apply ALL — these catch what the dimensions
+miss; the reviewer MUST try to construct a violating input for each):
+- **Trust boundary:** can an untrusted source (a committed project/repo config,
+  attacker-controlled diff/filenames, an env var, tool output) self-grant a
+  capability or loosen a tighten-only floor (`trusted`/`readOnly`/`allow*`/
+  `bypass`)? Any security decision reading a layer the user doesn't control?
+- **Async lifecycle:** every timer/child/stream/listener cleaned up on the
+  SUCCESS path too? `Promise.race([work, timeout])` leaving a pending timer
+  (hang)? Undrained stdout/stderr deadlock? Unbounded stdin read hang?
+- **Ambiguity/collision:** for any heuristic/canonicalization/fuzzy-match/
+  prefix-strip/name-match — build a collision (two distinct inputs → same key),
+  a case/prefix/suffix edge, a traversal-looking input.
+- **Platform reality:** env-var case (`PATH` vs `Path`), `.cmd`/shell wrapping,
+  `/` vs `\`, permissions, CRLF vs LF — Windows vs POSIX.
+A concrete invariant violation is Critical or Important.
+
 Be specific: cite `file:line`, quote the offending code, and explain the
 concrete failure (input → wrong output). No false alarms: if you cannot
 construct a real failing input, do not report Critical or Important.

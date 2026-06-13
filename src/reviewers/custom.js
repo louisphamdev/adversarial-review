@@ -11,9 +11,11 @@ import { tmpdir } from "node:os";
 import { resolveExecutable, spawnResolved, expandArgs } from "../core/process.js";
 import { parseVerdict } from "../core/verdict.js";
 import {
-  runWithTimeout,
+  runWithWatchdog,
+  sanePositiveSec,
   TIMEOUT_SENTINEL,
-  DEFAULT_TIMEOUT_SEC,
+  DEFAULT_INACTIVITY_SEC,
+  DEFAULT_HARDCAP_SEC,
 } from "./_shared.js";
 
 /**
@@ -53,7 +55,11 @@ function buildBrief(job) {
  */
 export function createAdapter(config, reviewerId) {
   const reviewerConfig = config?.reviewers?.[reviewerId] || {};
-  const timeoutSec = reviewerConfig.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+  // timeoutSec is the INACTIVITY window (no-output liveness) for the review run,
+  // not a fixed wall-clock deadline; maxTimeoutSec is the absolute hard-cap
+  // backstop. A reviewer still streaming output is never killed mid-review.
+  const inactivitySec = sanePositiveSec(reviewerConfig.timeoutSec, DEFAULT_INACTIVITY_SEC);
+  const hardCapSec = sanePositiveSec(reviewerConfig.maxTimeoutSec, DEFAULT_HARDCAP_SEC);
 
   if (reviewerConfig.type !== "custom") {
     throw new Error(`Custom adapter requires type:"custom" in reviewer config for "${reviewerId}"`);
@@ -130,7 +136,9 @@ export function createAdapter(config, reviewerId) {
 
       const env = io.env || process.env;
       const cwd = io.cwd || job.cwd || process.cwd();
-      const effectiveTimeout = (io.timeoutSec ?? timeoutSec) * 1000;
+      // Inactivity window + absolute hard cap for the run watchdog (ms).
+      const inactivityMs = sanePositiveSec(io.timeoutSec, inactivitySec) * 1000;
+      const hardCapMs = sanePositiveSec(io.maxTimeoutSec, hardCapSec) * 1000;
 
       let tempDir = null;
       try {
@@ -150,9 +158,13 @@ export function createAdapter(config, reviewerId) {
         const jobPath = join(tempDir, "job.json");
 
         // Write brief and job descriptor to temp files so they can be passed as
-        // file paths via placeholders without shell-escaping concerns.
-        await writeFile(briefPath, buildBrief(job), "utf8");
-        await writeFile(jobPath, JSON.stringify(job, null, 2), "utf8");
+        // file paths via placeholders without shell-escaping concerns. Both are
+        // written OWNER-ONLY (mode 0o600), like the diff temp file above: the
+        // brief carries job metadata and job.json carries the FULL job descriptor
+        // (including diffText), so on a shared POSIX CI runner another UID must not
+        // be able to read them before the tempdir is cleaned up.
+        await writeFile(briefPath, buildBrief(job), { encoding: "utf8", mode: 0o600 });
+        await writeFile(jobPath, JSON.stringify(job, null, 2), { encoding: "utf8", mode: 0o600 });
 
         // Expand placeholders BEFORE resolving the binary. expandArgs throws on
         // unknown placeholders — this is the injection guard. The check must
@@ -184,10 +196,13 @@ export function createAdapter(config, reviewerId) {
           return { ok: false, error: err?.message === "unsafe_batch_argument" ? "unsafe_batch_argument" : `spawn_failed:${err?.message || "error"}` };
         }
 
-        // Race the process completion against the timeout. On timeout, the child
-        // process tree is force-killed inside runWithTimeout.
-        const raceResult = await runWithTimeout(child, {
-          timeoutMs: effectiveTimeout,
+        // Inactivity watchdog: kill only after no output for inactivityMs (the
+        // timer resets on every chunk) or the hardCapMs backstop, whichever fires
+        // first. The child process tree is force-killed inside runWithWatchdog,
+        // which also drains stderr so a flood cannot deadlock the pipe.
+        const raceResult = await runWithWatchdog(child, {
+          inactivityMs,
+          hardCapMs,
         });
 
         if (raceResult === TIMEOUT_SENTINEL) {

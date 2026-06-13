@@ -114,10 +114,11 @@ describe("doctor command", () => {
     const cwd = await tmpDir("ar-doctor-wrapper-");
     const home = await tmpDir("ar-doctor-wrapper-home-");
     try {
-      // Write project config with a wrapper host (codex).
-      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      // The host->reviewer map is sourced from the TRUSTED user-level config
+      // (a project config can no longer inject hosts.*), so write it under home.
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
       await writeFile(
-        join(cwd, ".adversarial-review", "config.json"),
+        join(home, ".adversarial-review", "config.json"),
         JSON.stringify({
           policy: { allowAdvisoryHosts: true },
           hosts: {
@@ -131,13 +132,17 @@ describe("doctor command", () => {
 
       await doctorCommand(["--json"], io);
 
-      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+      // FINDING 7: a wrapper-ONLY configuration is advisory (bypassing the wrapper
+      // skips the gate), so doctor must NOT certify it as enforced — it exits
+      // non-zero so CI cannot mistake an advisory gate for an enforced one.
+      assert.equal(process.exitCode, 1, `expected exit 1 for wrapper-only gate, stderr: ${err.join("")}`);
 
       const parsed = JSON.parse(out.join(""));
       const hasWrapperWarning = parsed.warnings.some(
         (w) => /wrapper/i.test(w) || /advisory/i.test(w)
       );
       assert.ok(hasWrapperWarning, "expected a wrapper/advisory limitation warning in output");
+      assert.equal(parsed.wrapperOnlyNotEnforced, true, "wrapperOnlyNotEnforced must be flagged");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });
@@ -152,9 +157,11 @@ describe("doctor command", () => {
     const cwd = await tmpDir("ar-doctor-clean-");
     const home = await tmpDir("ar-doctor-clean-home-");
     try {
-      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      // Host map comes from the trusted user-level config (project layer can no
+      // longer inject hosts.*).
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
       await writeFile(
-        join(cwd, ".adversarial-review", "config.json"),
+        join(home, ".adversarial-review", "config.json"),
         JSON.stringify({
           hosts: {
             "claude-code": { reviewer: "none" },
@@ -264,6 +271,283 @@ describe("doctor command", () => {
       const { existsSync: efs } = await import("node:fs");
       assert.ok(!efs(join(cwd, ".adversarial-review")), "no cwd AR dir should be created");
       assert.ok(!efs(join(home, ".adversarial-review")), "no home AR dir should be created");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 1: a neutered Stop hook must NOT be certified healthy/registered.
+  // -------------------------------------------------------------------------
+  it("does NOT report a neutered Stop hook as registered/native-enforced; warns + exits 1 (findings 1,2,3)", async () => {
+    const cwd = await tmpDir("ar-doctor-neuter-");
+    const home = await tmpDir("ar-doctor-neuter-home-");
+    try {
+      // Host map comes from the trusted user-level config (project layer can no
+      // longer inject hosts.*).
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(home, ".adversarial-review", "config.json"),
+        JSON.stringify({ hosts: { "claude-code": { reviewer: "none" } } })
+      );
+      // SessionStart canonical, but Stop is a spoofed/neutered command that keeps
+      // the substrings yet does nothing.
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event session-start",
+                  },
+                ],
+              },
+            ],
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "true # adversarial-review hook --host claude-code --event stop",
+                  },
+                ],
+              },
+            ],
+          },
+        })
+      );
+
+      const { io, out } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await doctorCommand(["--json"], io);
+
+      const parsed = JSON.parse(out.join(""));
+      const cc = parsed.hosts.find((h) => h.id === "claude-code");
+      assert.equal(cc.hooks.registered, false, "neutered stop must NOT be registered");
+      assert.equal(cc.hooks.tampered, true, "tampered hook must be flagged");
+      assert.notEqual(
+        parsed.effectiveEnforcement,
+        "native-enforced",
+        "must NOT certify native-enforced when the stop hook is neutered"
+      );
+      assert.equal(parsed.nativeNotEnforced, true);
+      assert.ok(
+        parsed.warnings.some((wn) => /tamper|neuter|not registered|not actually/i.test(wn)),
+        "must warn about the non-functional/tampered gate"
+      );
+      // Finding 3: CI gating contract — exit non-zero.
+      assert.equal(process.exitCode, 1, "doctor must exit 1 for a configured-but-unenforced gate");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 2 + 3: native host configured but NO hooks at all -> not enforced,
+  // exit non-zero.
+  // -------------------------------------------------------------------------
+  it("exits non-zero when a native host is configured but hooks are absent (findings 2,3)", async () => {
+    const cwd = await tmpDir("ar-doctor-nohooks-");
+    const home = await tmpDir("ar-doctor-nohooks-home-");
+    try {
+      // Host map comes from the trusted user-level config (project layer can no
+      // longer inject hosts.*).
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(home, ".adversarial-review", "config.json"),
+        JSON.stringify({ hosts: { "claude-code": { reviewer: "none" } } })
+      );
+      // No .claude/settings.json at all.
+
+      const { io, out } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await doctorCommand(["--json"], io);
+
+      const parsed = JSON.parse(out.join(""));
+      assert.notEqual(parsed.effectiveEnforcement, "native-enforced");
+      assert.equal(parsed.nativeNotEnforced, true);
+      assert.equal(process.exitCode, 1, "doctor must exit 1 when the gate would never fire");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // A healthy registered native gate exits 0 (regression: contract is not
+  // over-eager).
+  // -------------------------------------------------------------------------
+  it("exits 0 for a healthy registered native-enforced gate (finding 3 negative)", async () => {
+    const cwd = await tmpDir("ar-doctor-ok-");
+    const home = await tmpDir("ar-doctor-ok-home-");
+    try {
+      // Host map comes from the trusted user-level config (project layer can no
+      // longer inject hosts.*).
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(home, ".adversarial-review", "config.json"),
+        JSON.stringify({ hosts: { "claude-code": { reviewer: "none" } } })
+      );
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event session-start",
+                  },
+                ],
+              },
+            ],
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event stop",
+                  },
+                ],
+              },
+            ],
+          },
+        })
+      );
+
+      const { io, out } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await doctorCommand(["--json"], io);
+
+      const parsed = JSON.parse(out.join(""));
+      assert.equal(parsed.effectiveEnforcement, "native-enforced");
+      assert.equal(parsed.nativeNotEnforced, false);
+      assert.equal(process.exitCode, 0, "healthy enforced gate must exit 0");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 8: a native host with registered hooks but an UNAVAILABLE reviewer
+  // is effectively broken — doctor must warn AND exit non-zero (not certify it).
+  // -------------------------------------------------------------------------
+  it("exits non-zero when a native host's reviewer is unavailable (finding 8)", async () => {
+    const cwd = await tmpDir("ar-doctor-revunavail-");
+    const home = await tmpDir("ar-doctor-revunavail-home-");
+    try {
+      // claude-code mapped to opencode, but PATH is empty so opencode is missing.
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(home, ".adversarial-review", "config.json"),
+        JSON.stringify({ hosts: { "claude-code": { reviewer: "opencode" } } })
+      );
+      // Hooks ARE registered (canonical), so only the reviewer is the problem.
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+      await writeFile(
+        join(cwd, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event session-start",
+                  },
+                ],
+              },
+            ],
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "adversarial-review-gate hook --host claude-code --event stop",
+                  },
+                ],
+              },
+            ],
+          },
+        })
+      );
+
+      // Empty PATH so the opencode binary cannot be resolved -> reviewer unavailable.
+      const { io, out } = makeIo(cwd, home, { PATH: "" });
+      process.exitCode = 0;
+      await doctorCommand(["--json"], io);
+
+      const parsed = JSON.parse(out.join(""));
+      const cc = parsed.hosts.find((h) => h.id === "claude-code");
+      assert.equal(cc.hooks.registered, true, "hooks ARE registered in this scenario");
+      assert.equal(cc.reviewerAvailable, false, "the opencode reviewer must be unavailable");
+      // Must NOT certify as native-enforced when no review can actually run.
+      assert.notEqual(
+        parsed.effectiveEnforcement,
+        "native-enforced",
+        "must not certify native-enforced when the reviewer is unavailable"
+      );
+      assert.equal(parsed.nativeNotEnforced, true, "nativeNotEnforced must be flagged");
+      assert.equal(
+        process.exitCode,
+        1,
+        "doctor must exit 1 when the native host's reviewer is unavailable"
+      );
+      assert.ok(
+        parsed.warnings.some((w) => /unavailable/i.test(w)),
+        "must warn about the unavailable reviewer"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 7: a wrapper-only gate must not be certified as enforced; exit 1.
+  // -------------------------------------------------------------------------
+  it("exits non-zero for a wrapper-only (advisory) gate (finding 7)", async () => {
+    const cwd = await tmpDir("ar-doctor-wrapperonly-");
+    const home = await tmpDir("ar-doctor-wrapperonly-home-");
+    try {
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(home, ".adversarial-review", "config.json"),
+        JSON.stringify({
+          policy: { allowAdvisoryHosts: true },
+          hosts: { codex: { reviewer: "none" } },
+        })
+      );
+
+      const { io, out } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await doctorCommand(["--json"], io);
+
+      const parsed = JSON.parse(out.join(""));
+      assert.equal(parsed.effectiveEnforcement, "wrapper-enforced (advisory)");
+      assert.equal(parsed.wrapperOnlyNotEnforced, true);
+      assert.equal(parsed.notEffectivelyEnforced, true);
+      assert.equal(process.exitCode, 1, "wrapper-only gate must exit non-zero");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

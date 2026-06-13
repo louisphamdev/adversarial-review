@@ -22,15 +22,33 @@ import { sessionStateKey } from "./hook.js";
 
 const DEFAULT_QUIESCENCE_MS = 750;
 const BLOCK_EXIT_CODE = 2;
+// Number of CONSECUTIVE stable snapshots required to declare the workspace
+// quiescent. A two-snapshot compare (1 stable transition) can land both samples
+// in the same quiet gap of a periodic/bursty writer (file watcher, autoformatter,
+// build daemon) and wrongly conclude "settled". Requiring several consecutive
+// identical snapshots widens the observation window so a periodic writer is far
+// more likely to be caught mid-cycle. This is best-effort quiescence detection,
+// not a hard guarantee against an adversarial writer timed to our exact cadence.
+const QUIESCENCE_STABLE_SAMPLES = 3;
 
 /**
  * @param {string[]} argv
  * @param {object} io  - { stdin, stdout, stderr, env, cwd }
  */
 export async function runCommand(argv, io) {
-  const { host, command } = parseArgs(argv);
+  const { host, command, error } = parseArgs(argv);
   const env = io.env || process.env;
   const cwd = io.cwd;
+
+  // Reject argument confusion BEFORE running anything: an unknown flag in the
+  // head (pre-`--`) is silently ignored otherwise, so a typo like `--hosts`
+  // (plural) or an unsupported `--json` would change behavior without warning.
+  if (error) {
+    io.stderr.write(`adversarial-review run: ${error}\n`);
+    io.stderr.write("usage: adversarial-review run --host <host> -- <command> [args...]\n");
+    process.exitCode = 2;
+    return;
+  }
 
   if (command.length === 0) {
     io.stderr.write("usage: adversarial-review run --host <host> -- <command> [args...]\n");
@@ -60,6 +78,16 @@ export async function runCommand(argv, io) {
     );
     process.exitCode = BLOCK_EXIT_CODE;
     return { action: "block", reason: "files_still_changing" };
+  }
+  if (stillChanging) {
+    // Non-enforced (soft/advisory) mode does NOT block, but the reviewer would
+    // then see a moving target — an inconsistent, possibly mid-write diff. Surface
+    // that the snapshot is not settled instead of silently reviewing it, so a
+    // PASS on a partial change is not mistaken for a clean review of the final state.
+    io.stderr.write(
+      "WARNING: workspace is still being written after the command exited; reviewing a " +
+        "possibly-inconsistent snapshot (soft mode does not block). Re-run once the tool has finished.\n"
+    );
   }
 
   const { hostDescriptor, reviewerRunner } = buildHostRouting(host, config, env);
@@ -124,33 +152,68 @@ async function runWrapped(command, { cwd, env, io }) {
       io.stderr.write(`adversarial-review run: ${exe} error: ${err.message}\n`);
       resolve(127);
     });
-    child.on("close", (code) => resolve(code == null ? 0 : code));
+    // A signal-terminated child reports code:null with a signal name. Treating a
+    // signal kill as exit 0 (success) would let a kill MASK a gate bypass: a tool
+    // that signals itself (or a Ctrl+C) would surface success on a command that
+    // never completed normally. Map a signal to the shell convention 128+signum
+    // (non-zero), and a null-with-no-signal to 1, so a kill can never report
+    // success. (The gate's own block decision still overrides the exit code.)
+    child.on("close", (code, signal) =>
+      resolve(code != null ? code : signal ? 128 + signalNumber(signal) : 1)
+    );
   });
+}
+
+// Map a POSIX signal name to its number for the shell 128+signum exit convention.
+// Falls back to SIGTERM's 15 for an unknown/unmapped signal so the result is
+// always a non-zero, signal-like exit code.
+function signalNumber(signal) {
+  const SIGNALS = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGQUIT: 3,
+    SIGKILL: 9,
+    SIGTERM: 15,
+    SIGABRT: 6,
+    SIGSEGV: 11,
+  };
+  return SIGNALS[signal] ?? 15;
 }
 
 // ---------------------------------------------------------------------------
 // Quiescence detection
 // ---------------------------------------------------------------------------
 
-// Take two review-scope snapshots `quiescenceMs` apart. If the diff hash changes
-// between them, files are still being written (not quiescent). Tolerant: a
-// build failure returns false (do not wedge on a diff error — the gate's own
+// Sample the review-scope diff hash repeatedly, `quiescenceMs` apart, and require
+// QUIESCENCE_STABLE_SAMPLES CONSECUTIVE identical hashes before declaring the
+// workspace settled. A single two-snapshot compare can land both samples in the
+// same quiet gap of a periodic/bursty writer and wrongly report "settled";
+// requiring several consecutive stable samples widens the window so a writer that
+// touches files between cycles is far more likely to be caught. Returns true as
+// soon as ANY two adjacent snapshots differ (still changing). Tolerant: a build
+// failure returns false (do not wedge on a diff error — the gate's own
 // internal-error handling covers an unbuildable diff).
 async function stillChangingScope(cwd, baseline, quiescenceMs) {
-  let first;
+  let prevHash;
   try {
-    first = await buildReviewDiff(cwd, baseline);
+    prevHash = (await buildReviewDiff(cwd, baseline)).diffHash;
   } catch {
     return false;
   }
-  await sleep(quiescenceMs);
-  let second;
-  try {
-    second = await buildReviewDiff(cwd, baseline);
-  } catch {
-    return false;
+  // We already have sample #1; take (STABLE_SAMPLES - 1) more and compare each to
+  // the previous. Any mismatch => still changing.
+  for (let i = 1; i < QUIESCENCE_STABLE_SAMPLES; i += 1) {
+    await sleep(quiescenceMs);
+    let nextHash;
+    try {
+      nextHash = (await buildReviewDiff(cwd, baseline)).diffHash;
+    } catch {
+      return false;
+    }
+    if (nextHash !== prevHash) return true;
+    prevHash = nextHash;
   }
-  return first.diffHash !== second.diffHash;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,19 +221,54 @@ async function stillChangingScope(cwd, baseline, quiescenceMs) {
 // ---------------------------------------------------------------------------
 
 // Parse `--host <host> -- <command...>`. Everything after the first `--` is the
-// command. `--host` defaults to "wrapper".
+// command (passed through verbatim — flags there belong to the wrapped tool).
+// `--host` defaults to "wrapper" and takes the FIRST occurrence (consistent with
+// check.js). Any UNKNOWN flag in the head (a token starting with `-`) is rejected
+// with an `error` rather than silently ignored, so a typo or unsupported option
+// cannot quietly change behavior (argument confusion).
 function parseArgs(argv) {
   let host = "wrapper";
+  let hostSeen = false;
+  let error = null;
   const sep = argv.indexOf("--");
   const head = sep >= 0 ? argv.slice(0, sep) : argv;
   const command = sep >= 0 ? argv.slice(sep + 1) : [];
   for (let i = 0; i < head.length; i += 1) {
-    if (head[i] === "--host" && head[i + 1]) {
-      host = head[i + 1];
+    const tok = head[i];
+    if (tok === "--host") {
+      if (!head[i + 1]) {
+        error = error || "--host requires a value";
+        break;
+      }
+      // First occurrence wins; a second --host is argument confusion.
+      if (!hostSeen) {
+        host = head[i + 1];
+        hostSeen = true;
+      } else {
+        error = error || "duplicate --host flag";
+        break;
+      }
       i += 1;
+    } else if (tok.startsWith("--host=")) {
+      if (!hostSeen) {
+        host = tok.slice("--host=".length);
+        hostSeen = true;
+      } else {
+        error = error || "duplicate --host flag";
+        break;
+      }
+    } else if (tok.startsWith("-")) {
+      // Any other flag before `--` is unknown — reject rather than ignore.
+      error = error || `unknown flag "${tok}" (did you forget the "--" separator before the command?)`;
+      break;
+    } else {
+      // A bare positional before `--` is also a usage error: the command must be
+      // separated by `--` so flags meant for the wrapped tool are never consumed.
+      error = error || `unexpected argument "${tok}" before "--"; put the command after "--"`;
+      break;
     }
   }
-  return { host, command };
+  return { host, command, error };
 }
 
 function sleep(ms) {

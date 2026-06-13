@@ -18,7 +18,7 @@ import { spawn } from "node:child_process";
  * @param {string} name  - canonical key name (e.g. "PATH", "PATHEXT")
  * @returns {string|undefined}
  */
-function getEnvCaseInsensitive(env, name) {
+export function getEnvCaseInsensitive(env, name) {
   if (!env || typeof env !== "object") return undefined;
   // Prefer the exact key first to keep existing behavior identical.
   if (Object.prototype.hasOwnProperty.call(env, name) && env[name] != null) {
@@ -68,6 +68,13 @@ export async function resolveExecutable(command, env = process.env) {
       ? String(pathExtValue || ".COM;.EXE;.BAT;.CMD").split(";")
       : [""];
 
+  // On POSIX, a PATH candidate must be EXECUTABLE to be a real match: a
+  // non-executable same-named file (e.g. a mode-0o644 stub) earlier in PATH must
+  // be SKIPPED so a later, real executable is found instead of returning a path
+  // that spawn() would then reject with EACCES (a false negative). On Windows the
+  // execute bit is not modeled (X_OK behaves like F_OK), and executability is
+  // expressed via PATHEXT, so existence (F_OK) is the correct match test there.
+  const accessMode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
   for (const dir of pathEntries) {
     for (const ext of extensions) {
       const candidate = path.join(
@@ -75,7 +82,7 @@ export async function resolveExecutable(command, env = process.env) {
         process.platform === "win32" ? `${command}${ext}` : command
       );
       try {
-        await access(candidate, constants.F_OK);
+        await access(candidate, accessMode);
         return candidate;
       } catch {
         continue;

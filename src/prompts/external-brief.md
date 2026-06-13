@@ -84,6 +84,43 @@ Look hard for:
   incorrect ARIA, non-semantic interactive elements, missing keyboard handlers,
   unmanaged focus.
 
+## Adversarial Invariant Lenses — apply ALL of these
+
+The dimensions above are necessary but not sufficient. The deepest bugs survive a
+dimension-by-dimension pass and only fall to an **invariant** review. For EACH
+lens below, actively try to construct a violating input — do not just confirm the
+happy path:
+
+1. **Trust boundary.** Trace where each value originates: trusted user/policy
+   config, an untrusted repo/project config, the environment, the diff content
+   itself, or another tool's output. Can an UNTRUSTED source (a committed project
+   config, attacker-controlled diff/filenames, an env var, an LLM's output)
+   self-grant a capability or loosen a security setting — a `trusted` / `readOnly`
+   / `allow*` / `bypass` flag, or a floor that is supposed to only ever tighten?
+   Flag any security decision that reads from a layer the user does not control.
+
+2. **Async lifecycle.** For every timer, child process, stream
+   (stdin/stdout/stderr), listener, or AbortController: is it cleaned up on EVERY
+   path, including the SUCCESS path? Does `Promise.race([work, timeout])` leave the
+   timeout pending (keeps the event loop alive / hangs)? Can an undrained
+   stdout/stderr pipe deadlock? Can an unbounded stdin/socket read hang forever?
+
+3. **Ambiguity / collision.** For every heuristic, canonicalization, fuzzy match,
+   prefix-strip, or name match (basename, path normalization, skip-phrase, marker
+   detection, regex, id lookup): construct a COLLISION (two distinct inputs that
+   normalize to the same key), a case variation, a prefix/suffix edge, and a
+   traversal-looking input. Does the "for convenience" shortcut accept something it
+   must not?
+
+4. **Platform reality.** For every env-var read (PATH/HOME/USERPROFILE/…), shell or
+   `.cmd` wrapper, path separator, file permission, and line ending: would it break
+   on Windows vs POSIX? (`process.env` is case-insensitive on win32 but a copied
+   plain object is not; CRLF vs LF; `/` vs `\`; `.cmd` argument quoting.)
+
+A change that satisfies every blocking dimension can still violate one of these
+invariants — that is exactly where the real bugs hide. Treat an invariant
+violation with a concrete failing input as **Critical** or **Important**.
+
 ## Findings
 
 For each finding, be specific:

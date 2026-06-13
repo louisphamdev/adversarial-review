@@ -436,6 +436,64 @@ describe("install command", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Finding 9: legacy <- existing layering must DEEP-merge nested sections so a
+  // migrated legacy threshold is not clobbered by an existing project config that
+  // sets a DIFFERENT threshold key.
+  // -------------------------------------------------------------------------
+  it("deep-merges legacy and existing config so nested keys from BOTH survive (finding 9)", async () => {
+    const cwd = await tmpDir("ar-install-deepmerge-");
+    const home = await tmpDir("ar-install-deepmerge-home-");
+    try {
+      // Legacy config migrates thresholds.bigDiffLines + bigFileCount.
+      await mkdir(join(cwd, "hooks"), { recursive: true });
+      await writeFile(
+        join(cwd, "hooks", "config.json"),
+        JSON.stringify({ bigDiffLines: 500, bigFileCount: 10 })
+      );
+      // Existing project config sets a DIFFERENT threshold key — a shallow merge
+      // would replace the whole thresholds object and drop the legacy keys.
+      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      await writeFile(
+        join(cwd, ".adversarial-review", "config.json"),
+        JSON.stringify({ thresholds: { debateDiffLines: 200 } })
+      );
+
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const written = JSON.parse(
+        await rf(join(cwd, ".adversarial-review", "config.json"), "utf8")
+      );
+      // Both the migrated legacy keys AND the existing key must be present.
+      assert.equal(
+        written.thresholds?.bigDiffLines,
+        500,
+        "migrated legacy bigDiffLines must survive the deep merge"
+      );
+      assert.equal(
+        written.thresholds?.bigFileCount,
+        10,
+        "migrated legacy bigFileCount must survive the deep merge"
+      );
+      assert.equal(
+        written.thresholds?.debateDiffLines,
+        200,
+        "existing project debateDiffLines must survive the deep merge"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // No hosts specified -> usage error
   // -------------------------------------------------------------------------
   it("exits with usage error when no --hosts given", async () => {
@@ -676,6 +734,51 @@ describe("install command", () => {
         errText,
         /codex.*ignored|ignored.*codex/i,
         `stderr must warn about ignored codex mapping; got: ${errText}`
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 12: the install registry must record reviewer mappings ONLY for
+  // hosts that were actually selected/installed — never for ignored non-selected
+  // hosts (those only get a warning).
+  // -------------------------------------------------------------------------
+  it("registry records reviewer mappings only for selected hosts (finding 12)", async () => {
+    const cwd = await tmpDir("ar-install-regfilter-");
+    const home = await tmpDir("ar-install-regfilter-home-");
+    try {
+      const { io } = makeIo(cwd, home);
+      process.exitCode = 0;
+      // --hosts has only claude-code; an extra --reviewer maps a non-selected host.
+      await installCommand(
+        [
+          "--hosts", "claude-code",
+          "--reviewer", "claude-code=none",
+          "--reviewer", "codex=none",
+        ],
+        io
+      );
+      assert.equal(process.exitCode, 0);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const reg = JSON.parse(
+        await rf(join(home, ".adversarial-review", "install.json"), "utf8")
+      );
+      const entry = Object.values(reg)[0];
+      assert.ok(entry, "a registry entry must exist");
+      // Only the selected host's mapping is recorded; the ignored one is absent.
+      assert.deepEqual(
+        entry.reviewers,
+        { "claude-code": "none" },
+        "registry must record only the selected host's reviewer mapping"
+      );
+      assert.ok(
+        !("codex" in entry.reviewers),
+        "non-selected host mapping must NOT be persisted in the registry"
       );
     } finally {
       resetExit();
@@ -1121,6 +1224,46 @@ describe("install command", () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Finding 10: atomicWrite must NOT leak a temp file when the atomic rename
+  // fails. We force a rename failure by pre-creating the target path as a
+  // DIRECTORY (rename(tmp, <dir>) fails) and assert no `.tmp` litter remains.
+  // -------------------------------------------------------------------------
+  it("does not leak a temp file when the atomic rename fails (finding 10)", async () => {
+    const cwd = await tmpDir("ar-install-tmpleak-");
+    const home = await tmpDir("ar-install-tmpleak-home-");
+    try {
+      // Make the project config path a DIRECTORY so atomicWrite's rename fails.
+      await mkdir(join(cwd, ".adversarial-review", "config.json"), { recursive: true });
+
+      const { io } = makeIo(cwd, home);
+      process.exitCode = 0;
+      let threw = false;
+      try {
+        await installCommand(
+          ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+          io
+        );
+      } catch {
+        threw = true; // The rename failure propagates — expected.
+      }
+      assert.ok(threw, "install must surface the rename failure (not swallow it)");
+
+      // No orphaned `.tmp` file may remain in the target directory.
+      const entries = await readdir(join(cwd, ".adversarial-review"));
+      const leftovers = entries.filter((e) => e.includes(".tmp"));
+      assert.equal(
+        leftovers.length,
+        0,
+        `no temp file must leak on rename failure; found: ${leftovers.join(", ")}`
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it("backs up a corrupt settings.json to settings.json.bak before merging", async () => {
     const cwd = await tmpDir("ar-install-corrupt-");
     const home = await tmpDir("ar-install-corrupt-home-");
@@ -1146,6 +1289,70 @@ describe("install command", () => {
         await rf(join(cwd, ".claude", "settings.json"), "utf8")
       );
       assert.ok(merged.hooks.Stop, "merged settings must have our Stop hook");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 11: a second corrupt-settings backup must NOT overwrite the prior
+  // `.bak` — the earlier (possibly GOOD) backup must be preserved under a unique
+  // timestamped name.
+  // -------------------------------------------------------------------------
+  it("does not overwrite a prior settings.json.bak with a new corrupt backup (finding 11)", async () => {
+    const cwd = await tmpDir("ar-install-bakpreserve-");
+    const home = await tmpDir("ar-install-bakpreserve-home-");
+    try {
+      const settingsPath = join(cwd, ".claude", "settings.json");
+      const defaultBak = join(cwd, ".claude", "settings.json.bak");
+      await mkdir(join(cwd, ".claude"), { recursive: true });
+
+      // First corrupt install -> creates settings.json.bak with the FIRST corrupt
+      // content (stand-in for a prior good backup that must not be lost).
+      const firstCorrupt = "{ FIRST corrupt content ";
+      await writeFile(settingsPath, firstCorrupt);
+      const { io: io1 } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io1
+      );
+      assert.equal(process.exitCode, 0);
+      assert.ok(existsSync(defaultBak), "first corrupt install must create settings.json.bak");
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const firstBakContent = await rf(defaultBak, "utf8");
+      assert.equal(firstBakContent, firstCorrupt, "first .bak must hold the first corrupt content");
+
+      // Second corrupt install (corrupt the live settings.json again).
+      const secondCorrupt = "{ SECOND corrupt content ";
+      await writeFile(settingsPath, secondCorrupt);
+      const { io: io2 } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io2
+      );
+      assert.equal(process.exitCode, 0);
+
+      // The ORIGINAL .bak must be untouched (still the first corrupt content).
+      const firstBakAfter = await rf(defaultBak, "utf8");
+      assert.equal(
+        firstBakAfter,
+        firstCorrupt,
+        "prior settings.json.bak must NOT be overwritten by the second corrupt backup"
+      );
+
+      // A new, distinct timestamped backup must hold the second corrupt content.
+      const claudeEntries = await readdir(join(cwd, ".claude"));
+      const extraBaks = claudeEntries.filter(
+        (e) => e.startsWith("settings.json.bak.") && e !== "settings.json.bak"
+      );
+      assert.equal(extraBaks.length, 1, "a unique timestamped backup must be created for the 2nd corrupt file");
+      const secondBakContent = await rf(join(cwd, ".claude", extraBaks[0]), "utf8");
+      assert.equal(secondBakContent, secondCorrupt, "timestamped backup must hold the 2nd corrupt content");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });
@@ -1264,6 +1471,129 @@ describe("install command", () => {
       assert.equal(cfgStat.mode & 0o777, 0o644, "config.json must be 0o644");
       assert.equal(settingsStat.mode & 0o777, 0o644, "settings.json must be 0o644");
       assert.equal(regStat.mode & 0o777, 0o600, "install.json must be 0o600");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 6: installer WRITES a user-level policy.json floor capturing the
+  // chosen enforcement mode, so a cloned repo's config cannot downgrade it.
+  // -------------------------------------------------------------------------
+  it("writes a user-level policy.json floor (mode + fail-closed actions) on install (finding 6)", async () => {
+    const cwd = await tmpDir("ar-install-floorwrite-");
+    const home = await tmpDir("ar-install-floorwrite-home-");
+    try {
+      const { io, out, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const floorPath = join(home, ".adversarial-review", "policy.json");
+      assert.ok(existsSync(floorPath), "install must create the user policy floor");
+      const { readFile: rf } = await import("node:fs/promises");
+      const floor = JSON.parse(await rf(floorPath, "utf8"));
+      // Default enforcement is "enforced".
+      assert.equal(floor.policy.mode, "enforced", "floor mode must capture the chosen mode");
+      assert.equal(floor.policy.onReviewerError, "block");
+      assert.equal(floor.policy.onInternalError, "block");
+      assert.equal(floor.policy.onBlockCap, "block");
+      assert.equal(floor.policy.allowSkip, false);
+      assert.equal(floor.policy.allowAdvisoryHosts, false);
+      // Messaging reflects the floor.
+      assert.match(out.join(""), /policy\.json/i, "install must mention the policy floor write");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("policy floor write is idempotent and never loosens a stricter existing floor (finding 6)", async () => {
+    const cwd = await tmpDir("ar-install-flooridem-");
+    const home = await tmpDir("ar-install-flooridem-home-");
+    try {
+      // Pre-existing STRICTER floor (strict-ci) with a user-authored extra key.
+      await mkdir(join(home, ".adversarial-review"), { recursive: true });
+      const strictFloor = {
+        policy: {
+          mode: "strict-ci",
+          onReviewerError: "block",
+          onInternalError: "block",
+          onBlockCap: "block",
+          allowSkip: false,
+          allowAdvisoryHosts: false,
+          reviewScope: "all-code",
+        },
+      };
+      await writeFile(
+        join(home, ".adversarial-review", "policy.json"),
+        JSON.stringify(strictFloor)
+      );
+
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io
+      );
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const floor = JSON.parse(
+        await rf(join(home, ".adversarial-review", "policy.json"), "utf8")
+      );
+      // Must NOT be downgraded from strict-ci to enforced.
+      assert.equal(floor.policy.mode, "strict-ci", "stricter floor must be preserved");
+      // User-authored extra key preserved (idempotent no-clobber).
+      assert.equal(floor.policy.reviewScope, "all-code");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Finding 5: registry key is case-normalized on the FULL path (win32), so the
+  // same project under different casing maps to ONE registry entry.
+  // -------------------------------------------------------------------------
+  it("win32 registry key lowercases the full path so re-install dedupes (finding 5)", async () => {
+    if (process.platform !== "win32") return; // Behavior is win32-specific.
+    const cwd = await tmpDir("ar-install-regcase-");
+    const home = await tmpDir("ar-install-regcase-home-");
+    try {
+      const { io: io1 } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io1
+      );
+      assert.equal(process.exitCode, 0);
+
+      // Re-install from an UPPER-CASED form of the same cwd.
+      const { io: io2 } = makeIo(cwd.toUpperCase(), home);
+      process.exitCode = 0;
+      await installCommand(
+        ["--hosts", "claude-code", "--reviewer", "claude-code=none"],
+        io2
+      );
+      assert.equal(process.exitCode, 0);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const reg = JSON.parse(
+        await rf(join(home, ".adversarial-review", "install.json"), "utf8")
+      );
+      assert.equal(
+        Object.keys(reg).length,
+        1,
+        "same project under different casing must yield ONE registry key"
+      );
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

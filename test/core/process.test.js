@@ -93,6 +93,56 @@ describe("resolveExecutable", () => {
     assert.equal(result, null, "no PATH-like key -> bare command cannot resolve");
   });
 
+  // REGRESSION (Finding 5): the PATH-walking branch must require EXECUTE
+  // permission (X_OK) on POSIX, not mere existence (F_OK). A non-executable
+  // same-named file (mode 0o644) earlier in PATH must be SKIPPED so a later, real
+  // executable is resolved — returning the non-executable one would make spawn()
+  // fail EACCES (a false negative). Skipped on Windows where the execute bit is
+  // not modeled and executability is expressed via PATHEXT.
+  it("on POSIX skips a non-executable PATH entry and resolves a later executable", async () => {
+    if (process.platform === "win32") {
+      return; // POSIX execute-bit semantics only.
+    }
+    const earlyDir = await mkdtemp(join(tmpdir(), "ar-path-early-"));
+    const lateDir = await mkdtemp(join(tmpdir(), "ar-path-late-"));
+    try {
+      // A NON-executable stub named "mytool" earlier in PATH (mode 0o644).
+      const earlyFile = join(earlyDir, "mytool");
+      await writeFile(earlyFile, "#!/bin/sh\necho early\n", { mode: 0o644 });
+      // The REAL executable later in PATH (mode 0o755).
+      const lateFile = join(lateDir, "mytool");
+      await writeFile(lateFile, "#!/bin/sh\necho late\n", { mode: 0o755 });
+
+      const env = { PATH: `${earlyDir}:${lateDir}` };
+      const result = await resolveExecutable("mytool", env);
+      assert.equal(
+        result,
+        lateFile,
+        `must skip the non-executable early entry and resolve the executable later one, got: ${result}`
+      );
+    } finally {
+      await rm(earlyDir, { recursive: true, force: true });
+      await rm(lateDir, { recursive: true, force: true });
+    }
+  });
+
+  // Companion: when the ONLY candidate is non-executable on POSIX, resolution
+  // returns null (so the caller fails closed) rather than a path spawn() rejects.
+  it("on POSIX returns null when the only PATH match is non-executable", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const dir = await mkdtemp(join(tmpdir(), "ar-path-noexec-"));
+    try {
+      const file = join(dir, "mytool");
+      await writeFile(file, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+      const result = await resolveExecutable("mytool", { PATH: dir });
+      assert.equal(result, null, "a non-executable-only match must resolve to null on POSIX");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("on Windows resolves .cmd through PATHEXT using a temp PATH", async () => {
     // Create foo.cmd in the temp dir.
     const cmdPath = join(tempDir, "foo.cmd");

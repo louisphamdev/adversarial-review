@@ -1,12 +1,17 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir, readdir } from "node:fs/promises";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 
-import { hookCommand } from "../../src/cli/hook.js";
+import {
+  hookCommand,
+  canonicalWorkspaceRoot,
+  sessionStateKey,
+  readTranscriptFile,
+} from "../../src/cli/hook.js";
 import { git, isGitRepo } from "../../src/core/git.js";
 
 // ---------------------------------------------------------------------------
@@ -117,6 +122,123 @@ describe("hook command", () => {
     }
   });
 
+  // ASYNC-3: a stdin pipe that opens but never closes must NOT hang the hook.
+  // readStdinJson races the drain against a timeout and yields {} on timeout; with
+  // no recorded baseline and no edit evidence the gate then silently allows.
+  it("stop with a never-ending stdin stream resolves within the timeout (yields {})", async () => {
+    const cwd = await tmpDir("ar-hook-stdin-hang-");
+    const stateDir = await tmpDir("ar-state-stdin-hang-");
+    try {
+      // A Readable that stays open forever: read() never pushes EOF, so the
+      // `for await` drain would hang indefinitely without the ASYNC-3 timeout.
+      const neverEnding = new Readable({ read() { /* never push, never end */ } });
+      // Inject a short stdin timeout so the test is fast; assert it resolves well
+      // under a real 5s bound (proving the timeout fired, not a normal close).
+      const { io, out } = makeIo(cwd, neverEnding, {
+        ADVERSARIAL_REVIEW_STATE_DIR: stateDir,
+      });
+      io.stdinTimeoutMs = 300;
+      const start = Date.now();
+      await hookCommand(["--event", "stop", "--host", "claude-code"], io);
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 4000, `hook should not hang on an open stdin pipe, took ${elapsed}ms`);
+      // No baseline + no edit evidence -> silent allow (no stdout output).
+      assert.equal(parseHookJson(out), null);
+      assert.equal(process.exitCode, 0);
+      neverEnding.destroy();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // ASYNC-3 (regression): resolving the race is NOT enough — the losing
+  // `for await` keeps the open stdin handle ref'd, holding the event loop alive
+  // so the hook never exits and the host kills it (fail-OPEN). The fix actively
+  // tears the stream down on timeout. Assert the injected stdin is DESTROYED
+  // (and paused) once the timeout fires, which is what releases the libuv handle.
+  it("actively destroys the stdin stream when the read times out (releases the handle)", async () => {
+    const cwd = await tmpDir("ar-hook-stdin-destroy-");
+    const stateDir = await tmpDir("ar-state-stdin-destroy-");
+    try {
+      const neverEnding = new Readable({ read() { /* never push, never end */ } });
+      let destroyed = false;
+      let paused = false;
+      const origDestroy = neverEnding.destroy.bind(neverEnding);
+      const origPause = neverEnding.pause.bind(neverEnding);
+      neverEnding.destroy = (...a) => { destroyed = true; return origDestroy(...a); };
+      neverEnding.pause = (...a) => { paused = true; return origPause(...a); };
+
+      const { io } = makeIo(cwd, neverEnding, { ADVERSARIAL_REVIEW_STATE_DIR: stateDir });
+      io.stdinTimeoutMs = 200;
+      await hookCommand(["--event", "stop", "--host", "claude-code"], io);
+      assert.equal(destroyed, true, "timed-out stdin must be destroyed so the handle is released");
+      assert.equal(paused, true, "timed-out stdin should be paused before destroy");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // ASYNC-3 (definitive wall-clock regression): with a REAL OS stdin pipe held
+  // open by a parent and never closed, the hook child must EXIT NATURALLY shortly
+  // after the stdin timeout — proving no libuv handle is leaked. Before the fix
+  // the child hung until SIGKILL (the host-timeout fail-OPEN). Skipped if the
+  // platform cannot spawn (very unlikely).
+  it("a child reading a never-closing OS stdin pipe exits naturally after the timeout", async (t) => {
+    const { spawn } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const hookUrl = new URL("../../src/cli/hook.js", import.meta.url).href;
+
+    const childDir = await tmpDir("ar-hook-pipe-child-");
+    const childScript = join(childDir, "child.mjs");
+    await writeFile(
+      childScript,
+      [
+        `import { hookCommand } from ${JSON.stringify(hookUrl)};`,
+        `import { mkdtempSync, rmSync } from "node:fs";`,
+        `import { tmpdir } from "node:os";`,
+        `import { join } from "node:path";`,
+        `const cwd = mkdtempSync(join(tmpdir(), "ar-pipe-c-"));`,
+        `const stateDir = mkdtempSync(join(tmpdir(), "ar-pipe-c-state-"));`,
+        `const home = mkdtempSync(join(tmpdir(), "ar-pipe-c-home-"));`,
+        `const io = {`,
+        `  stdin: process.stdin,`,
+        `  stdout: { write: () => {} },`,
+        `  stderr: { write: () => {} },`,
+        `  env: { ...process.env, ADVERSARIAL_REVIEW_HOME: home, HOME: home, USERPROFILE: home, ADVERSARIAL_REVIEW_STATE_DIR: stateDir },`,
+        `  cwd,`,
+        `  stdinTimeoutMs: 300,`,
+        `};`,
+        `await hookCommand(["--event", "stop", "--host", "claude-code"], io);`,
+        `process.on("exit", () => {`,
+        `  try { rmSync(cwd, { recursive: true, force: true }); } catch {}`,
+        `  try { rmSync(stateDir, { recursive: true, force: true }); } catch {}`,
+        `  try { rmSync(home, { recursive: true, force: true }); } catch {}`,
+        `});`,
+      ].join("\n"),
+    );
+
+    try {
+      // Parent holds the child's stdin pipe OPEN and never writes/closes it.
+      const child = spawn(process.execPath, [fileURLToPath(new URL(`file:///${childScript.replace(/\\/g, "/")}`))], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      const exited = await new Promise((resolve) => {
+        let done = false;
+        child.on("exit", (code) => { if (!done) { done = true; resolve({ code, killed: false }); } });
+        const kill = setTimeout(() => {
+          if (!done) { done = true; child.kill("SIGKILL"); resolve({ code: null, killed: true }); }
+        }, 4000);
+        if (typeof kill.unref === "function") kill.unref();
+      });
+      assert.equal(exited.killed, false, "hook child hung on an open stdin pipe (handle leaked -> fail-open)");
+      assert.equal(exited.code, 0, "hook child must exit cleanly after the stdin timeout");
+    } finally {
+      await rm(childDir, { recursive: true, force: true });
+    }
+  });
+
   it("session-start records a baseline (state file written) and produces no block", async () => {
     const cwd = await tmpDir("ar-hook-ss-");
     const stateDir = await tmpDir("ar-state-ss-");
@@ -164,22 +286,64 @@ describe("hook command", () => {
     }
   });
 
-  it("ignores a Windows subagent transcript (\\subagents\\ path) -> allow", async () => {
+  it("ignores a genuine SubagentStop event (authoritative hook_event_name) -> allow", async () => {
     const cwd = await tmpDir("ar-hook-sub-");
     const stateDir = await tmpDir("ar-state-sub-");
     try {
       await mkdir(join(cwd, "src"), { recursive: true });
       await recordBaseline(cwd, stateDir, "sSub");
       await writeFile(join(cwd, "src", "x.js"), "export function f(){ return 1; }\n");
-      // A subagent transcript path (Windows-style) must never trigger the gate.
+      // A genuine subagent Stop arrives as hook_event_name === "SubagentStop"
+      // (set by Claude Code itself). That authoritative signal — NOT the path —
+      // is what lets the gate stand down for a subagent pipeline.
       const subPath = "C:\\Users\\me\\.claude\\subagents\\agent-123.jsonl";
       const { io, out } = makeIo(
         cwd,
-        stdinFrom({ session_id: "sSub", cwd, transcript_path: subPath }),
+        stdinFrom({
+          session_id: "sSub",
+          cwd,
+          transcript_path: subPath,
+          hook_event_name: "SubagentStop",
+        }),
         { ADVERSARIAL_REVIEW_STATE_DIR: stateDir }
       );
       await hookCommand(["--event", "stop", "--host", "claude-code"], io);
       assert.equal(parseHookJson(out), null); // silent allow
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  // SECURITY regression: an UNTRUSTED transcript_path/session_id that LOOKS like a
+  // subagent (path under \subagents\, agent-* basename, g- session id) must NOT
+  // disable the gate on a plain Stop event. Previously this was a fail-OPEN
+  // bypass: a malicious repo could name its transcript to silently skip review.
+  it("does NOT skip the gate for a subagent-looking path on a plain Stop (fail-closed)", async () => {
+    const cwd = await tmpDir("ar-hook-subspoof-");
+    const stateDir = await tmpDir("ar-state-subspoof-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      // Record a baseline (empty src), then the agent adds an unreviewed code file.
+      await recordBaseline(cwd, stateDir, "g-spoofed");
+      await writeFile(join(cwd, "src", "x.js"), "export function f(){ return 1; }\n");
+      const tp = await writeEditTranscript(cwd, "src/x.js");
+      // Attacker-influencable fields chosen to hit ALL three old heuristics, but
+      // NO authoritative SubagentStop -> the gate must still BLOCK.
+      const { io, out } = makeIo(
+        cwd,
+        stdinFrom({
+          session_id: "g-spoofed",
+          cwd,
+          transcript_path: tp,
+          hook_event_name: "Stop",
+        }),
+        { ADVERSARIAL_REVIEW_STATE_DIR: stateDir }
+      );
+      await hookCommand(["--event", "stop", "--host", "claude-code"], io);
+      const json = parseHookJson(out);
+      assert.ok(json, "expected a hook decision (must not silently allow)");
+      assert.equal(json.decision, "block", "subagent-looking untrusted fields must not disarm the gate");
     } finally {
       await rm(cwd, { recursive: true, force: true });
       await rm(stateDir, { recursive: true, force: true });
@@ -210,13 +374,20 @@ describe("hook command", () => {
   it("stop with edit evidence but NO recorded baseline falls back with a disclosed limitation in soft", async () => {
     const cwd = await tmpDir("ar-hook-soft-");
     const stateDir = await tmpDir("ar-state-soft-");
+    // Soft posture must be set at the TRUSTED USER layer. A project-level
+    // config.json can no longer downgrade enforced -> soft (that project
+    // self-downgrade was closed as a security floor: with no user policy floor
+    // the default enforced baseline is re-applied over the merged config). So we
+    // establish soft via the user-level (machine-wide) config in an explicit
+    // home dir, which the floor legitimately permits.
+    const userHome = await tmpDir("ar-hook-soft-home-");
     try {
-      // Soft mode with onInternalError:allow — when no baseline was recorded the
-      // NOW-baseline fallback cannot see an already-completed change, so the gate
-      // surfaces an advisory; the hook then appends the disclosed limitation.
-      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      // Soft mode with onInternalError:allow at the USER layer — when no baseline
+      // was recorded the NOW-baseline fallback cannot see an already-completed
+      // change, so the gate surfaces an advisory; the hook appends the limitation.
+      await mkdir(join(userHome, ".adversarial-review"), { recursive: true });
       await writeFile(
-        join(cwd, ".adversarial-review", "config.json"),
+        join(userHome, ".adversarial-review", "config.json"),
         JSON.stringify({ policy: { mode: "soft", onInternalError: "allow" } })
       );
       // A present unreviewed code file (already on disk before the NOW baseline).
@@ -227,7 +398,14 @@ describe("hook command", () => {
       const { io, out } = makeIo(
         cwd,
         stdinFrom({ session_id: "softNoBaseline", cwd, transcript_path: tp }),
-        { ADVERSARIAL_REVIEW_STATE_DIR: stateDir }
+        {
+          ADVERSARIAL_REVIEW_STATE_DIR: stateDir,
+          // Pin the user-level base to our explicit home (overrides isoEnv's
+          // fresh-empty home) so the soft user config above is read.
+          ADVERSARIAL_REVIEW_HOME: userHome,
+          HOME: userHome,
+          USERPROFILE: userHome,
+        }
       );
       await hookCommand(["--event", "stop", "--host", "claude-code"], io);
       const json = parseHookJson(out);
@@ -239,6 +417,7 @@ describe("hook command", () => {
     } finally {
       await rm(cwd, { recursive: true, force: true });
       await rm(stateDir, { recursive: true, force: true });
+      await rm(userHome, { recursive: true, force: true });
     }
   });
 
@@ -404,6 +583,299 @@ describe("hook command (cross-workspace baseline isolation)", () => {
     } finally {
       await rm(repoA, { recursive: true, force: true });
       await rm(repoB, { recursive: true, force: true });
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Windows case-normalization of the workspace state key. On win32 the FS is
+// case-insensitive but realpathSync preserves the caller's casing, so the SAME
+// workspace under two casings used to produce two DIFFERENT state keys — a
+// SessionStart baseline recorded under one casing was invisible to a Stop event
+// under another. canonicalWorkspaceRoot now lowercases on win32 so casing can
+// never split the key (POSIX paths, being case-sensitive, are left untouched).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ROUND-2 Finding 5: sessionStateKey must be INJECTIVE. The bare-space join was
+// non-injective — a session_id containing a space (attacker-controlled, from the
+// Stop-hook payload) could merge with a workspace root that also contains a space
+// (common on Windows: "C:\Users\John Doe\...") so two distinct (sessionId, root)
+// pairs produced the same key, sharing baseline/block-counter/cache across
+// unrelated sessions+workspaces. The length-prefixed encoding cannot collide.
+// ---------------------------------------------------------------------------
+describe("sessionStateKey injectivity (finding 5)", () => {
+  it("distinct (sessionId, cwd) pairs never collide even with embedded spaces", () => {
+    // The classic non-injective collision: "a /home" + "/x" vs "a" + "/home /x".
+    // After canonicalization the roots differ, but we also assert the encoding
+    // itself is injective by feeding crafted components whose bare-space join
+    // WOULD collide ("S a" | "b" vs "S" | "a b").
+    assert.notEqual(
+      sessionStateKey("S a", "b"),
+      sessionStateKey("S", "a b"),
+      "a space in the session id must not merge into the workspace component",
+    );
+    assert.notEqual(
+      sessionStateKey("a /home/user", "/project"),
+      sessionStateKey("a", "/home/user /project"),
+    );
+  });
+
+  it("an embedded-space workspace root cannot be absorbed by a crafted session id", () => {
+    // Use a REAL workspace root that contains a space, then split it and craft a
+    // session id that, under the OLD bare-space join, would reconstruct the same
+    // key for a different (sessionId, root) pair.
+    const cwd = mkdtempSync(join(tmpdir(), "ar sessionkey col-")); // space in name
+    try {
+      const root = canonicalWorkspaceRoot(cwd);
+      const sp = root.indexOf(" ");
+      // The temp dir name contains a space, so the canonical root does too.
+      assert.ok(sp >= 0, "test fixture must produce a space-containing root");
+      const head = root.slice(0, sp);
+      const tail = root.slice(sp + 1);
+      // Pair 1: sessionId "S", root = full path. Pair 2: sessionId "S <head>",
+      // root = tail. Under a bare-space join both = "S <head> <tail>".
+      assert.notEqual(
+        sessionStateKey("S", cwd),
+        sessionStateKey(`S ${head}`, tail),
+        "length-prefixed key must distinguish the two pairs the old join merged",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the same key stable for identical inputs (no regression)", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "ar-sk-stable-"));
+    try {
+      assert.equal(sessionStateKey("s1", cwd), sessionStateKey("s1", cwd));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND-2 Finding 6: the transcript read must be TIME-BOUNDED so a FIFO / device
+// file / hung FS at transcript_path cannot block the Stop hook until Claude
+// Code's 300s SIGKILL (a killed hook emits no block = fail-OPEN). On timeout we
+// resolve to "" (tolerant) and proceed; with edit evidence the empty transcript
+// routes into the missing-baseline fail-CLOSED path.
+// ---------------------------------------------------------------------------
+describe("transcript read timeout (finding 6)", () => {
+  // Wall-clock regression: a real never-delivering FIFO must NOT hang the read.
+  // The bounded read returns "" within a small multiple of the injected timeout
+  // instead of blocking forever. POSIX-only (mkfifo); skipped on win32.
+  it("a blocking FIFO transcript path resolves to '' within the timeout (wall-clock)", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("FIFO/mkfifo regression is POSIX-specific");
+      return;
+    }
+    const { execFile } = await import("node:child_process");
+    const dir = await tmpDir("ar-fifo-");
+    const fifo = join(dir, "transcript.fifo");
+    try {
+      // Create a named pipe that no writer ever opens for writing -> a read on it
+      // blocks indefinitely without the timeout.
+      const made = await new Promise((resolve) => {
+        execFile("mkfifo", [fifo], (err) => resolve(!err));
+      });
+      if (!made) {
+        t.skip("mkfifo unavailable; skipping FIFO regression");
+        return;
+      }
+      const start = Date.now();
+      const text = await readTranscriptFile(fifo, 300);
+      const elapsed = Date.now() - start;
+      assert.equal(text, "", "a blocking FIFO read must resolve to '' on timeout");
+      assert.ok(
+        elapsed < 4000,
+        `transcript read must not hang on a FIFO; took ${elapsed}ms`,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A normal, readable transcript on disk is returned in full (fast path intact).
+  it("reads a normal transcript file fully (fast path unaffected)", async () => {
+    const dir = await tmpDir("ar-tx-ok-");
+    try {
+      const tp = join(dir, "t.jsonl");
+      const body = '{"a":1}\n{"b":2}\n';
+      await writeFile(tp, body);
+      const text = await readTranscriptFile(tp, 2000);
+      assert.equal(text, body);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // R3: an oversized transcript is CAPPED (peak memory bounded) instead of being
+  // loaded in full — a huge transcript_path can no longer OOM-kill the hook
+  // (a fail-OPEN). The read stops at maxBytes; the filesystem diff remains the
+  // authoritative edit evidence so a truncated transcript only fails toward review.
+  it("R3: caps an oversized transcript read at maxBytes", async () => {
+    const dir = await tmpDir("ar-tx-big-");
+    try {
+      const tp = join(dir, "big.jsonl");
+      await writeFile(tp, "x".repeat(64 * 1024)); // 64 KiB
+      const text = await readTranscriptFile(tp, 2000, 4 * 1024); // 4 KiB cap
+      assert.ok(text.length >= 4 * 1024, "reads up to the cap");
+      assert.ok(text.length < 64 * 1024, "does NOT read the full oversized file");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Definitive wall-clock: a child whose transcript_path is a never-delivering
+  // FIFO must EXIT NATURALLY (no leaked fs handle) shortly after the timeout,
+  // rather than hanging until SIGKILL (the host-timeout fail-OPEN). POSIX-only.
+  it("a Stop hook with a FIFO transcript exits naturally after the timeout (wall-clock)", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("FIFO/mkfifo regression is POSIX-specific");
+      return;
+    }
+    const { execFile, spawn } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const hookUrl = new URL("../../src/cli/hook.js", import.meta.url).href;
+
+    const childDir = await tmpDir("ar-fifo-child-");
+    const fifo = join(childDir, "transcript.fifo");
+    const childScript = join(childDir, "child.mjs");
+    try {
+      const made = await new Promise((resolve) => {
+        execFile("mkfifo", [fifo], (err) => resolve(!err));
+      });
+      if (!made) {
+        t.skip("mkfifo unavailable; skipping FIFO child regression");
+        return;
+      }
+      await writeFile(
+        childScript,
+        [
+          `import { hookCommand } from ${JSON.stringify(hookUrl)};`,
+          `import { mkdtempSync } from "node:fs";`,
+          `import { tmpdir } from "node:os";`,
+          `import { join } from "node:path";`,
+          `const cwd = mkdtempSync(join(tmpdir(), "ar-fifo-c-"));`,
+          `const stateDir = mkdtempSync(join(tmpdir(), "ar-fifo-c-state-"));`,
+          `const home = mkdtempSync(join(tmpdir(), "ar-fifo-c-home-"));`,
+          `const payload = JSON.stringify({ session_id: "fifoSess", cwd, transcript_path: ${JSON.stringify(
+            fifo,
+          )}, hook_event_name: "Stop" });`,
+          `const io = {`,
+          `  stdin: payload,`,
+          `  stdout: { write: () => {} },`,
+          `  stderr: { write: () => {} },`,
+          `  env: { ...process.env, ADVERSARIAL_REVIEW_HOME: home, HOME: home, USERPROFILE: home, ADVERSARIAL_REVIEW_STATE_DIR: stateDir },`,
+          `  cwd,`,
+          `  transcriptTimeoutMs: 300,`,
+          `};`,
+          `await hookCommand(["--event", "stop", "--host", "claude-code"], io);`,
+        ].join("\n"),
+      );
+
+      const child = spawn(process.execPath, [childScript], { stdio: ["ignore", "ignore", "ignore"] });
+      const exited = await new Promise((resolve) => {
+        let done = false;
+        child.on("exit", (code) => {
+          if (!done) {
+            done = true;
+            resolve({ code, killed: false });
+          }
+        });
+        const kill = setTimeout(() => {
+          if (!done) {
+            done = true;
+            child.kill("SIGKILL");
+            resolve({ code: null, killed: true });
+          }
+        }, 5000);
+        if (typeof kill.unref === "function") kill.unref();
+      });
+      assert.equal(
+        exited.killed,
+        false,
+        "Stop hook hung on a FIFO transcript (fs handle leaked -> fail-open)",
+      );
+      assert.equal(exited.code, 0, "hook child must exit cleanly after the transcript timeout");
+    } finally {
+      await rm(childDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("canonicalWorkspaceRoot case-normalization", () => {
+  it("yields the SAME state key for the same workspace under different casing", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "ar-CaseKey-"));
+    try {
+      const upper = canonicalWorkspaceRoot(cwd.toUpperCase());
+      const lower = canonicalWorkspaceRoot(cwd.toLowerCase());
+      if (process.platform === "win32") {
+        assert.equal(upper, lower, "win32 must case-fold the workspace root");
+        assert.equal(
+          sessionStateKey("s1", cwd.toUpperCase()),
+          sessionStateKey("s1", cwd.toLowerCase()),
+          "win32 state keys must match across casing",
+        );
+        // The folded form is lowercase.
+        assert.equal(upper, upper.toLowerCase());
+      } else {
+        // POSIX is case-sensitive: distinct casings legitimately differ. We only
+        // assert no crash + idempotent same-casing keying here.
+        assert.equal(
+          sessionStateKey("s1", cwd),
+          sessionStateKey("s1", cwd),
+        );
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// On win32, a baseline recorded at SessionStart under one path casing must be
+// FOUND by a Stop event under a different casing (same physical workspace).
+describe("hook command (workspace casing, win32)", () => {
+  it("SessionStart under UPPER casing pairs with Stop under lower casing", async (t) => {
+    if (process.platform !== "win32") {
+      t.skip("case-folding regression is win32-specific");
+      return;
+    }
+    const cwd = await tmpDir("ar-hook-case-");
+    const stateDir = await tmpDir("ar-state-case-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      // Record the baseline under an UPPER-cased cwd.
+      {
+        const { io } = makeIo(cwd.toUpperCase(), stdinFrom({ session_id: "caseSess", cwd: cwd.toUpperCase() }), {
+          ADVERSARIAL_REVIEW_STATE_DIR: stateDir,
+        });
+        await hookCommand(["--event", "session-start", "--host", "claude-code"], io);
+      }
+      // Add an unreviewed code file, then evaluate under a lower-cased cwd.
+      await writeFile(join(cwd, "src", "x.js"), "export function f(){ return 1; }\n");
+      const tp = await writeEditTranscript(cwd, "src/x.js");
+      const { io, out } = makeIo(
+        cwd.toLowerCase(),
+        stdinFrom({ session_id: "caseSess", cwd: cwd.toLowerCase(), transcript_path: tp }),
+        { ADVERSARIAL_REVIEW_STATE_DIR: stateDir }
+      );
+      await hookCommand(["--event", "stop", "--host", "claude-code"], io);
+      const json = parseHookJson(out);
+      assert.ok(json, "expected a review requirement");
+      assert.equal(json.decision, "block");
+      // The recorded baseline WAS found (key matched across casing), so the
+      // missing-baseline disclosure must NOT appear.
+      assert.doesNotMatch(
+        json.reason,
+        /no SessionStart baseline was recorded/i,
+        "the baseline recorded under a different casing must be reused, not rejected",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
       await rm(stateDir, { recursive: true, force: true });
     }
   });

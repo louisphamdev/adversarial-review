@@ -4,7 +4,15 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { evaluateGate, classifyLevel, allow, block, advisory } from "../../src/core/gate.js";
+import {
+  evaluateGate,
+  classifyLevel,
+  allow,
+  block,
+  advisory,
+  canonicalizePath,
+  citationVariants,
+} from "../../src/core/gate.js";
 import { captureBaseline, buildReviewDiff } from "../../src/core/diff.js";
 import { mergeConfig } from "../../src/core/config.js";
 import { readSessionState } from "../../src/core/state.js";
@@ -162,6 +170,81 @@ afterEach(async () => {
 async function tmpStateDir() {
   return track(await mkdtemp(join(tmpdir(), "ar-state-")));
 }
+
+// ---------------------------------------------------------------------------
+// canonicalizePath / citationVariants (COLLISION-1/2/3a unit coverage)
+// ---------------------------------------------------------------------------
+
+describe("canonicalizePath (COLLISION-2)", () => {
+  it("collapses leading './/' to a clean relative path (no stray leading /)", () => {
+    assert.equal(canonicalizePath(".//src/x.js"), "src/x.js");
+  });
+
+  it("collapses a single leading './' to a clean relative path", () => {
+    assert.equal(canonicalizePath("./src/x.js"), "src/x.js");
+  });
+
+  it("collapses repeated './' and internal '//' runs", () => {
+    assert.equal(canonicalizePath("././src//x.js"), "src/x.js");
+  });
+
+  it("normalizes backslashes and trims surrounding whitespace", () => {
+    assert.equal(canonicalizePath("  src\\x.js  "), "src/x.js");
+  });
+
+  it("does NOT strip a leading 'a/' or 'b/' (reviewable-path safety)", () => {
+    // canonicalizePath alone must preserve a real top-level 'a/'/'b/' directory.
+    assert.equal(canonicalizePath("a/x.js"), "a/x.js");
+    assert.equal(canonicalizePath("b/src/x.js"), "b/src/x.js");
+  });
+
+  it("does NOT strip a trailing ':<digits>' suffix (real filename safety)", () => {
+    assert.equal(canonicalizePath("src/weird:12"), "src/weird:12");
+  });
+});
+
+describe("citationVariants (COLLISION-1/3a)", () => {
+  // HARDENING (audit COLLISION-1/2/3): citationVariants no longer emits a GLOBALLY
+  // matchable 'a/'/'b/'-prefix-stripped variant. The git-diff header form is matched
+  // PATH-SPECIFICALLY in coverageFailure instead (covered by the evaluateGate tests
+  // below), so a 'b/src/x.js' citation can only cover 'src/x.js', never a distinct
+  // top-level file.
+  it("does NOT manufacture a 'b/'-prefix-stripped global variant", () => {
+    const v = citationVariants("b/src/x.js");
+    assert.deepEqual(v, ["b/src/x.js"], "no free-floating 'src/x.js' strip");
+  });
+
+  it("does NOT manufacture an 'a/'-prefix-stripped global variant", () => {
+    const v = citationVariants("a/src/x.js");
+    assert.deepEqual(v, ["a/src/x.js"], "no free-floating 'src/x.js' strip");
+  });
+
+  it("keeps the exact ':<line>'-bearing form AND its stripped form, exact first", () => {
+    const v = citationVariants("src/weird:12");
+    assert.equal(v[0], "src/weird:12", "exact form must be preferred (listed first)");
+    assert.ok(v.includes("src/weird"));
+  });
+
+  it("expands 'src/a.js:3' to include the line-stripped 'src/a.js'", () => {
+    const v = citationVariants("src/a.js:3");
+    assert.ok(v.includes("src/a.js:3"));
+    assert.ok(v.includes("src/a.js"));
+  });
+
+  it("does NOT manufacture an 'a/'-stripped form for a plain path", () => {
+    const v = citationVariants("src/x.js");
+    assert.deepEqual(v, ["src/x.js"]);
+  });
+
+  // Finding #4: an 'a/'+':line' citation must NOT yield a malformed prefix-stripped-
+  // but-line-retained variant like 'x.js:12', and must NOT emit a global 'x.js' strip.
+  it("does NOT emit a malformed prefix-stripped ':line' variant for 'a/x.js:12'", () => {
+    const v = citationVariants("a/x.js:12");
+    assert.deepEqual(v, ["a/x.js:12", "a/x.js"]);
+    assert.ok(!v.includes("x.js:12"), "no malformed prefix-stripped+line variant");
+    assert.ok(!v.includes("x.js"), "no free-floating prefix-stripped variant");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // classifyLevel
@@ -441,6 +524,55 @@ describe("evaluateGate basic policy", () => {
     assert.equal(decision.selfReview, true);
     assert.match(decision.reason, /self-review orchestrator/i);
   });
+
+  // Finding #7 (LOW, defense-in-depth): in SOFT mode a self-review pass must still
+  // be bound to what was examined. A verdict with empty coverage and a mismatched
+  // payload_hash is rejected (deferred checks now run in EVERY mode), so a loosened/
+  // non-canonical mode cannot exploit a binding-free soft self-review.
+  it("soft self-review with empty coverage + mismatched payload_hash is rejected", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const config = mergeConfig({ policy: { mode: "soft", allowSkip: false } });
+    const job = await selfReviewJobFor(cwd, baseline, "src/x.js", ["src/x.js"], { config });
+    // Forge: empty coverage + deliberately wrong payload_hash, still a "pass".
+    const forged = makeVerdict(job, {
+      verdict: "pass",
+      coverage: { files_examined: [] },
+      payloadHash: "deadbeef-wrong-hash",
+    });
+    const transcript = selfReviewTranscript("src/x.js", wrapVerdict(forged));
+    const decision = await evaluateGate({
+      config,
+      cwd,
+      baseline,
+      transcript,
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "soft mode must not accept binding-free self-review");
+    assert.equal(decision.selfReview, true);
+  });
+
+  // Finding #7: a WELL-FORMED soft self-review (correct payload_hash + coverage of
+  // every reviewable file) is still accepted as a pass.
+  it("soft self-review with valid payload_hash + full coverage is accepted", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const config = mergeConfig({ policy: { mode: "soft", allowSkip: false } });
+    const job = await selfReviewJobFor(cwd, baseline, "src/x.js", ["src/x.js"], { config });
+    const verdict = makeVerdict(job, { verdict: "pass" });
+    const transcript = selfReviewTranscript("src/x.js", wrapVerdict(verdict));
+    const decision = await evaluateGate({
+      config,
+      cwd,
+      baseline,
+      transcript,
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "already_reviewed");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -502,7 +634,35 @@ describe("evaluateGate external reviewer", () => {
       stateDir: await tmpStateDir(),
     });
     assert.equal(decision.action, "block");
-    assert.equal(decision.reviewerError, "payload_hash_mismatch");
+    // HARDENING (finding: payload_hash is not validated): validateVerdict now binds
+    // payload_hash for any job carrying a payloadHash, so the gate's re-validation
+    // rejects the mismatch EARLIER (as invalid_verdict:payload_hash_mismatch) than
+    // the enforced-only deferred check. Either way it blocks; the binding now also
+    // covers the SOFT external path (regression below).
+    assert.match(decision.reviewerError, /payload_hash_mismatch/);
+  });
+
+  // Finding (payload_hash is not validated): the binding must hold on the SOFT
+  // external path too, not only enforced. Previously the deferred check ran only in
+  // enforced mode, so a forged payload_hash passed as external_pass in soft mode.
+  it("SOFT external pass with mismatched payload_hash is now rejected (blocks)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { payloadHash: "deadbeef-wrong" }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft", allowSkip: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.notEqual(decision.action, "allow", "forged payload_hash must not pass in soft mode");
+    assert.match(decision.reviewerError, /payload_hash_mismatch/);
   });
 
   it("pass with empty coverage is operational failure (blocks enforced)", async () => {
@@ -716,6 +876,282 @@ describe("evaluateGate external reviewer", () => {
     assert.equal(decision.reason, "external_pass");
   });
 
+  // COLLISION-1 (HIGH): the reviewable changed paths come from the filesystem and
+  // may legitimately start with a real top-level dir named 'a' or 'b'. Stripping
+  // 'a/'/'b/' from reviewable paths would collapse 'a/x.js' onto 'x.js', letting a
+  // citation of ONE file "cover" a DIFFERENT unexamined file. The reviewable paths
+  // must NOT be prefix-stripped.
+
+  // (a) Two changed files 'a/x.js' and 'x.js'; coverage cites ONLY 'x.js'. This
+  // must NOT cover 'a/x.js' (no collapse) → blocks with missing_coverage:a/x.js.
+  it("COLLISION-1: citing only 'x.js' does NOT cover real top-level 'a/x.js' (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "a/x.js": "const a = 1;\n", "x.js": "const b = 2;\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["x.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "a/ prefix must not be stripped from reviewable paths");
+    assert.match(decision.reviewerError, /missing_coverage:a\/x\.js/);
+  });
+
+  // (b) A reviewable 'src/x.js' cited with a git-diff 'b/' prefix IS covered: the
+  // citation accepts both the as-is and the prefix-stripped form.
+  it("COLLISION-1: reviewable 'src/x.js' cited as 'b/src/x.js' is covered (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["b/src/x.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow", "b/ prefix citation must cover the reviewable path");
+    assert.equal(decision.reason, "external_pass");
+  });
+
+  // (c) A real reviewable 'a/x.js' cited exactly as 'a/x.js' IS covered (the
+  // as-is citation form matches the un-stripped reviewable path).
+  it("COLLISION-1: real reviewable 'a/x.js' cited as 'a/x.js' is covered (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "a/x.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["a/x.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("a/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "external_pass");
+  });
+
+  // COLLISION-3(a): a citation carrying a ':<line>' suffix must cover the matching
+  // reviewable file (the suffix-stripped citation form matches 'src/a.js').
+  it("COLLISION-3a: citation 'src/a.js:3' covers reviewable 'src/a.js' (enforced)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/a.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["src/a.js:3"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/a.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow", ":line suffix citation must cover src/a.js");
+    assert.equal(decision.reason, "external_pass");
+  });
+
+  // ---- HARDENING REGRESSIONS (audit findings #1-4, #8, #9) ----
+
+  // Finding #1-4 (CRITICAL): citing a real reviewable 'a/foo.js' must NOT cover a
+  // DISTINCT top-level 'foo.js' via the git 'a/'+p header rule. The header rule is
+  // suppressed when the prefixed form is itself a reviewable changed path.
+  it("CITATION-COLLISION: citing real 'a/foo.js' does NOT cover distinct top-level 'foo.js'", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "a/foo.js": "const benign = 1;\n", "foo.js": "const evil = 2;\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["a/foo.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("a/foo.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "a/foo.js citation must not cover top-level foo.js");
+    assert.match(decision.reviewerError, /missing_coverage:foo\.js/);
+  });
+
+  // Finding #1-4: when BOTH 'a/foo.js' and 'foo.js' are cited in full, coverage passes.
+  it("CITATION-COLLISION: citing BOTH 'a/foo.js' and 'foo.js' is fully covered", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "a/foo.js": "const benign = 1;\n", "foo.js": "const ok = 2;\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["a/foo.js", "foo.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("a/foo.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "external_pass");
+  });
+
+  // Finding #8 (advisory): above COVERAGE_FILE_CAP, a single JUNK citation that maps
+  // to no real reviewable changed path must NOT count as coverage.
+  it("COVERAGE-CAP: >cap reviewable files + ONLY a junk citation blocks (no real path)", async () => {
+    const files = {};
+    for (let i = 0; i < 41; i++) files[`src/f${i}.js`] = `const a = ${i};\n`;
+    const { cwd, baseline } = await makeWorkspace({}, files);
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["totally-unrelated-junk.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/f0.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "junk-only coverage over the cap must block");
+    assert.match(decision.reviewerError, /coverage_no_real_path/);
+  });
+
+  // HARDENING (finding: large diffs can pass with 40+ unexamined reviewable files):
+  // above the cap, a SINGLE real citation no longer rubber-stamps the whole diff. A
+  // pass must cite a minimum number of DISTINCT real reviewable paths
+  // (max(2, ceil(0.05*total))). For 41 files the threshold is 3, so one real
+  // citation now BLOCKS as coverage_below_min_ratio.
+  it("COVERAGE-CAP: >cap reviewable files + only ONE real citation now BLOCKS (min ratio)", async () => {
+    const files = {};
+    for (let i = 0; i < 41; i++) files[`src/f${i}.js`] = `const a = ${i};\n`;
+    const { cwd, baseline } = await makeWorkspace({}, files);
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, { coverage: { files_examined: ["src/f7.js"] } }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/f0.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "one real citation must not cover 40+ files");
+    assert.match(decision.reviewerError, /coverage_below_min_ratio/);
+  });
+
+  // Finding (min ratio): above the cap, coverage meeting the minimum ratio of
+  // DISTINCT real reviewable paths is still accepted (the cap's usability relaxation
+  // is preserved for genuine partial coverage — here 3 real of 41 meets the floor).
+  it("COVERAGE-CAP: >cap reviewable files + enough REAL citations still allows", async () => {
+    const files = {};
+    for (let i = 0; i < 41; i++) files[`src/f${i}.js`] = `const a = ${i};\n`;
+    const { cwd, baseline } = await makeWorkspace({}, files);
+    track(cwd);
+    const runner = capturingRunner((job) => ({
+      ok: true,
+      verdict: makeVerdict(job, {
+        coverage: { files_examined: ["src/f7.js", "src/f8.js", "src/f9.js"] },
+      }),
+    }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/f0.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "external_pass");
+    assert.equal(decision.coverageLimited, true);
+  });
+
+  // Finding #9 (advisory): the gate re-validates the runner's verdict. A "pass"
+  // verdict that carries a Critical finding is forced to FAIL and blocks.
+  it("VERDICT-REVALIDATE: a 'pass' verdict carrying a Critical finding is blocked", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    // A "pass" verdict that nonetheless reports a Critical finding. validateVerdict
+    // (re-run by the gate) forces "fail" on any Critical/Important finding.
+    const runner = capturingRunner((job) => {
+      const v = makeVerdict(job, { verdict: "pass" });
+      v.findings = [{ severity: "Critical", title: "backdoor" }];
+      return { ok: true, verdict: v };
+    });
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "Critical finding must force a fail/block");
+    assert.ok(Array.isArray(decision.findings), "block surfaces the findings");
+  });
+
+  // Finding #9: a verdict value that is neither "pass" nor "fail" is invalid and is
+  // routed through the reviewer-error path (blocks in enforced), never a silent pass.
+  it("VERDICT-REVALIDATE: a non-'pass'/'fail' verdict value blocks (invalid_verdict)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const runner = capturingRunner((job) => {
+      const v = makeVerdict(job, { verdict: "pass" });
+      v.verdict = "needs-changes";
+      return { ok: true, verdict: v };
+    });
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block");
+    assert.match(decision.reviewerError, /invalid_verdict/);
+  });
+
   it("valid pass with full coverage allows and caches (second call hits cache)", async () => {
     const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
     track(cwd);
@@ -927,6 +1363,50 @@ describe("evaluateGate privacy gate", () => {
     assert.equal(decision.reason, "external_pass");
     assert.equal(runner.calls.length, 1); // normal path still dispatches
   });
+
+  // Finding #5 (HIGH): the path-based secret scan must cover EVERY changed path, not
+  // just the classifier-reviewable subset. A sensitive path the classifier drops
+  // (e.g. a *.md whose NAME matches a secret pattern) must still be caught before any
+  // external dispatch. Here a reviewable code file app.js drives the review while a
+  // dropped 'docs/private_key.md' would previously escape the scan.
+  it("SECRET-ALLPATHS: a sensitive path the classifier drops is still scanned (not sent externally)", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "app.js": "const a = 1;\n", "docs/private_key.md": "placeholder\n" }
+    );
+    track(cwd);
+    const runner = capturingRunner((job) => ({ ok: true, verdict: makeVerdict(job) }));
+    const decision = await evaluateGate({
+      config: mergeConfig({ thresholds: { debateOnSensitive: false } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("app.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "dropped sensitive path must route to self-review");
+    assert.equal(decision.privacyReason, "secret_detected_block_external");
+    assert.equal(runner.calls.length, 0, "secret-bearing change never sent externally");
+  });
+
+  // Finding #5: a docs-ONLY change whose path is sensitive (so allDocsOnly is true)
+  // must NOT slip through the docs-only early-allow without a secret path scan.
+  it("SECRET-ALLPATHS: a docs-only change with a sensitive path blocks (not docs_only allow)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "docs/private_key.md": "placeholder\n" });
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("docs/private_key.md"),
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "sensitive path in docs-only change must block");
+    assert.notEqual(decision.reason, "docs_only");
+    assert.equal(decision.secretBlocked, true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -988,7 +1468,7 @@ describe("evaluateGate block cap", () => {
 // ---------------------------------------------------------------------------
 
 describe("evaluateGate guards", () => {
-  it("allows subagent transcripts", async () => {
+  it("allows subagent transcripts on the authoritative SubagentStop event", async () => {
     const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
     track(cwd);
     const decision = await evaluateGate({
@@ -997,10 +1477,95 @@ describe("evaluateGate guards", () => {
       baseline,
       transcript: editTranscript("src/x.js"),
       sessionId: "g-subagent",
+      // The gate skips ONLY on the host-set SubagentStop event, not on the
+      // untrusted session-id/path heuristics alone (#38).
+      hookEventName: "SubagentStop",
       stateDir: await tmpStateDir(),
     });
     assert.equal(decision.action, "allow");
     assert.equal(decision.reason, "subagent_transcript");
+  });
+
+  it("REVIEWS a subagent-looking transcript on a plain Stop (untrusted fields can't skip the gate)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      sessionId: "g-subagent", // attacker-influencable "subagent" hint
+      hookEventName: "Stop",
+      stateDir: await tmpStateDir(),
+    });
+    assert.notEqual(decision.reason, "subagent_transcript", "must not silently skip on untrusted hints");
+  });
+
+  // #22: a reviewable file whose diff text is truncated at the per-file size cap
+  // hides the post-cap payload from the reviewer. The gate must NOT accept it.
+  it("BLOCKS in enforced when a reviewable file's diff is truncated at the size cap", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, {});
+    track(cwd);
+    // Shrink the per-file diff cap so a modest reviewable file is truncated.
+    baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
+    await mkdir(join(cwd, "src"), { recursive: true });
+    // A NEW reviewable file larger than the cap; the post-cap bytes are hidden.
+    await writeFile(join(cwd, "src/big.js"), "// " + "a".repeat(400) + "\nconst evil = require('child_process');\n");
+    let reviewerCalled = false;
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/big.js"),
+      stateDir: await tmpStateDir(),
+      reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
+    });
+    assert.equal(decision.action, "block", "truncated reviewable content must block in enforced");
+    assert.equal(decision.truncated, true);
+    assert.ok(decision.truncatedPaths.includes("src/big.js"));
+    assert.equal(reviewerCalled, false, "must block before even running the reviewer");
+  });
+
+  it("downgrades to advisory in soft mode when a reviewable file's diff is truncated", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, {});
+    track(cwd);
+    baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src/big.js"), "// " + "a".repeat(400) + "\nconst x = 1;\n");
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft" } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/big.js"),
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.truncated, true);
+    assert.notEqual(decision.action, "block", "soft mode advises, does not hard-block");
+  });
+
+  // R3: a reviewable file whose PATH contains " b/" (a directory with a space)
+  // must still have its truncation detected — a non-greedy `a/(.+?) b/` header
+  // parse would mis-split the path and MISS the truncation (fail-open). The
+  // backreference parse handles it.
+  it("R3: detects truncation for a reviewable path containing ' b/' (header ambiguity)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, {});
+    track(cwd);
+    baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
+    const rel = "src/foo b/bar.js"; // dir name "foo b" -> header has a literal " b/"
+    await mkdir(join(cwd, "src", "foo b"), { recursive: true });
+    await writeFile(join(cwd, rel), "// " + "a".repeat(400) + "\nconst evil = 1;\n");
+    let reviewerCalled = false;
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript(rel),
+      stateDir: await tmpStateDir(),
+      reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
+    });
+    assert.equal(decision.action, "block", "truncation of a ' b/' path must still block");
+    assert.ok((decision.truncatedPaths || []).includes(rel), `expected ${rel} in truncatedPaths`);
+    assert.equal(reviewerCalled, false);
   });
 
   it("allows when stop_hook_active recursion guard is set", async () => {

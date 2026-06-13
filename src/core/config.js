@@ -96,6 +96,62 @@ const MODE_RANK = new Map([
   ["strict-ci", 2],
 ]);
 
+// The only recognized policy modes.
+const KNOWN_MODES = new Set(["soft", "enforced", "strict-ci"]);
+
+/**
+ * Canonicalize a policy mode value to a known mode string.
+ *
+ * Trims + lowercases a string and maps it to the matching known mode. ANY
+ * unrecognized value — a non-string, a typo, a case variant ("Enforced"), a
+ * padded value (" enforced "), or outright garbage — maps to the secure default
+ * "enforced". This is a FAIL-CLOSED guarantee: a non-canonical mode can never
+ * silently slip past the gate's `mode === "enforced"` / `=== "strict-ci"` checks
+ * and thereby disable enforced-only protections (reviewer isolation, deferred
+ * coverage checks, fail-closed error handling).
+ *
+ * @param {*} mode
+ * @returns {"soft"|"enforced"|"strict-ci"}
+ */
+function canonicalizeMode(mode) {
+  if (typeof mode === "string") {
+    const m = mode.trim().toLowerCase();
+    if (KNOWN_MODES.has(m)) return m;
+  }
+  return "enforced";
+}
+
+// Ranked privacy domains — higher rank means stricter (more protective).
+// The floor ratchets each to max(floor, current) so a user floor can only
+// tighten and a project can never loosen below it.
+const SECRET_SCAN_RANK = new Map([
+  ["warn", 0],
+  ["block-external", 1],
+  ["block-all", 2],
+]);
+const EXTERNAL_REVIEW_RANK = new Map([
+  ["allow", 0],
+  ["prompt", 1],
+  ["deny", 2],
+]);
+
+/**
+ * Ratchet a ranked config value up to the floor when the floor is stricter.
+ * No-op when the floor value is unknown/absent or the current value already
+ * ranks at least as strict. A stricter project value is never loosened.
+ *
+ * @param {Map<string, number>} rank   - value -> strictness rank
+ * @param {string|undefined} floorVal  - floor value (may be undefined)
+ * @param {string|undefined} currentVal - current effective value
+ * @returns {string|undefined} the value to use (floor when stricter, else current)
+ */
+function ratchetRanked(rank, floorVal, currentVal) {
+  if (floorVal == null || !rank.has(floorVal)) return currentVal;
+  const floorRank = rank.get(floorVal);
+  const currentRank = rank.has(currentVal) ? rank.get(currentVal) : -1;
+  return currentRank < floorRank ? floorVal : currentVal;
+}
+
 /**
  * Apply a user-level policy floor to a fully-merged config object so that
  * a project config can never loosen what the user has set as a minimum.
@@ -105,20 +161,47 @@ const MODE_RANK = new Map([
  *  - allowSkip / allowAdvisoryHosts: floor=false forces false
  *  - onReviewerError / onInternalError / onBlockCap: floor="block" forces "block"
  *  - reviewScope: floor="all-code" forces "all-code"
- *  - privacy.externalReview: floor="deny" forces "deny"
- *  - privacy.secretScan: floor="block-all" forces "block-all"
+ *  - privacy.externalReview: ratchets over deny(2) > prompt(1) > allow(0), so a
+ *    "prompt" floor cannot be loosened to "allow"
+ *  - privacy.secretScan: ratchets over block-all(2) > block-external(1) > warn(0),
+ *    so a "block-external" floor cannot be loosened to "warn"
  *
  * @param {object} config  - already deep-cloned merged config (mutated in place)
  * @param {object} floor   - user policy floor (may have .policy sub-object or be flat)
  * @returns {object} config
  */
 export function applyPolicyFloor(config, floor = {}) {
+  // DEFENSIVE (fail-closed): an untrusted layer can replace a structured
+  // sub-object with a scalar / null / array — e.g. a committed project config
+  // `{"privacy":"pwned"}` or `{"policy":null}`. Reading `.mode` / `.externalReview`
+  // off such a value throws a TypeError, and because config loading sits on the
+  // gate's critical path (and is NOT wrapped by the fail-closed catch), an
+  // uncaught throw would FAIL OPEN — the agent stops with un-reviewed changes.
+  // Coerce every known structured sub-object back to a DEFAULT clone when it is
+  // not a plain object, so the floor logic below always sees a valid shape. The
+  // caller's trusted-baseline floor then re-applies the user's intended values
+  // on top, so a project's scalar/null injection is neutralized, not honored.
+  for (const key of ["policy", "privacy", "runtime", "thresholds", "sensitivity"]) {
+    const v = config[key];
+    if (!v || typeof v !== "object" || Array.isArray(v)) {
+      config[key] = structuredClone(DEFAULT_CONFIG[key]);
+    }
+  }
+  // Canonicalize the effective mode so a non-canonical project value (case
+  // variant, padded, typo, non-string) can never silently bypass the gate's
+  // `mode === "enforced"` / `=== "strict-ci"` checks (fail closed to enforced).
+  config.policy.mode = canonicalizeMode(config.policy.mode);
+
   const floorPolicy = floor.policy || floor;
 
-  if (floorPolicy.mode && MODE_RANK.has(floorPolicy.mode)) {
-    const currentRank = MODE_RANK.get(config.policy.mode) ?? 1;
-    const floorRank = MODE_RANK.get(floorPolicy.mode);
-    if (currentRank < floorRank) config.policy.mode = floorPolicy.mode;
+  // A PRESENT floor mode is canonicalized too (a trusted user floor of
+  // "Enforced" still ratchets); an ABSENT floor mode is left untouched so it
+  // never spuriously forces enforced when the user set no floor.
+  if (floorPolicy.mode != null) {
+    const floorMode = canonicalizeMode(floorPolicy.mode);
+    const currentRank = MODE_RANK.get(config.policy.mode);
+    const floorRank = MODE_RANK.get(floorMode);
+    if (currentRank < floorRank) config.policy.mode = floorMode;
   }
 
   for (const key of ["allowSkip", "allowAdvisoryHosts"]) {
@@ -133,12 +216,19 @@ export function applyPolicyFloor(config, floor = {}) {
     config.policy.reviewScope = "all-code";
   }
 
-  if (floor.privacy?.externalReview === "deny") {
-    config.privacy.externalReview = "deny";
-  }
-  if (floor.privacy?.secretScan === "block-all") {
-    config.privacy.secretScan = "block-all";
-  }
+  // Privacy floors ratchet MONOTONICALLY over their ranked domains so a floor
+  // at an intermediate level (e.g. block-external / prompt) is still enforced and
+  // a project can never loosen below it.
+  config.privacy.externalReview = ratchetRanked(
+    EXTERNAL_REVIEW_RANK,
+    floor.privacy?.externalReview,
+    config.privacy.externalReview
+  );
+  config.privacy.secretScan = ratchetRanked(
+    SECRET_SCAN_RANK,
+    floor.privacy?.secretScan,
+    config.privacy.secretScan
+  );
 
   return config;
 }

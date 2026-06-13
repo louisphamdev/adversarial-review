@@ -82,6 +82,28 @@ not allowed — report on every dimension you own.
 - **Accessibility** *(only when the diff touches UI/frontend)*: missing alt text,
   incorrect ARIA, non-semantic interactive elements, missing keyboard handlers.
 
+## Adversarial Invariant Lenses — apply ALL
+
+The deepest bugs survive a dimension-by-dimension pass and fall only to an
+**invariant** review. For EACH lens, try to construct a violating input — don't
+just confirm the happy path:
+
+1. **Trust boundary** — where does each value come from (trusted user/policy
+   config, untrusted repo/project config, env, the diff itself, tool output)? Can
+   an untrusted source self-grant a capability or loosen a tighten-only floor
+   (`trusted`/`readOnly`/`allow*`/`bypass`)?
+2. **Async lifecycle** — every timer / child process / stream / listener cleaned up
+   on the SUCCESS path too? `Promise.race([work, timeout])` leaving a pending
+   timer (hang)? Undrained stdout/stderr deadlock? Unbounded stdin read hang?
+3. **Ambiguity / collision** — for any heuristic / canonicalization / fuzzy match /
+   prefix-strip / name match: build a collision (two distinct inputs → same key),
+   a case/prefix/suffix edge, a traversal-looking input.
+4. **Platform reality** — env-var case (`PATH` vs `Path`), `.cmd`/shell wrapping,
+   `/` vs `\`, permissions, CRLF vs LF — Windows vs POSIX.
+
+An invariant violation with a concrete failing input is **Critical** or
+**Important**.
+
 ## No False Alarms
 
 For each finding, cite `file:line`, quote the offending code, and explain the

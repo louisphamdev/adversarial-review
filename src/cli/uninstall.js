@@ -53,13 +53,15 @@ async function readJsonTolerant(filePath) {
   }
 }
 
-/** Normalize a registry key (matches install.js): absolute + lowercased win32 drive. */
+/**
+ * Normalize a registry key. MUST stay byte-for-byte identical to the copy in
+ * src/cli/install.js so install and uninstall agree on the key. On win32 the
+ * ENTIRE path is lowercased (case-insensitive filesystem); on POSIX casing is
+ * preserved (case-sensitive filesystem).
+ */
 function normalizeRegistryKey(dir) {
-  let resolved = path.resolve(dir);
-  if (process.platform === "win32" && /^[a-zA-Z]:/.test(resolved)) {
-    resolved = resolved[0].toLowerCase() + resolved.slice(1);
-  }
-  return resolved;
+  const resolved = path.resolve(dir);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 /** Atomically write content (mode 0o644 — settings/config are team-shared). */
@@ -69,7 +71,15 @@ async function atomicWrite(filePath, content, mode = 0o644) {
   const tmp = `${filePath}.tmp${Date.now()}`;
   await writeFile(tmp, content, { encoding: "utf8", mode });
   const { rename } = await import("node:fs/promises");
-  await rename(tmp, filePath);
+  try {
+    await rename(tmp, filePath);
+  } catch (err) {
+    // Clean up the orphaned temp file if the atomic rename failed (cross-device,
+    // locked target on Windows, concurrent run) so it does not litter the dir,
+    // then re-throw so the caller still observes the failure.
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 /**

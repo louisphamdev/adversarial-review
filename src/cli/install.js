@@ -23,7 +23,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { mergeConfig, applyPolicyFloor, DEFAULT_CONFIG } from "../core/config.js";
+import { mergeConfig, applyPolicyFloor, deepAssign, DEFAULT_CONFIG } from "../core/config.js";
 import { HOSTS } from "../hosts/index.js";
 import {
   plannedClaudeCodeWrites,
@@ -60,6 +60,80 @@ const OPENCODE_REVIEWER_DEFAULTS = Object.freeze({
   agent: "adversarial-reviewer",
   timeoutSec: 180,
 });
+
+// Mode strictness ranks (mirrors the private MODE_RANK in src/core/config.js).
+// Higher rank == stricter. Used ONLY to ratchet the user-level policy.json floor
+// UP — never to loosen an existing stricter floor.
+const MODE_RANK = new Map([
+  ["soft", 0],
+  ["enforced", 1],
+  ["strict-ci", 2],
+]);
+
+/**
+ * Compute the user-level policy.json floor to write so a cloned repo's project
+ * config can never silently downgrade the chosen enforcement (e.g. enforced ->
+ * soft). The floor is a tighten-only RATCHET applied over any existing floor:
+ *
+ *  - policy.mode: take whichever of {existing floor, chosen mode} is STRICTER
+ *    (an unknown existing floor mode is treated as the loosest so the chosen
+ *    canonical mode wins). Never lowers a stricter existing floor.
+ *  - onReviewerError / onInternalError / onBlockCap: pinned to "block" unless the
+ *    existing floor already pins them to "block" (idempotent — stays "block").
+ *  - allowSkip / allowAdvisoryHosts: pinned to false (a floor only tightens).
+ *
+ * Returns `null` when the existing floor is already at least as strict on every
+ * dimension (so install performs no redundant write — idempotent).
+ *
+ * @param {object} existingFloor - parsed existing policy.json (or {})
+ * @param {string} chosenMode    - resolved policy.mode for this install
+ * @returns {object|null} floor object to write, or null when no change is needed
+ */
+function computePolicyFloorToWrite(existingFloor, chosenMode) {
+  const ef =
+    existingFloor && typeof existingFloor === "object" && !Array.isArray(existingFloor)
+      ? existingFloor.policy && typeof existingFloor.policy === "object"
+        ? existingFloor.policy
+        : existingFloor
+      : {};
+
+  const chosenRank = MODE_RANK.has(chosenMode) ? MODE_RANK.get(chosenMode) : 1;
+  const existingRank = MODE_RANK.has(ef.mode) ? MODE_RANK.get(ef.mode) : -1;
+  // Never loosen: keep the stricter of (existing floor mode, chosen mode).
+  const flooredMode = existingRank >= chosenRank && MODE_RANK.has(ef.mode) ? ef.mode : chosenMode;
+
+  const desired = {
+    mode: flooredMode,
+    onReviewerError: "block",
+    onInternalError: "block",
+    onBlockCap: "block",
+    allowSkip: false,
+    allowAdvisoryHosts: false,
+  };
+
+  // Idempotency: if the existing floor already satisfies every dimension at
+  // least as strictly, no write is needed.
+  const alreadyCovered =
+    ef.mode === desired.mode &&
+    ef.onReviewerError === "block" &&
+    ef.onInternalError === "block" &&
+    ef.onBlockCap === "block" &&
+    ef.allowSkip === false &&
+    ef.allowAdvisoryHosts === false;
+  if (alreadyCovered) return null;
+
+  // Preserve any unrelated keys the user authored at the top level / in policy.
+  const base =
+    existingFloor && typeof existingFloor === "object" && !Array.isArray(existingFloor)
+      ? structuredClone(existingFloor)
+      : {};
+  const basePolicy =
+    base.policy && typeof base.policy === "object" && !Array.isArray(base.policy)
+      ? base.policy
+      : {};
+  base.policy = { ...basePolicy, ...desired };
+  return base;
+}
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -155,14 +229,25 @@ async function readSettingsForMerge(filePath) {
 }
 
 /**
- * Back up a corrupt settings.json to settings.json.bak before it is overwritten
- * by the merged (from-scratch) result. Best-effort; never throws.
+ * Back up a corrupt settings.json before it is overwritten by the merged
+ * (from-scratch) result. Best-effort; never throws.
+ *
+ * A prior `${filePath}.bak` (e.g. a GOOD backup from an earlier valid->corrupt
+ * recovery) must NOT be silently clobbered by this new corrupt-source backup —
+ * doing so would permanently destroy the only good copy. When `.bak` already
+ * exists we instead write a UNIQUE timestamped backup name so every recovery
+ * point is preserved.
  *
  * @param {string} filePath
  * @param {object} io  - { stdout }
  */
 async function backupCorruptSettings(filePath, io) {
-  const bakPath = `${filePath}.bak`;
+  const defaultBak = `${filePath}.bak`;
+  // If a prior backup already exists, do not overwrite it — use a unique,
+  // timestamped name so the earlier (possibly GOOD) backup survives.
+  const bakPath = existsSync(defaultBak)
+    ? `${filePath}.bak.${new Date().toISOString().replace(/[:.]/g, "-")}`
+    : defaultBak;
   try {
     await copyFile(filePath, bakPath);
     io.stdout.write(
@@ -179,19 +264,22 @@ async function backupCorruptSettings(filePath, io) {
 /**
  * Normalize a directory path into a STABLE install-registry key so the same
  * project never produces duplicate registry entries. We path.resolve() to an
- * absolute, normalized form and, on win32, lowercase a leading drive letter
- * (`D:\` and `d:\` denote the same path). Other path casing is left intact
- * because POSIX filesystems are case-sensitive.
+ * absolute, normalized form and, on win32, lowercase the ENTIRE path (the
+ * Windows filesystem is case-INSENSITIVE, so `D:\Code\Foo` and `d:\code\foo`
+ * denote the same project and MUST map to one key — lowercasing only the drive
+ * letter wrongly produced two keys for the same dir, defeating dedupe/uninstall).
+ * On POSIX the casing is left intact because the filesystem is case-sensitive.
+ *
+ * NOTE: this implementation is duplicated verbatim in src/cli/uninstall.js; the
+ * two MUST stay byte-for-byte identical so install and uninstall agree on the
+ * key. Keep them in sync.
  *
  * @param {string} dir
  * @returns {string}
  */
 function normalizeRegistryKey(dir) {
-  let resolved = path.resolve(dir);
-  if (process.platform === "win32" && /^[a-zA-Z]:/.test(resolved)) {
-    resolved = resolved[0].toLowerCase() + resolved.slice(1);
-  }
-  return resolved;
+  const resolved = path.resolve(dir);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 /**
@@ -325,8 +413,18 @@ async function atomicWrite(filePath, content, mode = 0o600) {
   const tmp = `${filePath}.tmp${Date.now()}`;
   await writeFile(tmp, content, { encoding: "utf8", mode });
   // node:fs rename is atomic on POSIX; on Windows it will overwrite on Node 14+.
-  const { rename } = await import("node:fs/promises");
-  await rename(tmp, filePath);
+  const { rename, rm } = await import("node:fs/promises");
+  try {
+    await rename(tmp, filePath);
+  } catch (err) {
+    // The temp file was written but the rename failed (cross-device link, target
+    // locked by another process on Windows, concurrent install). Clean up the
+    // orphaned temp file so repeated failed installs do not accumulate
+    // `.tmp<ts>` litter in .adversarial-review/ and .claude/, then re-throw so
+    // the caller still sees the failure.
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,9 +473,17 @@ export async function installCommand(argv, io) {
   // --- Read legacy config and merge ---
   const legacyFragment = await readLegacyConfig(cwd);
 
-  // Build initial project config by layering: DEFAULT_CONFIG <- legacy <- existing.
-  // We do NOT write legacy values if the existing config already has them.
-  const baseProjectConfig = Object.assign({}, legacyFragment, existingProjectConfig);
+  // Build initial project config by DEEP-layering: legacy <- existing (existing
+  // wins on a leaf conflict). A shallow Object.assign replaced whole nested
+  // sections (e.g. an existing `thresholds:{debateDiffLines}` would clobber the
+  // migrated legacy `thresholds:{bigDiffLines,bigFileCount}`), silently dropping
+  // the migrated keys. deepAssign recurses so per-leaf keys from BOTH layers
+  // survive (and it carries the same __proto__/constructor guards). Start from a
+  // fresh object so neither input is mutated.
+  const baseProjectConfig = deepAssign(
+    deepAssign({}, legacyFragment),
+    existingProjectConfig
+  );
 
   // Build the effective config to evaluate advisory/policy constraints.
   const effectiveConfig = mergeConfig(baseProjectConfig, userPolicyFloor);
@@ -563,7 +669,13 @@ export async function installCommand(argv, io) {
     installedAt: new Date().toISOString(),
     scope: userScope ? "user" : "project",
     hosts,
-    reviewers: Object.fromEntries(reviewerMap),
+    // Record reviewer mappings ONLY for hosts that were actually selected and
+    // installed. Persisting the full reviewerMap would also store mappings for
+    // hosts NOT in --hosts (those were already warned-about and ignored), giving
+    // downstream tooling (doctor/audit) a false picture of reviewer coverage.
+    reviewers: Object.fromEntries(
+      hosts.filter((h) => reviewerMap.has(h)).map((h) => [h, reviewerMap.get(h)])
+    ),
   };
   const registryKey = normalizeRegistryKey(userScope ? home : cwd);
   const updatedRegistry = {
@@ -577,6 +689,34 @@ export async function installCommand(argv, io) {
     type: "install-registry",
     mode: 0o600,
   });
+
+  // 2b. User-level policy.json FLOOR (~/.adversarial-review/policy.json).
+  //
+  // Without a floor, applyPolicyFloor's mode ratchet is a no-op, so a cloned
+  // repo's .adversarial-review/config.json can silently downgrade the chosen
+  // enforcement (e.g. enforced -> soft) — a full fail-open. We WRITE a tighten-
+  // only floor capturing the resolved mode plus the fail-closed error actions,
+  // ratcheting over (never clobbering) any existing stricter floor. Idempotent:
+  // when the existing floor already covers every dimension, no write is queued.
+  // User-level + security-sensitive -> mode 0o600.
+  const chosenMode = resolvedConfig.policy?.mode || DEFAULT_CONFIG.policy.mode;
+  const floorToWrite = computePolicyFloorToWrite(userPolicyFloor, chosenMode);
+  if (floorToWrite) {
+    plannedWrites.push({
+      path: userPolicyPath,
+      content: JSON.stringify(floorToWrite, null, 2),
+      note:
+        `User-level policy floor (~/.adversarial-review/policy.json: mode=${floorToWrite.policy.mode}, ` +
+        `fail-closed) — prevents a cloned project's config from downgrading enforcement`,
+      type: "policy-floor",
+      mode: 0o600,
+    });
+  } else {
+    io.stdout.write(
+      `  NOTE: user policy floor at ${userPolicyPath} already enforces ` +
+        `mode>=${chosenMode} (fail-closed); leaving it unchanged.\n`
+    );
+  }
 
   // FIX 3: pick the hook/wrapper command once. Prefer the direct bin name when
   // it resolves on PATH (global install — no per-Stop npx resolution); else use

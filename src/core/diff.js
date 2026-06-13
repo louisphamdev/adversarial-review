@@ -32,7 +32,17 @@ const SKIP_DIRS = new Set([
 export async function captureBaseline(cwd) {
   if (await isGitRepo(cwd)) {
     const head = await git(["rev-parse", "HEAD"], cwd);
-    return { type: "git", head: head.stdout.trim() || null, cwd };
+    const headSha = head.stdout.trim();
+    // A git repo with at least one commit: diff against the committed HEAD tree.
+    // NB: on a zero-commit (unborn) branch, `git rev-parse HEAD` ECHOES the
+    // literal "HEAD" to stdout (with an error on stderr + nonzero exit), so we
+    // must require a real 40-char object id — not just any non-empty stdout —
+    // before trusting the git path.
+    if (/^[0-9a-f]{40}$/i.test(headSha)) return { type: "git", head: headSha, cwd };
+    // A git repo with NO commits (no HEAD) has no committed tree to diff against.
+    // Fall through to the FILESYSTEM snapshot so every working-tree file is still
+    // captured and reviewed — otherwise a zero-commit repo would make ALL files
+    // invisible to the gate (a full bypass).
   }
   const { files, truncated } = await snapshotWorkspace(cwd);
   return {
@@ -206,9 +216,14 @@ function toPosixRel(cwd, absolute) {
 // `changedFiles` are non-empty — never a vacuous empty diff.
 export async function buildReviewDiff(cwd, baseline) {
   if (baseline?.type === "git" && baseline.head) {
-    const committed = await git(["diff", "--binary", baseline.head, "HEAD"], cwd);
-    const working = await git(["diff", "--binary", "HEAD"], cwd);
-    const staged = await git(["diff", "--binary", "--cached"], cwd);
+    // --no-textconv / --no-ext-diff: a committed .gitattributes can bind files to
+    // a `textconv`/external diff driver that REPLACES the real content shown to
+    // the reviewer (hiding a malicious change). Force the raw diff so an untrusted
+    // repo cannot launder its diff through a content filter. (git is already
+    // invoked with -c core.quotePath=false for correct non-ASCII paths.)
+    const committed = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", baseline.head, "HEAD"], cwd);
+    const working = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", "HEAD"], cwd);
+    const staged = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", "--cached"], cwd);
     const chunks = [
       withTruncationMarker(committed),
       withTruncationMarker(working),
@@ -233,10 +248,20 @@ export async function buildReviewDiff(cwd, baseline) {
   return { text: "", diffHash: sha256(""), changedFiles: [] };
 }
 
+// Synthetic path used to surface a truncated-snapshot coverage limitation as a
+// reviewable changed-file entry so the gate cannot treat an incomplete baseline
+// as a clean "no changes" result. It is intentionally extensionless so the
+// gate's classifyPath fails CLOSED and marks it reviewable (an extensionless
+// path is reviewable, while a `.txt` would be docs-only and slip review).
+const TRUNCATION_SENTINEL_PATH = ".adversarial-review-snapshot-truncated";
+
 // Compute a real diff for non-git workspaces by comparing the current snapshot
 // against the baseline snapshot.
 async function buildFilesystemReviewDiff(cwd, baseline) {
-  const { files: current } = await snapshotWorkspace(cwd, baseline.options || {});
+  const { files: current, truncated: currentTruncated } = await snapshotWorkspace(
+    cwd,
+    baseline.options || {}
+  );
   const baselineSnapshot = baseline.snapshot || {};
   const blocks = [];
   const changed = [];
@@ -265,8 +290,41 @@ async function buildFilesystemReviewDiff(cwd, baseline) {
     }
   }
 
+  // FAIL CLOSED on a truncated snapshot. If EITHER the baseline OR the current
+  // snapshot hit the maxFiles cap, the per-file comparison above is unreliable:
+  // a file that fell outside the captured window in either walk is invisible to
+  // this diff, so a real change can vanish into a vacuously empty diff (a silent
+  // bypass). When truncation occurred we ALWAYS emit a coverage-limitation block
+  // plus a synthetic reviewable changed-file entry, so the diff is never empty
+  // and the gate is forced to treat the change set as needing manual review
+  // rather than as "nothing changed".
+  if (baseline.truncated || currentTruncated) {
+    blocks.unshift(truncatedSnapshotBlock(baseline.truncated, currentTruncated));
+    if (!changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
+      changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
+    }
+  }
+
   const text = blocks.filter(Boolean).join("\n");
   return { text, diffHash: sha256(text), changedFiles: changed };
+}
+
+// Coverage-limitation block emitted when a filesystem snapshot was truncated at
+// the maxFiles cap. It is intentionally non-empty so the review diff can never
+// be a vacuous empty string when the baseline/current comparison is incomplete.
+function truncatedSnapshotBlock(baselineTruncated, currentTruncated) {
+  const which = baselineTruncated && currentTruncated
+    ? "baseline and current"
+    : baselineTruncated
+      ? "baseline"
+      : "current";
+  return (
+    `diff --git a/${TRUNCATION_SENTINEL_PATH} b/${TRUNCATION_SENTINEL_PATH}\n` +
+    `coverage limitation: filesystem snapshot truncated at the maxFiles cap ` +
+    `(${which} snapshot incomplete); some files were not compared so this diff ` +
+    `may be missing real changes — review this change set manually and reduce ` +
+    `the workspace file count (e.g. add SKIP_DIRS entries) so the snapshot is complete.\n`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -293,12 +351,18 @@ async function modifiedBlock(cwd, rel, prior, info, maxFileBytes) {
 // truncation is a diff-text coverage limitation only, marked explicitly.
 export async function synthesizeNewFileDiff(cwd, rel, maxFileBytes = 1_000_000) {
   const absolute = path.resolve(cwd, rel);
-  const body = await readFile(absolute, "utf8").catch(() => "");
-  if (!body) {
+  // Branch on the READ FAILURE, not on `!body`: an empty string ("") is a
+  // perfectly valid empty text file and must render as an empty added file, not
+  // be misreported as "Binary or unreadable". Only a genuine read error
+  // (missing/permission/binary-decode failure) should take the unreadable path.
+  let body;
+  try {
+    body = await readFile(absolute, "utf8");
+  } catch {
     return `diff --git a/${rel} b/${rel}\nnew file mode 100644\nBinary or unreadable file: ${rel}\n`;
   }
   const { text, marker } = capForDiff(body, maxFileBytes);
-  const lines = text.split(/\r?\n/).map((line) => `+${line}`).join("\n");
+  const lines = renderAddedLines(text);
   return `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n${lines}\n${marker}`;
 }
 
@@ -307,9 +371,18 @@ export async function synthesizeNewFileDiff(cwd, rel, maxFileBytes = 1_000_000) 
 // be non-empty so the gate always sees the change. Inlined content is capped.
 async function synthesizeModifiedFileDiff(cwd, rel, maxFileBytes = 1_000_000) {
   const absolute = path.resolve(cwd, rel);
-  const body = await readFile(absolute, "utf8").catch(() => "");
+  let body;
+  try {
+    body = await readFile(absolute, "utf8");
+  } catch {
+    // On a read failure, emit a clearly-flagged NON-EMPTY block (like the
+    // new-file path) instead of silently producing empty content — an empty
+    // "modified" block would let a changed-but-unreadable file pass with nothing
+    // for the reviewer to see (a fail-open).
+    return `diff --git a/${rel} b/${rel}\nmodified file mode 100644\nBinary or unreadable file: ${rel}\n`;
+  }
   const { text, marker } = capForDiff(body, maxFileBytes);
-  const lines = text.split(/\r?\n/).map((line) => `+${line}`).join("\n");
+  const lines = renderAddedLines(text);
   return `diff --git a/${rel} b/${rel}\nmodified file mode 100644\n--- a/${rel}\n+++ b/${rel}\n${lines}\n${marker}`;
 }
 
@@ -327,6 +400,22 @@ function capForDiff(body, maxFileBytes) {
     `... [truncated: ${notShown} bytes not shown] ...\n` +
     `(coverage limitation: diff text capped at ${maxFileBytes} bytes; full content was hashed for change detection)\n`;
   return { text: truncated, marker };
+}
+
+/**
+ * Render file content as `+`-prefixed unified-diff lines, preserving each line's
+ * exact bytes — including a trailing `\r` (CRLF) and any other in-line control
+ * characters. Splitting on `\n` only (NOT `/\r?\n/`) keeps the carriage return
+ * inside each line, so byte-distinct contents that differ ONLY in line endings
+ * (CRLF vs LF) render to DIFFERENT text and therefore hash to different
+ * diffHash/payloadHash values. Collapsing `\r?\n` here previously let a CRLF
+ * and an LF version of the same logical lines synthesize identical diff text.
+ *
+ * @param {string} text - the (possibly capped) file body.
+ * @returns {string} newline-joined, `+`-prefixed lines.
+ */
+function renderAddedLines(text) {
+  return text.split("\n").map((line) => `+${line}`).join("\n");
 }
 
 // Small text block for an added/modified symlink, noting its target.

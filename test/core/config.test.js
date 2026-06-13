@@ -127,6 +127,71 @@ test("privacy floor secretScan=block-all forces block-all", () => {
   assert.equal(cfg.privacy.secretScan, "block-all");
 });
 
+// ── TRUST-2: privacy floor is MONOTONIC over ranked domains ───────────────────
+// A floor at an INTERMEDIATE level must still be enforced — a project must not be
+// able to loosen below it. Previously only block-all / deny were enforced.
+
+test("TRUST-2: secretScan floor=block-external is NOT loosened to warn by project", () => {
+  const cfg = mergeConfig(
+    { privacy: { secretScan: "warn" } },
+    { privacy: { secretScan: "block-external" } },
+  );
+  assert.equal(
+    cfg.privacy.secretScan,
+    "block-external",
+    "block-external floor must ratchet a 'warn' project value back up"
+  );
+});
+
+test("TRUST-2: externalReview floor=prompt is NOT loosened to allow by project", () => {
+  const cfg = mergeConfig(
+    { privacy: { externalReview: "allow" } },
+    { privacy: { externalReview: "prompt" } },
+  );
+  assert.equal(
+    cfg.privacy.externalReview,
+    "prompt",
+    "prompt floor must ratchet an 'allow' project value back up"
+  );
+});
+
+test("TRUST-2: a privacy floor never LOOSENS a stricter project value", () => {
+  // Project is already stricter than the floor in both domains; floor must not lower it.
+  const cfg = mergeConfig(
+    { privacy: { secretScan: "block-all", externalReview: "deny" } },
+    { privacy: { secretScan: "block-external", externalReview: "prompt" } },
+  );
+  assert.equal(cfg.privacy.secretScan, "block-all", "stricter project secretScan preserved");
+  assert.equal(cfg.privacy.externalReview, "deny", "stricter project externalReview preserved");
+});
+
+test("TRUST-2: secretScan floor=block-external also blocks a block-all project? (stays block-all)", () => {
+  // block-all is stricter than the block-external floor; it must be preserved.
+  const cfg = mergeConfig(
+    { privacy: { secretScan: "block-all" } },
+    { privacy: { secretScan: "block-external" } },
+  );
+  assert.equal(cfg.privacy.secretScan, "block-all");
+});
+
+test("TRUST-2: existing block-all/deny floors still ratchet from the loosest project value", () => {
+  const cfg = mergeConfig(
+    { privacy: { secretScan: "warn", externalReview: "allow" } },
+    { privacy: { secretScan: "block-all", externalReview: "deny" } },
+  );
+  assert.equal(cfg.privacy.secretScan, "block-all");
+  assert.equal(cfg.privacy.externalReview, "deny");
+});
+
+test("TRUST-2: an absent privacy floor leaves the project privacy values untouched", () => {
+  const cfg = mergeConfig(
+    { privacy: { secretScan: "warn", externalReview: "allow" } },
+    {},
+  );
+  assert.equal(cfg.privacy.secretScan, "warn");
+  assert.equal(cfg.privacy.externalReview, "allow");
+});
+
 // ── mergeConfig does not mutate DEFAULT_CONFIG ────────────────────────────────
 
 test("mergeConfig does not mutate DEFAULT_CONFIG", () => {
@@ -147,4 +212,26 @@ test("deepAssign blocks __proto__ pollution via nested policy config", () => {
 
   // The returned config should still be valid and use the default mode
   assert.equal(cfg.policy.mode, "enforced");
+});
+
+// ── Security: applyPolicyFloor coerces malformed sub-objects & canonicalizes mode
+
+test("mergeConfig does NOT throw when a sub-object is replaced by a scalar/null", () => {
+  // Each of these would make applyPolicyFloor read .mode/.externalReview off a
+  // non-object and throw (fail-open) if not coerced.
+  for (const bad of [{ privacy: "pwned" }, { policy: null }, { policy: "soft" }, { privacy: 5 }, { policy: [] }]) {
+    const cfg = mergeConfig(bad);
+    assert.equal(typeof cfg.policy, "object");
+    assert.equal(typeof cfg.privacy, "object");
+    assert.equal(cfg.policy.mode, "enforced", `bad input ${JSON.stringify(bad)} must stay enforced`);
+  }
+});
+
+test("applyPolicyFloor canonicalizes a non-canonical mode to a known value", () => {
+  assert.equal(mergeConfig({ policy: { mode: "Enforced" } }).policy.mode, "enforced");
+  assert.equal(mergeConfig({ policy: { mode: " strict-ci " } }).policy.mode, "strict-ci");
+  assert.equal(mergeConfig({ policy: { mode: "garbage" } }).policy.mode, "enforced");
+  assert.equal(mergeConfig({ policy: { mode: 123 } }).policy.mode, "enforced");
+  // A genuine soft is preserved (mergeConfig's single layer is the trusted input).
+  assert.equal(mergeConfig({ policy: { mode: "soft" } }).policy.mode, "soft");
 });
