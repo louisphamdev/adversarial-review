@@ -18,7 +18,7 @@
  * @returns {{ host: string, wrapperCommand: string, enforcement: string, residualRisk: string }}
  */
 export function wrapperInstructions({ host, reviewer, binPath }) {
-  const bin = binPath || "npx adversarial-review";
+  const bin = binPath || "npx adversarial-review-gate";
   const reviewerNote = reviewer && reviewer !== "none" ? ` (reviewer: ${reviewer})` : "";
 
   // Build a representative wrapper command.  The user substitutes their actual

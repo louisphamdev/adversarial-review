@@ -22,7 +22,7 @@ import path from "node:path";
  * @returns {object}  hook config JSON object
  */
 function buildHookConfig(binPath) {
-  const bin = binPath || "npx adversarial-review";
+  const bin = binPath || "npx adversarial-review-gate";
   return {
     hooks: {
       SessionStart: [
