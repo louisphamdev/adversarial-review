@@ -176,10 +176,27 @@ export function createAdapter(config) {
      * Verify that the opencode binary is available and functional.
      * On Windows, resolveExecutable walks PATHEXT so it finds opencode.cmd.
      *
+     * Two-phase verification:
+     *  - BINARY (always): the `opencode` binary resolves on PATH and answers
+     *    `--version` with exit 0. This is the "is the tool installed" check.
+     *  - AGENT (optional, default ON): the configured read-only agent exists in
+     *    `opencode agent list`. This is the "can it run isolated NOW" check.
+     *
+     * The agent phase must be SKIPPABLE because of a chicken-and-egg at install
+     * time: the installer is the very thing that CREATES the read-only agent, so
+     * the install-time availability check must NOT reject merely because the
+     * agent does not exist yet. Pass { requireAgent: false } to skip the agent
+     * phase (binary-only) — the installer uses this. Runtime (makeReviewerRunner)
+     * and `doctor` keep the default (requireAgent:true) so a missing/deleted
+     * agent is still reported as `reviewer_agent_missing`.
+     *
      * @param {object} [env]  - environment variables (defaults to process.env)
+     * @param {object} [options]
+     * @param {boolean} [options.requireAgent=true] - when false, skip the
+     *        `opencode agent list` / `reviewer_agent_missing` check.
      * @returns {Promise<{ok:boolean, resolvedPath?:string, version?:string, capabilities?:object, reason?:string}>}
      */
-    async verify(env = process.env) {
+    async verify(env = process.env, { requireAgent = true } = {}) {
       const resolvedPath = await resolveExecutable("opencode", env);
       if (!resolvedPath) {
         return { ok: false, reason: "missing_binary" };
@@ -202,20 +219,25 @@ export function createAdapter(config) {
       // falls back to the full-permission default agent when the requested agent
       // is missing, so a read-only gate cannot deliver isolation without it.
       // Run `opencode agent list` and require the agent name to appear.
-      try {
-        const child = spawnResolved(resolvedPath, ["agent", "list"], { env });
-        const [agentOutput, code] = await Promise.all([
-          collectOutput(child),
-          waitForExit(child),
-        ]);
-        if (code !== 0) {
-          return { ok: false, reason: "agent_list_failed" };
+      //
+      // SKIPPED when requireAgent:false (install time): the installer creates the
+      // agent, so a missing agent here is expected and must not block install.
+      if (requireAgent) {
+        try {
+          const child = spawnResolved(resolvedPath, ["agent", "list"], { env });
+          const [agentOutput, code] = await Promise.all([
+            collectOutput(child),
+            waitForExit(child),
+          ]);
+          if (code !== 0) {
+            return { ok: false, reason: "agent_list_failed" };
+          }
+          if (!agentOutput.includes(agent)) {
+            return { ok: false, reason: "reviewer_agent_missing" };
+          }
+        } catch {
+          return { ok: false, reason: "agent_list_error" };
         }
-        if (!agentOutput.includes(agent)) {
-          return { ok: false, reason: "reviewer_agent_missing" };
-        }
-      } catch {
-        return { ok: false, reason: "agent_list_error" };
       }
 
       return {

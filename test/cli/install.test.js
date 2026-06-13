@@ -41,6 +41,57 @@ async function tmpDir(prefix) {
   return mkdtemp(join(tmpdir(), prefix));
 }
 
+// Create a fake `opencode` executable on a fresh bin dir and return a PATH
+// string that PREPENDS that dir to the real PATH. The shim satisfies the
+// opencode adapter's install-time check verify(env, {requireAgent:false}):
+//   `opencode --version`     -> exit 0 with a version string (binary works)
+//   `opencode agent list`    -> exit 0 listing ONLY "build" (NOT the
+//                               adversarial-reviewer agent)
+//
+// CLEAN-HOME SCENARIO: the agent list deliberately OMITS "adversarial-reviewer"
+// to reproduce the real clean-machine bug — the read-only agent does not exist
+// yet because the installer is the thing that creates it. The install must still
+// succeed (binary resolves + --version ok) via the install-time binary-only
+// check, then create the agent. A full verify() (default requireAgent:true)
+// against this same stub would report reviewer_agent_missing, which is exactly
+// the chicken-and-egg the install-time check must bypass.
+//
+// We keep the real PATH appended so that, on Windows, spawnResolved can still
+// locate cmd.exe (in System32) to wrap the .cmd shim. The stub dir is FIRST so
+// the fake opencode always wins over any real install. On POSIX we emit an
+// executable shell script instead of a .cmd.
+async function stubOpencode(baseDir) {
+  const binDir = join(baseDir, "stub-bin");
+  await mkdir(binDir, { recursive: true });
+  if (process.platform === "win32") {
+    const cmd = [
+      "@echo off",
+      "if \"%1\"==\"--version\" (echo 1.0.0-stub & exit /b 0)",
+      // agent list intentionally does NOT include adversarial-reviewer.
+      "if \"%1\"==\"agent\" (echo build & exit /b 0)",
+      "exit /b 0",
+      "",
+    ].join("\r\n");
+    await writeFile(join(binDir, "opencode.cmd"), cmd);
+  } else {
+    const sh = [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo "1.0.0-stub"; exit 0; fi',
+      // agent list intentionally does NOT include adversarial-reviewer.
+      'if [ "$1" = "agent" ]; then echo "build"; exit 0; fi',
+      "exit 0",
+      "",
+    ].join("\n");
+    const p = join(binDir, "opencode");
+    await writeFile(p, sh);
+    const { chmod } = await import("node:fs/promises");
+    await chmod(p, 0o755);
+  }
+  // Prepend the stub dir; append the real PATH so cmd.exe stays resolvable.
+  const { delimiter } = await import("node:path");
+  return binDir + delimiter + (process.env.PATH || "");
+}
+
 function resetExit() {
   process.exitCode = 0;
 }
@@ -702,6 +753,233 @@ describe("install command", () => {
       // Install registry must exist.
       const registryPath = join(home, ".adversarial-review", "install.json");
       assert.ok(existsSync(registryPath), "install registry must be written");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX 1: opencode reviewer gets a working readOnlyConfig block so enforced
+  // mode isolation (readOnly && noEdit) passes at runtime.
+  // -------------------------------------------------------------------------
+  it("writes reviewers.opencode.readOnlyConfig:true when a host maps to opencode", async () => {
+    const cwd = await tmpDir("ar-install-oc-cfg-");
+    const home = await tmpDir("ar-install-oc-cfg-home-");
+    try {
+      // opencode must resolve on PATH for the availability check to pass; stub a
+      // fake opencode and the agent-list output via a tiny shim dir on PATH.
+      const binDir = await stubOpencode(home);
+      const { io, err } = makeIo(cwd, home, { PATH: binDir });
+      process.exitCode = 0;
+
+      await installCommand(
+        [
+          "--hosts", "claude-code",
+          "--reviewer", "claude-code=opencode",
+        ],
+        io
+      );
+
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const written = JSON.parse(
+        await rf(join(cwd, ".adversarial-review", "config.json"), "utf8")
+      );
+      assert.equal(
+        written.reviewers?.opencode?.readOnlyConfig,
+        true,
+        "reviewers.opencode.readOnlyConfig must be true"
+      );
+      assert.equal(
+        written.reviewers?.opencode?.agent,
+        "adversarial-reviewer",
+        "reviewers.opencode.agent must default to adversarial-reviewer"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX 2: opencode read-only agent is created at
+  // <home>/.config/opencode/agent/adversarial-reviewer.md with mode:primary and
+  // permission denies. Listed in dry-run but NOT written in dry-run.
+  // -------------------------------------------------------------------------
+  it("creates the opencode read-only agent file with mode:primary and permission denies", async () => {
+    const cwd = await tmpDir("ar-install-oc-agent-");
+    const home = await tmpDir("ar-install-oc-agent-home-");
+    try {
+      const binDir = await stubOpencode(home);
+      const { io, err } = makeIo(cwd, home, { PATH: binDir });
+      process.exitCode = 0;
+
+      await installCommand(
+        [
+          "--hosts", "claude-code",
+          "--reviewer", "claude-code=opencode",
+        ],
+        io
+      );
+
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const agentPath = join(
+        home, ".config", "opencode", "agent", "adversarial-reviewer.md"
+      );
+      assert.ok(existsSync(agentPath), "opencode agent file must be created");
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const content = await rf(agentPath, "utf8");
+      assert.match(content, /mode:\s*primary/, "agent must be mode:primary");
+      assert.match(content, /edit:\s*deny/, "agent must deny edit");
+      assert.match(content, /bash:\s*deny/, "agent must deny bash");
+      assert.match(content, /<<<ADVERSARIAL-REVIEW-VERDICT>>>/, "agent must include the verdict block format");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("lists the opencode agent as a planned write in dry-run WITHOUT writing it", async () => {
+    const cwd = await tmpDir("ar-install-oc-dry-");
+    const home = await tmpDir("ar-install-oc-dry-home-");
+    try {
+      const binDir = await stubOpencode(home);
+      const { io, out, err } = makeIo(cwd, home, { PATH: binDir });
+      process.exitCode = 0;
+
+      await installCommand(
+        [
+          "--dry-run",
+          "--hosts", "claude-code",
+          "--reviewer", "claude-code=opencode",
+        ],
+        io
+      );
+
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const output = out.join("");
+      // The agent path must be listed as a planned write.
+      assert.match(output, /adversarial-reviewer\.md/, "dry-run must list the agent file");
+
+      // But the agent file must NOT exist on disk after dry-run.
+      const agentPath = join(
+        home, ".config", "opencode", "agent", "adversarial-reviewer.md"
+      );
+      assert.ok(!existsSync(agentPath), "dry-run must not write the opencode agent file");
+      // And no opencode config dir should be created at all.
+      assert.ok(
+        !existsSync(join(home, ".config", "opencode")),
+        "dry-run must not create ~/.config/opencode"
+      );
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX 2 idempotency: an existing agent file is NOT overwritten.
+  // -------------------------------------------------------------------------
+  it("does not overwrite an existing opencode agent file (idempotent)", async () => {
+    const cwd = await tmpDir("ar-install-oc-idem-");
+    const home = await tmpDir("ar-install-oc-idem-home-");
+    try {
+      const binDir = await stubOpencode(home);
+
+      // Pre-create the agent file with a sentinel.
+      const agentDir = join(home, ".config", "opencode", "agent");
+      await mkdir(agentDir, { recursive: true });
+      const agentPath = join(agentDir, "adversarial-reviewer.md");
+      const sentinel = "SENTINEL-DO-NOT-OVERWRITE\n";
+      await writeFile(agentPath, sentinel);
+
+      const { io, err } = makeIo(cwd, home, { PATH: binDir });
+      process.exitCode = 0;
+
+      await installCommand(
+        [
+          "--hosts", "claude-code",
+          "--reviewer", "claude-code=opencode",
+        ],
+        io
+      );
+
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      const { readFile: rf } = await import("node:fs/promises");
+      const after = await rf(agentPath, "utf8");
+      assert.equal(after, sentinel, "existing agent file must be preserved untouched");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Chicken-and-egg regression (the exact clean-home failing scenario):
+  // On a CLEAN home where the opencode read-only agent does NOT exist yet (the
+  // stub's `agent list` omits it), the install must SUCCEED — the install-time
+  // availability check is binary-only (requireAgent:false), so a missing agent
+  // must not block the install. The installer then CREATES the agent + writes
+  // readOnlyConfig:true. A subsequent full verify() would then pass.
+  // -------------------------------------------------------------------------
+  it("clean-home: install succeeds when the opencode agent does NOT exist yet, then creates it", async () => {
+    const cwd = await tmpDir("ar-install-clean-");
+    const home = await tmpDir("ar-install-clean-home-");
+    try {
+      // Sanity: a CLEAN home has no read-only agent file.
+      const agentPath = join(
+        home, ".config", "opencode", "agent", "adversarial-reviewer.md"
+      );
+      assert.ok(!existsSync(agentPath), "precondition: clean home must NOT have the agent file");
+
+      // The stub's `agent list` deliberately OMITS adversarial-reviewer, so the
+      // FULL verify() would reject with reviewer_agent_missing. The install-time
+      // binary-only check must still pass.
+      const binDir = await stubOpencode(home);
+      const { io, err } = makeIo(cwd, home, { PATH: binDir });
+      process.exitCode = 0;
+
+      await installCommand(
+        [
+          "--hosts", "claude-code,codex",
+          "--reviewer", "claude-code=opencode",
+          "--reviewer", "codex=opencode",
+        ],
+        io
+      );
+
+      // Exit 0 — the missing agent must NOT have blocked the install.
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+
+      // The project config must carry readOnlyConfig:true for opencode.
+      const { readFile: rf } = await import("node:fs/promises");
+      const written = JSON.parse(
+        await rf(join(cwd, ".adversarial-review", "config.json"), "utf8")
+      );
+      assert.equal(
+        written.reviewers?.opencode?.readOnlyConfig,
+        true,
+        "reviewers.opencode.readOnlyConfig must be true after clean-home install"
+      );
+
+      // The installer must have CREATED the read-only agent file.
+      assert.ok(
+        existsSync(agentPath),
+        "install must create the opencode read-only agent on a clean home"
+      );
+      const agentContent = await rf(agentPath, "utf8");
+      assert.match(agentContent, /mode:\s*primary/, "created agent must be mode:primary");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

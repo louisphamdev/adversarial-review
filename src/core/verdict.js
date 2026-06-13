@@ -20,8 +20,12 @@ export function parseVerdict(output, job, options = {}) {
 
   const end = text.indexOf(END, start + START.length);
   if (end < 0) return { ok: false, error: "missing_verdict_end" };
-  const trailing = text.slice(end + END.length).trim();
-  if (trailing) return { ok: false, error: "trailing_output_after_verdict" };
+  // Trailing content after the verdict block's <<<END>>> is intentionally ignored.
+  // Real LLM reviewers intermittently append a sign-off / extra prose after the
+  // verdict block; rejecting it made the gate unusable. Injection safety is preserved
+  // by the single-START requirement above: a second verdict block (the only injection
+  // vector that matters) is already rejected as multiple_verdict_blocks, so trailing
+  // non-START text is harmless.
   const body = text.slice(start + START.length, end).trim();
 
   // FIX 1 (defense-in-depth): reject nested sentinel tokens inside the extracted body

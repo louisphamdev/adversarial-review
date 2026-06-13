@@ -22,18 +22,41 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { mergeConfig, applyPolicyFloor, DEFAULT_CONFIG } from "../core/config.js";
 import { HOSTS } from "../hosts/index.js";
 import { plannedClaudeCodeWrites } from "../hosts/claude-code.js";
 import { wrapperInstructions } from "../hosts/wrapper.js";
 import { createReviewer } from "../reviewers/index.js";
+import { resolveExecutable } from "../core/process.js";
 
 // Path constants (relative to cwd / home).
 const PROJECT_CONFIG_REL = path.join(".adversarial-review", "config.json");
 const USER_POLICY_REL = path.join(".adversarial-review", "policy.json");
 const USER_INSTALL_REL = path.join(".adversarial-review", "install.json");
 const LEGACY_CONFIG_REL = path.join("hooks", "config.json");
+
+// Read-only opencode agent: where it lives in the user's home, and the bundled
+// source that ships inside the package. The agent MUST be a `primary` opencode
+// agent (not a subagent) or opencode falls back to the writable default agent.
+const OPENCODE_AGENT_REL = path.join(
+  ".config",
+  "opencode",
+  "agent",
+  "adversarial-reviewer.md"
+);
+const BUNDLED_OPENCODE_AGENT_PATH = fileURLToPath(
+  new URL("../integrations/opencode/adversarial-reviewer.agent.md", import.meta.url)
+);
+
+// Default config block written for an opencode reviewer so enforced-mode
+// isolation (readOnly && noEdit) passes and the read-only agent is selected.
+const OPENCODE_REVIEWER_DEFAULTS = Object.freeze({
+  readOnlyConfig: true,
+  agent: "adversarial-reviewer",
+  timeoutSec: 180,
+});
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -93,13 +116,39 @@ async function readJsonTolerant(filePath) {
   }
 }
 
-/** Resolve home directory from env, falling back to os.homedir(). */
+/**
+ * Resolve the user's home directory, honoring an injected env so tests can
+ * redirect home-based writes (registry, opencode agent) without touching the
+ * real home dir. This MUST match load-config.js's homeDir() resolution so the
+ * installer writes to the SAME user-level base the gate later reads. Priority:
+ *   1. ADVERSARIAL_REVIEW_HOME — dedicated override for the user-level base;
+ *   2. HOME / USERPROFILE — standard OS home env vars;
+ *   3. os.homedir() — the real home dir.
+ */
 function homeDir(env) {
   if (env) {
-    const fromEnv = env.HOME || env.USERPROFILE;
+    const fromEnv = env.ADVERSARIAL_REVIEW_HOME || env.HOME || env.USERPROFILE;
     if (fromEnv) return fromEnv;
   }
   return os.homedir();
+}
+
+/**
+ * Pick the command used to invoke this package from hooks/wrappers.
+ *
+ * Prefers the direct bin name `adversarial-review-gate` when it resolves on
+ * PATH (a global install — faster, no npx resolution per Stop hook). Falls back
+ * to `npx adversarial-review-gate` otherwise, which always works.
+ *
+ * @param {object} env  - environment variables
+ * @returns {Promise<{ command: string, direct: boolean }>}
+ */
+async function resolveHookBinCommand(env) {
+  const resolved = await resolveExecutable("adversarial-review-gate", env);
+  if (resolved) {
+    return { command: "adversarial-review-gate", direct: true };
+  }
+  return { command: "npx adversarial-review-gate", direct: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -163,8 +212,18 @@ async function readLegacyConfig(cwd) {
 // ---------------------------------------------------------------------------
 
 /**
- * Verify that a reviewer id is available (its binary resolves on PATH).
- * "none" is always treated as available.
+ * Verify that a reviewer id is available FOR INSTALL (its binary resolves on
+ * PATH and answers --version). "none" is always treated as available.
+ *
+ * INSTALL-TIME SEMANTICS: this uses { requireAgent: false } so the opencode
+ * adapter checks ONLY the binary + version and SKIPS the `opencode agent list`
+ * / `reviewer_agent_missing` check. This breaks a chicken-and-egg: the installer
+ * is the very thing that CREATES the read-only agent (FIX 2 below), so on a
+ * clean machine the agent does not exist yet and the full verify() would reject
+ * the install before the agent could ever be created. A MISSING BINARY or a
+ * failing --version (missing_binary / version_check_failed) STILL rejects — only
+ * agent-existence is skipped. Other adapters (codex/custom) ignore the option.
+ * Runtime (makeReviewerRunner) and `doctor` keep the full verify() (with agent).
  *
  * @param {string} reviewerId
  * @param {object} config  - effective config (used by createReviewer)
@@ -175,7 +234,7 @@ async function checkReviewerAvailability(reviewerId, config, env) {
   if (reviewerId === "none") return { ok: true };
   try {
     const adapter = createReviewer(reviewerId, config);
-    return adapter.verify(env);
+    return adapter.verify(env, { requireAgent: false });
   } catch (err) {
     return { ok: false, reason: err.message };
   }
@@ -353,10 +412,38 @@ export async function installCommand(argv, io) {
     };
   }
 
+  // FIX 1: write a working reviewers config for any opencode reviewer.
+  // Without reviewers.opencode.readOnlyConfig:true the adapter reports
+  // capabilities {readOnly:false,noEdit:false}, so enforced-mode isolation
+  // (readOnly && noEdit) fails and makeReviewerRunner rejects every review with
+  // `reviewer_not_isolated`. For each DISTINCT selected-host mapping to
+  // opencode, merge the read-only defaults — without clobbering any reviewers
+  // section the user/project already set. (codex-as-reviewer already reports
+  // isolated, so it needs no config block.)
+  const reviewersConfig = { ...(baseProjectConfig.reviewers || {}) };
+  const usesOpencodeReviewer = hosts.some(
+    (host) => reviewerMap.get(host) === "opencode"
+  );
+  if (usesOpencodeReviewer) {
+    reviewersConfig.opencode = {
+      ...OPENCODE_REVIEWER_DEFAULTS,
+      // Preserve any explicit overrides the user already set for opencode.
+      ...(reviewersConfig.opencode || {}),
+      // Always assert isolation: a user who wrote a writable opencode block must
+      // not silently defeat enforced-mode isolation through this installer.
+      readOnlyConfig: true,
+    };
+  }
+
   const newProjectConfig = {
     ...baseProjectConfig,
     hosts: hostsConfig,
   };
+  // Only attach reviewers when there is something to write so buildProjectConfig
+  // ToWrite's `if (newProjectConfig.reviewers)` guard stays accurate.
+  if (Object.keys(reviewersConfig).length) {
+    newProjectConfig.reviewers = reviewersConfig;
+  }
 
   // Merge with DEFAULT_CONFIG and enforce policy floor.
   const resolvedConfig = mergeConfig(newProjectConfig, userPolicyFloor);
@@ -398,6 +485,11 @@ export async function installCommand(argv, io) {
     type: "install-registry",
   });
 
+  // FIX 3: pick the hook/wrapper command once. Prefer the direct bin name when
+  // it resolves on PATH (global install — no per-Stop npx resolution); else use
+  // `npx adversarial-review-gate`, which always works.
+  const hookBin = await resolveHookBinCommand(env);
+
   // 3. Per-host integration files (native) or wrapper instructions.
   const wrapperInstructionsList = [];
   for (const host of hosts) {
@@ -405,7 +497,7 @@ export async function installCommand(argv, io) {
     if (hostInfo.enforcement === "native-enforced") {
       // Native host: compute planned file writes.
       if (host === "claude-code") {
-        const nativeWrites = plannedClaudeCodeWrites({ cwd });
+        const nativeWrites = plannedClaudeCodeWrites({ cwd, binPath: hookBin.command });
         for (const w of nativeWrites) {
           plannedWrites.push({
             path: w.path,
@@ -420,9 +512,37 @@ export async function installCommand(argv, io) {
       const instructions = wrapperInstructions({
         host,
         reviewer: reviewerMap.get(host),
+        binPath: hookBin.command,
       });
       wrapperInstructionsList.push(instructions);
     }
+  }
+
+  // 4. FIX 2: ensure the opencode read-only agent exists when opencode is a
+  // chosen reviewer. opencode SILENTLY falls back to the writable default agent
+  // when this primary agent is missing, so the adapter's verify() rejects the
+  // setup with `reviewer_agent_missing` until it exists. We ship the agent in
+  // the package and copy it on install. IDEMPOTENT: never overwrite an existing
+  // file (the user may have customized it) — only create when missing.
+  if (usesOpencodeReviewer) {
+    const opencodeAgentPath = path.join(home, OPENCODE_AGENT_REL);
+    const agentAlreadyPresent = existsSync(opencodeAgentPath);
+    let agentContent = "";
+    if (!agentAlreadyPresent) {
+      // Read the bundled agent markdown once so a single missing-bundle error
+      // surfaces clearly instead of mid-write.
+      agentContent = await readFile(BUNDLED_OPENCODE_AGENT_PATH, "utf8");
+    }
+    plannedWrites.push({
+      path: opencodeAgentPath,
+      content: agentContent,
+      note: agentAlreadyPresent
+        ? "opencode read-only agent (adversarial-reviewer.md) — already present, will be kept"
+        : "opencode read-only agent (adversarial-reviewer.md) — mode:primary, read-only",
+      type: "opencode-agent",
+      // Idempotency marker: when true the real-mode writer skips this entry.
+      skipExisting: agentAlreadyPresent,
+    });
   }
 
   // --- Dry-run: print and exit without writing ---
@@ -431,7 +551,10 @@ export async function installCommand(argv, io) {
     io.stdout.write("adversarial-review install --dry-run: planned writes\n");
     io.stdout.write("(No files will be written in dry-run mode)\n\n");
     for (const w of plannedWrites) {
-      io.stdout.write(`  [WRITE] ${w.path}\n`);
+      // Idempotent entries that already exist on disk are listed as SKIP so the
+      // dry-run accurately previews that the real run will keep the file.
+      const tag = w.skipExisting ? "SKIP " : "WRITE";
+      io.stdout.write(`  [${tag}] ${w.path}\n`);
       io.stdout.write(`          ${w.note}\n`);
     }
     if (wrapperInstructionsList.length) {
@@ -450,6 +573,13 @@ export async function installCommand(argv, io) {
   // --- Real mode: write files ---
 
   for (const w of plannedWrites) {
+    // FIX 2 idempotency: never overwrite an existing opencode agent (or any
+    // entry flagged skipExisting) — the user may have customized it.
+    if (w.skipExisting) {
+      io.stdout.write(`Keeping ${w.path} (already present) ...\n`);
+      io.stdout.write(`  SKIP: ${w.note}\n`);
+      continue;
+    }
     io.stdout.write(`Writing ${w.path} ...\n`);
     await atomicWrite(w.path, w.content);
     io.stdout.write(`  OK: ${w.note}\n`);
@@ -463,6 +593,15 @@ export async function installCommand(argv, io) {
       io.stdout.write(`    Enforcement: ${inst.enforcement}\n`);
       io.stdout.write(`    Residual risk: ${inst.residualRisk}\n`);
     }
+  }
+
+  // FIX 3: when we fell back to npx, recommend a global install for lower
+  // per-hook latency (npx resolves the package on every Stop event).
+  if (!hookBin.direct) {
+    io.stdout.write(
+      "\nTip: install globally for lower per-hook latency: npm i -g adversarial-review-gate\n" +
+        "     (the hook then runs `adversarial-review-gate` directly instead of resolving via npx).\n"
+    );
   }
 
   io.stdout.write("\nadversarial-review install: complete.\n");

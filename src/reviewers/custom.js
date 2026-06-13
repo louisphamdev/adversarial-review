@@ -130,10 +130,15 @@ export function createAdapter(config, reviewerId) {
     /**
      * Verify that the custom command binary is available.
      *
+     * Custom reviewers have no separate "agent existence" phase, so this accepts
+     * and IGNORES the second options arg (e.g. { requireAgent }) to keep the
+     * verify() call site uniform across reviewers.
+     *
      * @param {object} [env]
+     * @param {object} [_options]  - accepted for call-site uniformity; ignored
      * @returns {Promise<{ok:boolean, resolvedPath?:string, version?:string, capabilities?:object, reason?:string}>}
      */
-    async verify(env = process.env) {
+    async verify(env = process.env, _options = {}) {
       // Trust check: the reviewer config must explicitly declare trusted:true.
       if (reviewerConfig.trusted !== true) {
         return { ok: false, reason: "untrusted_custom_reviewer" };

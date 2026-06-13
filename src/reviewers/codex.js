@@ -157,10 +157,16 @@ export function createAdapter(config) {
     /**
      * Verify that the codex binary is available and functional.
      *
+     * Codex has no separate "agent existence" phase, so it accepts and IGNORES
+     * the second options arg (e.g. { requireAgent }). This keeps the verify()
+     * call site uniform across reviewers: the installer can pass
+     * { requireAgent: false } to every adapter without special-casing opencode.
+     *
      * @param {object} [env]  - environment variables (defaults to process.env)
+     * @param {object} [_options]  - accepted for call-site uniformity; ignored
      * @returns {Promise<{ok:boolean, resolvedPath?:string, version?:string, capabilities?:object, reason?:string}>}
      */
-    async verify(env = process.env) {
+    async verify(env = process.env, _options = {}) {
       const resolvedPath = await resolveExecutable("codex", env);
       if (!resolvedPath) {
         return { ok: false, reason: "missing_binary" };

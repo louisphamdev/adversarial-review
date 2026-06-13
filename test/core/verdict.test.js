@@ -81,12 +81,24 @@ describe("parseVerdict", () => {
     assert.equal(result.error, "invalid_verdict_json");
   });
 
-  it("returns error trailing_output_after_verdict when text follows END sentinel", () => {
+  it("ignores trailing prose after the END sentinel and still returns ok:true", () => {
+    // Real LLM reviewers intermittently append a sign-off after the verdict block.
+    // Trailing prose (with no second START sentinel) must be ignored, not rejected.
     const job = makeJob();
-    const output = `${wrap(makePayload())} extra text after end`;
+    const output = `${wrap(makePayload())}\n\nLet me know if you need anything else!`;
     const result = parseVerdict(output, job);
-    assert.equal(result.ok, false);
-    assert.equal(result.error, "trailing_output_after_verdict");
+    assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
+    assert.equal(result.verdict.verdict, "pass");
+  });
+
+  it("ignores a trailing summary after a single valid PASS block", () => {
+    // A single valid PASS block followed by a stray END marker + summary text.
+    // The first verdict block is parsed; everything after its END is ignored.
+    const job = makeJob();
+    const output = `${wrap(makePayload({ verdict: "pass" }))}\n${END}\nsome trailing summary text`;
+    const result = parseVerdict(output, job);
+    assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
+    assert.equal(result.verdict.verdict, "pass");
   });
 
   it("returns error job_id_mismatch when job_id does not match", () => {

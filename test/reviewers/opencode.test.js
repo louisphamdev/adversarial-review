@@ -243,6 +243,57 @@ describe("opencode adapter", () => {
     }
   });
 
+  // --- verify({requireAgent:false}) — install-time binary-only check ---
+
+  // The installer is the very thing that CREATES the read-only agent, so on a
+  // clean machine the agent does not exist yet. verify(env, {requireAgent:false})
+  // must report ok:true (with capabilities) for binary+version alone, SKIPPING
+  // the `agent list` check — otherwise the install rejects before it can create
+  // the agent (chicken-and-egg).
+  it("verify({requireAgent:false}) returns ok:true even when the agent is NOT listed", async () => {
+    // Stub whose `agent list` does NOT include the read-only agent (clean home).
+    const stub = await writeOpencodeStub(job, { agents: ["build", "general"] });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { readOnlyConfig: true } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.verify(shim.env, { requireAgent: false });
+      assert.equal(result.ok, true, `verify failed: ${result.reason}`);
+      // Capabilities still reflect the read-only config.
+      assert.equal(result.capabilities.readOnly, true);
+      assert.equal(result.capabilities.noEdit, true);
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+    }
+  });
+
+  // Same stub, DEFAULT verify() (requireAgent:true) must STILL reject — proving
+  // the agent-existence check is intact for runtime/doctor.
+  it("verify() (default requireAgent:true) still returns reviewer_agent_missing for the same stub", async () => {
+    const stub = await writeOpencodeStub(job, { agents: ["build", "general"] });
+    const shim = await createOpencodeShim(stub.stubPath);
+    try {
+      const config = { reviewers: { opencode: { readOnlyConfig: true } } };
+      const adapter = createAdapter(config);
+      const result = await adapter.verify(shim.env);
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "reviewer_agent_missing");
+    } finally {
+      await shim.cleanup();
+      await stub.cleanup();
+    }
+  });
+
+  // requireAgent:false must NOT mask a missing binary — install must still reject
+  // when opencode is not installed at all.
+  it("verify({requireAgent:false}) still returns missing_binary when opencode is absent", async () => {
+    const adapter = createAdapter({});
+    const result = await adapter.verify({ PATH: "", PATHEXT: ".EXE" }, { requireAgent: false });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "missing_binary");
+  });
+
   it("verify() honors a custom agent name from config", async () => {
     const stub = await writeOpencodeStub(job, { agents: ["my-readonly-agent"] });
     const shim = await createOpencodeShim(stub.stubPath);
