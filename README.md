@@ -21,7 +21,7 @@ This is the exact flow validated on a real local Windows install, installing
 Claude Code and Codex as hosts with opencode as the reviewer for both:
 
 ```bash
-npx adversarial-review install \
+npx @louispham.dev/adversarial-review install \
   --hosts claude-code,codex \
   --reviewer claude-code=opencode \
   --reviewer codex=opencode
@@ -47,7 +47,7 @@ Supported flags (see `src/cli/install.js`):
 ### After install
 
 ```bash
-npx adversarial-review doctor
+npx @louispham.dev/adversarial-review doctor
 ```
 
 The doctor verifies hook registration, reviewer binary + version + capabilities,
@@ -221,7 +221,7 @@ job_id, diff_hash, payload_hash, reviewer, and level from the stdin brief, then
 emit exactly ONE verdict block ending with `<<<END>>>` and nothing after it.)
 ```
 
-> `npx adversarial-review doctor` reports the opencode reviewer capabilities. If
+> `npx @louispham.dev/adversarial-review doctor` reports the opencode reviewer capabilities. If
 > it shows `reviewer_agent_missing`, the agent file is not on opencode's agent
 > list; if a review fails with `reviewer_agent_fallback`, the agent exists but is
 > the wrong `mode` (subagent) or otherwise unusable.
@@ -409,7 +409,7 @@ and debate tier by default (`debateOnSensitive: true`).
 ## Configuration
 
 Project config lives at `.adversarial-review/config.json`. Run
-`npx adversarial-review install` to generate it, or edit it directly.
+`npx @louispham.dev/adversarial-review install` to generate it, or edit it directly.
 
 ```json
 {
@@ -510,7 +510,7 @@ the Python runtime and uses a new config schema.
 
 Steps to migrate:
 
-1. Run `npx adversarial-review install`. The installer detects the old config
+1. Run `npx @louispham.dev/adversarial-review install`. The installer detects the old config
    at `hooks/config.json` and migrates threshold keys into
    `.adversarial-review/config.json` automatically.
 
@@ -534,7 +534,7 @@ Steps to migrate:
 Run the built-in doctor to verify your installation:
 
 ```bash
-npx adversarial-review doctor
+npx @louispham.dev/adversarial-review doctor
 ```
 
 The doctor checks:
@@ -549,7 +549,7 @@ Common issues:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Gate blocks every Stop with "no baseline" | SessionStart hook not installed or not running | Run `npx adversarial-review install` and restart Claude Code |
+| Gate blocks every Stop with "no baseline" | SessionStart hook not installed or not running | Run `npx @louispham.dev/adversarial-review install` and restart Claude Code |
 | Reviewer times out | Reviewer tool not authenticated or binary not found | Run `doctor`, check reviewer config, re-authenticate |
 | "reviewer_mismatch" error | Reviewer in config differs from verdict block | Check config and re-run install |
 | "missing_verdict_start" error | Reviewer did not produce a verdict block | Check reviewer prompt path, run `doctor` |
@@ -563,15 +563,15 @@ Common issues:
 ## Commands
 
 ```bash
-npx adversarial-review install    # Interactive install wizard
-npx adversarial-review install --hosts claude-code,codex --reviewer claude-code=opencode --reviewer codex=opencode
-npx adversarial-review install --dry-run  # Preview without writing
-npx adversarial-review check      # Run the gate manually against current working tree
-npx adversarial-review run --host codex -- codex exec "..."  # Wrapper mode
-npx adversarial-review doctor     # Verify installation
+npx @louispham.dev/adversarial-review install    # Interactive install wizard
+npx @louispham.dev/adversarial-review install --hosts claude-code,codex --reviewer claude-code=opencode --reviewer codex=opencode
+npx @louispham.dev/adversarial-review install --dry-run  # Preview without writing
+npx @louispham.dev/adversarial-review check      # Run the gate manually against current working tree
+npx @louispham.dev/adversarial-review run --host codex -- codex exec "..."  # Wrapper mode
+npx @louispham.dev/adversarial-review doctor     # Verify installation
 ```
 
-For a local (unpublished) checkout, `npx adversarial-review` becomes
+For a local (unpublished) checkout, `npx @louispham.dev/adversarial-review` becomes
 `node /abs/path/to/adversarial-review/bin/adversarial-review.js`.
 
 ---

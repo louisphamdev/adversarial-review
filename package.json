@@ -1,5 +1,5 @@
 {
-  "name": "adversarial-review",
+  "name": "@louispham.dev/adversarial-review",
   "version": "2.0.0",
   "description": "NodeJS multi-tool adversarial review gate for coding agents.",
   "type": "module",
