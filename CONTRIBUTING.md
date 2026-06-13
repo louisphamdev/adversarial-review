@@ -34,11 +34,13 @@ containing:
 so you do not hard-gate your own development. This file is **gitignored** in this
 repo, so it stays local and is never committed. Use `enforced` everywhere else.
 
-## Design docs
+## Design and threat model
 
-Implementation plans and specs live under [`docs/superpowers/`](./docs/superpowers/)
-(`plans/` and `specs/`). Read the design and risk-register specs there before
-making non-trivial changes to the gate's behavior or enforcement semantics.
+The gate's design intent, threat model, and enforcement semantics are documented
+inline in the source (see `src/core/gate.js`, `src/core/verdict.js`, and the
+hardening comments throughout) and summarized in the README's
+**Residual Risks** and **Policy Modes** sections. Read those before making
+non-trivial changes to the gate's behavior or enforcement.
 
 ## Before opening a PR
 
