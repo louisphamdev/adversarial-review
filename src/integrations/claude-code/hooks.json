@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/adversarial-review.js\" hook --host claude-code --event session-start",
+            "statusMessage": "Adversarial review baseline",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/adversarial-review.js\" hook --host claude-code --event stop",
+            "statusMessage": "Adversarial review gate",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

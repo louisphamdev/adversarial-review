@@ -1,0 +1,13 @@
+{
+  "name": "adversarial-review",
+  "version": "2.0.0",
+  "description": "NodeJS multi-tool adversarial review gate. Installs a SessionStart baseline hook and a Stop gate hook for Claude Code. Supports multiple host tools (Claude Code, Codex, opencode) with configurable reviewer mappings, policy modes (soft/enforced/strict-ci), and native or wrapper enforcement. Significant code changes must pass an adversarial review before the agent finishes.",
+  "author": {
+    "name": "adversarial-review contributors"
+  },
+  "keywords": ["code-review", "quality", "hook", "stop-hook", "adversarial"],
+  "hooks": {
+    "SessionStart": "node \"${CLAUDE_PLUGIN_ROOT}/bin/adversarial-review.js\" hook --host claude-code --event session-start",
+    "Stop": "node \"${CLAUDE_PLUGIN_ROOT}/bin/adversarial-review.js\" hook --host claude-code --event stop"
+  }
+}

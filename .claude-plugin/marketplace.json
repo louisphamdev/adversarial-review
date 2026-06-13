@@ -1,0 +1,16 @@
+{
+  "name": "adversarial-review",
+  "owner": {
+    "name": "Khoa Pham"
+  },
+  "metadata": {
+    "description": "Internal marketplace hosting the adversarial-review code-quality gate."
+  },
+  "plugins": [
+    {
+      "name": "adversarial-review",
+      "source": "./",
+      "description": "Soft Stop-hook gate that forces an adversarial review of significant code changes before an agent finishes."
+    }
+  ]
+}

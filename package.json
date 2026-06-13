@@ -1,0 +1,43 @@
+{
+  "name": "adversarial-review",
+  "version": "2.0.0",
+  "description": "NodeJS multi-tool adversarial review gate for coding agents.",
+  "type": "module",
+  "bin": {
+    "adversarial-review": "./bin/adversarial-review.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node ./bin/adversarial-review.js doctor --dry-run",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    ".claude-plugin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "code-review",
+    "coding-agent",
+    "claude-code",
+    "codex",
+    "opencode",
+    "adversarial",
+    "code-quality",
+    "ai-agents",
+    "hook"
+  ],
+  "license": "Apache-2.0",
+  "author": "louisphamdev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/louisphamdev/adversarial-review.git"
+  },
+  "homepage": "https://github.com/louisphamdev/adversarial-review#readme",
+  "bugs": "https://github.com/louisphamdev/adversarial-review/issues"
+}
