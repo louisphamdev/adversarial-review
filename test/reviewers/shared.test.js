@@ -13,6 +13,8 @@ import {
   forceKill,
   createMarkerScanner,
   collectStream,
+  sanePositiveSec,
+  MAX_SANE_SEC,
   MAX_OUTPUT_BYTES,
   TIMEOUT_SENTINEL,
 } from "../../src/reviewers/_shared.js";
@@ -181,6 +183,64 @@ describe("runWithWatchdog", () => {
     });
     assert.notEqual(result, TIMEOUT_SENTINEL);
     assert.equal(result.stderrMarkerHit, false, "no marker present -> no hit");
+  });
+});
+
+describe("sanePositiveSec", () => {
+  // Existing contract (rounds 2-3): a sane positive value passes through, and
+  // 0 / negative / NaN / Infinity / non-number all fall back. These must be
+  // preserved by the int32-overflow clamp added in round 5.
+  it("passes through a normal positive value unchanged", () => {
+    assert.equal(sanePositiveSec(120, 999), 120);
+    assert.equal(sanePositiveSec(1, 999), 1);
+    assert.equal(sanePositiveSec(MAX_SANE_SEC, 999), MAX_SANE_SEC, "the cap itself passes through");
+  });
+
+  it("falls back for 0 / negative / NaN / non-finite / non-number", () => {
+    assert.equal(sanePositiveSec(0, 77), 77, "zero -> fallback");
+    assert.equal(sanePositiveSec(-5, 77), 77, "negative -> fallback");
+    assert.equal(sanePositiveSec(Number.NaN, 77), 77, "NaN -> fallback");
+    assert.equal(sanePositiveSec(Infinity, 77), 77, "Infinity is not finite -> fallback");
+    assert.equal(sanePositiveSec(-Infinity, 77), 77, "-Infinity -> fallback");
+    assert.equal(sanePositiveSec("300", 77), 77, "string -> fallback");
+    assert.equal(sanePositiveSec(null, 77), 77, "null -> fallback");
+    assert.equal(sanePositiveSec(undefined, 77), 77, "undefined -> fallback");
+  });
+
+  // ROUND 5 (Finding: int32-overflow self-DoS): callers do `seconds * 1000` and
+  // pass to setTimeout, whose int32 delay SILENTLY clamps anything over
+  // 2_147_483_647 ms down to 1ms. So a huge configured timeoutSec like 3_000_000
+  // would fire the watchdog at ~1ms and force-kill EVERY review (TIMEOUT_SENTINEL)
+  // — a self-DoS. The clamp keeps seconds×1000 under the int32 max.
+  it("clamps an absurdly large value to MAX_SANE_SEC (int32-overflow guard)", () => {
+    assert.equal(sanePositiveSec(3_000_000, 120), MAX_SANE_SEC, "3e6 s is clamped to the cap");
+    assert.equal(sanePositiveSec(1e12, 120), MAX_SANE_SEC, "even 1e12 s is clamped");
+    const clamped = sanePositiveSec(3_000_000, 120);
+    assert.ok(clamped <= 2_147_483, "returned seconds must be <= 2_147_483 for a huge input");
+    assert.ok(clamped * 1000 <= 2_147_483_647, "seconds*1000 must stay within int32 (no setTimeout clamp)");
+  });
+
+  // End-to-end proof: a STREAMING child run under runWithWatchdog with a HUGE
+  // configured inactivity/hard-cap (passed through sanePositiveSec, as the real
+  // callers do) must NOT be killed at ~1ms. Pre-fix the 3e9 ms delay clamps to
+  // 1ms and TIMEOUT_SENTINEL fires instantly; post-fix the clamped timers let the
+  // child finish normally.
+  it("a streaming child with a huge configured timeout is NOT killed at 1ms", async () => {
+    // Same shape as the callers: configured seconds -> sanePositiveSec -> *1000.
+    const inactivityMs = sanePositiveSec(3_000_000, 120) * 1000;
+    const hardCapMs = sanePositiveSec(3_000_000, 1800) * 1000;
+    // Emits a chunk every 60ms, 5 times (~300ms), then exits 0. If the timers had
+    // overflowed to 1ms this would be force-killed almost immediately.
+    const child = spawnNode(
+      "let n=0;const t=setInterval(()=>{process.stdout.write('.');if(++n>=5){clearInterval(t);process.exit(0);}},60);"
+    );
+    const start = Date.now();
+    const result = await runWithWatchdog(child, { inactivityMs, hardCapMs });
+    const elapsed = Date.now() - start;
+    assert.notEqual(result, TIMEOUT_SENTINEL, "huge configured timeout must NOT force-kill (no int32 overflow to 1ms)");
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout.length, 5, "all 5 streamed chunks captured");
+    assert.ok(elapsed >= 250, `child must have run its full ~300ms, not been killed at ~1ms (took ${elapsed}ms)`);
   });
 });
 

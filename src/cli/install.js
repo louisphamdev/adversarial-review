@@ -22,6 +22,7 @@ import { readFile, writeFile, mkdir, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 
 import { mergeConfig, applyPolicyFloor, deepAssign, DEFAULT_CONFIG } from "../core/config.js";
 import { HOSTS } from "../hosts/index.js";
@@ -69,6 +70,81 @@ const MODE_RANK = new Map([
   ["enforced", 1],
   ["strict-ci", 2],
 ]);
+
+// The recognized policy modes (mirrors KNOWN_MODES in src/core/config.js). Used
+// to validate the explicit `--mode` flag.
+const KNOWN_MODES = new Set(["soft", "enforced", "strict-ci"]);
+
+/**
+ * Canonicalize a policy mode value to a known mode string (mirrors the private
+ * canonicalizeMode in src/core/config.js). Any unrecognized value — non-string,
+ * typo, case/whitespace variant, or garbage — maps to the secure default
+ * "enforced" (fail-closed). Kept local because the core helper is not exported.
+ *
+ * @param {*} mode
+ * @returns {"soft"|"enforced"|"strict-ci"}
+ */
+function canonicalizeMode(mode) {
+  if (typeof mode === "string") {
+    const m = mode.trim().toLowerCase();
+    if (KNOWN_MODES.has(m)) return m;
+  }
+  return "enforced";
+}
+
+// The strictest mode the installer will EVER write as the user-level floor on a
+// first install. The floor mode is derived ONLY from trusted inputs (this
+// constant, an existing user floor, and an explicit operator --mode flag) — it
+// is NEVER taken from the UNTRUSTED project config, so a cloned repo's
+// `{"policy":{"mode":"soft"}}` can never lower the installed floor below this.
+const MIN_FLOOR_MODE = "enforced";
+
+/**
+ * Compute the policy-floor MODE to write from TRUSTED inputs only.
+ *
+ * The floor mode is the STRICTEST of:
+ *   - MIN_FLOOR_MODE ("enforced") — the fail-closed default floor;
+ *   - the existing user floor's mode (a prior operator choice — may already be
+ *     stricter, e.g. "strict-ci");
+ *   - an explicit operator `--mode` flag (canonicalized).
+ *
+ * The UNTRUSTED project config is deliberately NOT an input here. Deriving the
+ * floor from the project config (the old behavior) let a cloned repo's
+ * `{"policy":{"mode":"soft"}}` install a `soft` floor (the weakest rank), and
+ * the tighten-only ratchet could never recover — the gate would be installed
+ * fail-open. (FINDING 1, ROUND 5.)
+ *
+ * @param {object} existingFloor    - parsed existing policy.json (or {})
+ * @param {string|null} explicitMode - canonicalized --mode flag, or null
+ * @returns {"soft"|"enforced"|"strict-ci"} the floor mode to write
+ */
+function resolveFloorMode(existingFloor, explicitMode) {
+  const efPolicy =
+    existingFloor && typeof existingFloor === "object" && !Array.isArray(existingFloor)
+      ? existingFloor.policy && typeof existingFloor.policy === "object"
+        ? existingFloor.policy
+        : existingFloor
+      : {};
+
+  // Start at the fail-closed minimum, then ratchet UP toward the strictest of
+  // the existing floor mode and an explicit operator choice. Each candidate is
+  // canonicalized; an unknown existing-floor value is ignored (rank stays at the
+  // minimum) rather than treated as the loosest.
+  let bestRank = MODE_RANK.get(MIN_FLOOR_MODE);
+  let best = MIN_FLOOR_MODE;
+  const consider = (mode) => {
+    if (mode == null) return;
+    const canon = canonicalizeMode(mode);
+    const rank = MODE_RANK.get(canon);
+    if (rank > bestRank) {
+      bestRank = rank;
+      best = canon;
+    }
+  };
+  if (MODE_RANK.has(efPolicy.mode)) consider(efPolicy.mode);
+  if (explicitMode != null) consider(explicitMode);
+  return best;
+}
 
 /**
  * Compute the user-level policy.json floor to write so a cloned repo's project
@@ -143,7 +219,7 @@ function computePolicyFloorToWrite(existingFloor, chosenMode) {
  * Parse the install command's argv array into structured options.
  *
  * @param {string[]} argv
- * @returns {{ hosts: string[], reviewerMap: Map<string,string>, dryRun: boolean, projectConfigPath: string|null, userScope: boolean }}
+ * @returns {{ hosts: string[], reviewerMap: Map<string,string>, dryRun: boolean, projectConfigPath: string|null, userScope: boolean, modeFlag: string|null }}
  */
 function parseArgs(argv) {
   const hosts = [];
@@ -151,6 +227,11 @@ function parseArgs(argv) {
   let dryRun = false;
   let projectConfigPath = null;
   let userScope = false;
+  // Explicit operator enforcement mode for the user-level policy floor. This is
+  // the ONLY way an install can RAISE the floor above the fail-closed default
+  // ("enforced") from the command line; the UNTRUSTED project config can never
+  // set it. A value is canonicalized at use; an unknown value is rejected.
+  let modeFlag = null;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -160,6 +241,11 @@ function parseArgs(argv) {
       // Machine-wide install: write to <home>/.adversarial-review/config.json
       // and merge hooks into <home>/.claude/settings.json instead of cwd.
       userScope = true;
+    } else if (arg === "--mode" && argv[i + 1]) {
+      modeFlag = argv[i + 1].trim();
+      i++;
+    } else if (arg.startsWith("--mode=")) {
+      modeFlag = arg.slice("--mode=".length).trim();
     } else if (arg === "--hosts" && argv[i + 1]) {
       // Accept either `--hosts a,b` or `--hosts a --hosts b`.
       argv[i + 1].split(",").forEach((h) => hosts.push(h.trim()));
@@ -179,7 +265,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { hosts, reviewerMap, dryRun, projectConfigPath, userScope };
+  return { hosts, reviewerMap, dryRun, projectConfigPath, userScope, modeFlag };
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +496,15 @@ async function checkReviewerAvailability(reviewerId, config, env) {
 async function atomicWrite(filePath, content, mode = 0o600) {
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.tmp${Date.now()}`;
-  await writeFile(tmp, content, { encoding: "utf8", mode });
+  // FINDING 3 (ROUND 5): the temp name must be UNPREDICTABLE. A predictable
+  // `${filePath}.tmp${Date.now()}` let a local attacker pre-create a SYMLINK at
+  // the guessed temp path so our write followed the link and clobbered an
+  // arbitrary target with our content (run as the installing user). Use a
+  // crypto-random suffix so the path cannot be guessed, AND open with the "wx"
+  // flag (O_EXCL) so the write FAILS rather than follows a pre-existing symlink
+  // or file at that path — closing the race entirely.
+  const tmp = `${filePath}.tmp.${randomUUID()}`;
+  await writeFile(tmp, content, { encoding: "utf8", mode, flag: "wx" });
   // node:fs rename is atomic on POSIX; on Windows it will overwrite on Node 14+.
   const { rename, rm } = await import("node:fs/promises");
   try {
@@ -420,7 +513,7 @@ async function atomicWrite(filePath, content, mode = 0o600) {
     // The temp file was written but the rename failed (cross-device link, target
     // locked by another process on Windows, concurrent install). Clean up the
     // orphaned temp file so repeated failed installs do not accumulate
-    // `.tmp<ts>` litter in .adversarial-review/ and .claude/, then re-throw so
+    // `.tmp<uuid>` litter in .adversarial-review/ and .claude/, then re-throw so
     // the caller still sees the failure.
     await rm(tmp, { force: true }).catch(() => {});
     throw err;
@@ -440,7 +533,26 @@ export async function installCommand(argv, io) {
   const env = io.env || process.env;
   const home = resolveHomeDir(env);
 
-  const { hosts, reviewerMap, dryRun, projectConfigPath, userScope } = parseArgs(argv);
+  const { hosts, reviewerMap, dryRun, projectConfigPath, userScope, modeFlag } = parseArgs(argv);
+
+  // Validate the explicit --mode flag up front so a typo is a clear usage error
+  // rather than silently coerced. Canonicalize only KNOWN values; anything else
+  // is rejected. (When absent, the floor falls back to the fail-closed default.)
+  let explicitMode = null;
+  if (modeFlag != null && modeFlag !== "") {
+    const canon = canonicalizeMode(modeFlag);
+    // canonicalizeMode maps garbage to "enforced", so re-validate the raw input
+    // against KNOWN_MODES to distinguish a real "enforced" from a coerced typo.
+    if (!KNOWN_MODES.has(modeFlag.toLowerCase())) {
+      io.stderr.write(
+        `adversarial-review install: unknown --mode "${modeFlag}". ` +
+          `Known modes: ${[...KNOWN_MODES].join(", ")}.\n`
+      );
+      process.exitCode = 2;
+      return;
+    }
+    explicitMode = canon;
+  }
 
   // Scope base: the directory whose .adversarial-review/config.json and
   // .claude/settings.json we write. User scope targets <home>; default targets
@@ -699,7 +811,15 @@ export async function installCommand(argv, io) {
   // ratcheting over (never clobbering) any existing stricter floor. Idempotent:
   // when the existing floor already covers every dimension, no write is queued.
   // User-level + security-sensitive -> mode 0o600.
-  const chosenMode = resolvedConfig.policy?.mode || DEFAULT_CONFIG.policy.mode;
+  //
+  // FINDING 1 (ROUND 5): the floor mode is derived from TRUSTED inputs ONLY —
+  // the fail-closed minimum ("enforced"), any existing user floor, and an
+  // explicit operator --mode flag. It is NEVER taken from resolvedConfig.policy
+  // .mode, which (on a first install with no user floor) is the UNTRUSTED project
+  // config: a cloned repo's `{"policy":{"mode":"soft"}}` would otherwise install
+  // a `soft` floor (the weakest rank) and the tighten-only ratchet could never
+  // recover — the gate would be installed fail-open.
+  const chosenMode = resolveFloorMode(userPolicyFloor, explicitMode);
   const floorToWrite = computePolicyFloorToWrite(userPolicyFloor, chosenMode);
   if (floorToWrite) {
     plannedWrites.push({
@@ -867,6 +987,105 @@ export async function installCommand(argv, io) {
 // Helper: build the project config object to serialize to disk.
 // ---------------------------------------------------------------------------
 
+// FINDING 2 (ROUND 5) — per-section key WHITELISTS for the config the installer
+// WRITES. The installer used to shallow-copy EVERY key from the UNTRUSTED project
+// config (overriding only reviewer/readOnlyConfig/agent), laundering hostile keys
+// into the written (and, for --global, user-TRUSTED) config: e.g.
+// `reviewers.<id>.command:"/bin/sh -c echo APPROVED"` (an always-pass custom
+// command), `hosts.<h>.skipPatterns:["**/*"]`, `thresholds.bigDiffLines:999999`,
+// or a `trusted:true` grant. We now keep ONLY known-safe keys per section and
+// STRIP everything else (command, args, type, trusted, skipPatterns, unknown
+// keys) before writing. The runtime trust floor (load-config.js) strips
+// PROJECT-layer dangerous values at READ time; this strips them at WRITE time so
+// they are never persisted (and never honored if the file is later read as a
+// trusted user/global config).
+const HOST_SAFE_KEYS = new Set(["reviewer"]);
+const REVIEWER_SAFE_KEYS = new Set([
+  "readOnlyConfig",
+  "agent",
+  "models",
+  "requiredDimensions",
+  "timeoutSec",
+]);
+const POLICY_SAFE_KEYS = new Set([
+  "mode",
+  "reviewScope",
+  "onReviewerError",
+  "onInternalError",
+  "onBlockCap",
+  "allowSkip",
+  "allowAdvisoryHosts",
+]);
+const THRESHOLD_SAFE_KEYS = new Set([
+  "bigDiffLines",
+  "bigFileCount",
+  "debateDiffLines",
+  "debateFileCount",
+  "debateOnSensitive",
+]);
+const RUNTIME_SAFE_KEYS = new Set([
+  "blockCap",
+  "stateTtlDays",
+  "timeoutSec",
+  "baselineRef",
+]);
+const PRIVACY_SAFE_KEYS = new Set([
+  "externalReview",
+  "secretScan",
+  "tempFileMode",
+]);
+const SENSITIVITY_SAFE_KEYS = new Set(["extraSensitive", "extraCodeExts"]);
+
+/**
+ * Return a shallow copy of `obj` keeping ONLY keys present in `allowed`. Any
+ * unknown / dangerous key is dropped. Non-object input yields {}.
+ *
+ * @param {*} obj
+ * @param {Set<string>} allowed
+ * @returns {object}
+ */
+function pickSafe(obj, allowed) {
+  const out = {};
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+  for (const [key, value] of Object.entries(obj)) {
+    if (allowed.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Whitelist-sanitize a `hosts` map: each host entry keeps only HOST_SAFE_KEYS
+ * (currently just `reviewer`). Strips skipPatterns / trusted / command / unknown
+ * keys an untrusted project may have injected.
+ *
+ * @param {*} hosts
+ * @returns {object}
+ */
+function sanitizeHostsToWrite(hosts) {
+  const out = {};
+  if (!hosts || typeof hosts !== "object" || Array.isArray(hosts)) return out;
+  for (const [hostId, hostCfg] of Object.entries(hosts)) {
+    out[hostId] = pickSafe(hostCfg, HOST_SAFE_KEYS);
+  }
+  return out;
+}
+
+/**
+ * Whitelist-sanitize a `reviewers` map: each reviewer entry keeps only
+ * REVIEWER_SAFE_KEYS. Strips command / args / type / trusted / unknown keys.
+ *
+ * @param {*} reviewers
+ * @returns {object}
+ */
+function sanitizeReviewersToWrite(reviewers) {
+  const out = {};
+  if (!reviewers || typeof reviewers !== "object" || Array.isArray(reviewers)) return out;
+  for (const [id, entry] of Object.entries(reviewers)) {
+    out[id] = pickSafe(entry, REVIEWER_SAFE_KEYS);
+  }
+  return out;
+}
+
 /**
  * Build the config object to write.  For PROJECT scope we include only the keys
  * that are meaningful for a project config (not DEFAULT_CONFIG boilerplate),
@@ -875,6 +1094,10 @@ export async function installCommand(argv, io) {
  * the machine-wide config is explicit and self-describing. We always run through
  * applyPolicyFloor to ensure we never loosen the user floor.
  *
+ * Every section is WHITELIST-sanitized (FINDING 2): only known-safe keys survive,
+ * so untrusted project-injected keys (command/args/type/trusted/skipPatterns and
+ * any unknown key) are STRIPPED from what we persist.
+ *
  * @param {object} newProjectConfig  - merged project + legacy + install config
  * @param {object} resolvedConfig    - fully resolved config (post applyPolicyFloor)
  * @param {boolean} [fullMachineConfig=false] - emit the full machine-wide config
@@ -882,26 +1105,28 @@ export async function installCommand(argv, io) {
  */
 function buildProjectConfigToWrite(newProjectConfig, resolvedConfig, fullMachineConfig = false) {
   // Start from the project-level config (not DEFAULT_CONFIG) so we don't
-  // flood the project file with defaults.
+  // flood the project file with defaults. hosts is always whitelist-sanitized so
+  // an injected per-host skipPatterns/trusted/command never lands on disk.
   const out = {
     version: resolvedConfig.version,
-    hosts: resolvedConfig.hosts,
+    hosts: sanitizeHostsToWrite(resolvedConfig.hosts),
   };
 
-  // Carry over any explicit policy/threshold/runtime/privacy overrides.
-  if (newProjectConfig.policy) out.policy = resolvedConfig.policy;
-  if (newProjectConfig.thresholds) out.thresholds = resolvedConfig.thresholds;
-  if (newProjectConfig.runtime) out.runtime = resolvedConfig.runtime;
-  if (newProjectConfig.privacy) out.privacy = resolvedConfig.privacy;
-  if (newProjectConfig.reviewers) out.reviewers = resolvedConfig.reviewers;
-  if (newProjectConfig.sensitivity) out.sensitivity = resolvedConfig.sensitivity;
+  // Carry over any explicit policy/threshold/runtime/privacy overrides — each
+  // run through its per-section whitelist so only known-safe keys are written.
+  if (newProjectConfig.policy) out.policy = pickSafe(resolvedConfig.policy, POLICY_SAFE_KEYS);
+  if (newProjectConfig.thresholds) out.thresholds = pickSafe(resolvedConfig.thresholds, THRESHOLD_SAFE_KEYS);
+  if (newProjectConfig.runtime) out.runtime = pickSafe(resolvedConfig.runtime, RUNTIME_SAFE_KEYS);
+  if (newProjectConfig.privacy) out.privacy = pickSafe(resolvedConfig.privacy, PRIVACY_SAFE_KEYS);
+  if (newProjectConfig.reviewers) out.reviewers = sanitizeReviewersToWrite(resolvedConfig.reviewers);
+  if (newProjectConfig.sensitivity) out.sensitivity = pickSafe(resolvedConfig.sensitivity, SENSITIVITY_SAFE_KEYS);
 
   // USER scope: the machine-wide config must be self-describing. Always emit
   // policy.mode and the reviewers block even when no explicit override was given.
   if (fullMachineConfig) {
     if (!out.policy) out.policy = {};
     if (out.policy.mode === undefined) out.policy.mode = resolvedConfig.policy.mode;
-    if (!out.reviewers) out.reviewers = resolvedConfig.reviewers || {};
+    if (!out.reviewers) out.reviewers = sanitizeReviewersToWrite(resolvedConfig.reviewers);
   }
 
   return out;

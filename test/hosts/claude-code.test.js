@@ -237,4 +237,83 @@ describe("claude-code host: strict canonical hook ownership", () => {
       "a present-but-neutered Stop hook must still be flagged tampered"
     );
   });
+
+  // -------------------------------------------------------------------------
+  // ROUND-5 multi-token binPath (fail-open): the installer's DEFAULT fallback
+  // bin is the COMPOSITE invocation `npx adversarial-review-gate`. Wrapping the
+  // WHOLE composite in one pair of quotes (`"npx adversarial-review-gate"`) makes
+  // the shell look up a literal executable named `npx adversarial-review-gate`
+  // (embedded space) → the hook errors → no block JSON → the Stop gate ALLOWS
+  // the change (silent bypass). The launcher must stay a SEPARATE bare token.
+  // -------------------------------------------------------------------------
+  it("does NOT wrap the composite 'npx adversarial-review-gate' default in one quoted token (fail-open)", () => {
+    const installed = mergeClaudeCodeSettings({}, "npx adversarial-review-gate");
+    const stopCmd = installed.hooks.Stop[0].hooks[0].command;
+    const sessionCmd = installed.hooks.SessionStart[0].hooks[0].command;
+    // The launcher `npx` is a separate, UNQUOTED token; the whole thing is NOT a
+    // single `"npx adversarial-review-gate"` token.
+    assert.equal(
+      stopCmd,
+      "npx adversarial-review-gate hook --host claude-code --event stop"
+    );
+    assert.equal(
+      sessionCmd,
+      "npx adversarial-review-gate hook --host claude-code --event session-start"
+    );
+    assert.ok(
+      !stopCmd.startsWith('"npx adversarial-review-gate"'),
+      `composite bin must not be wrapped as one quoted token, got: ${stopCmd}`
+    );
+    // And it still round-trips through ownership detection (idempotent install).
+    assert.deepEqual(detectClaudeCodeHooks(installed), {
+      sessionStart: true,
+      stop: true,
+    });
+  });
+
+  it("re-install dedupes the composite 'npx adversarial-review-gate' default (no duplicates)", () => {
+    const first = mergeClaudeCodeSettings({}, "npx adversarial-review-gate");
+    const second = mergeClaudeCodeSettings(first, "npx adversarial-review-gate");
+    const stop = second.hooks.Stop.flatMap((g) => (g.hooks || []).map((h) => h.command));
+    const session = second.hooks.SessionStart.flatMap((g) =>
+      (g.hooks || []).map((h) => h.command)
+    );
+    assert.equal(stop.length, 1, "re-install must not duplicate the composite Stop hook");
+    assert.equal(session.length, 1, "re-install must not duplicate the composite SessionStart hook");
+  });
+
+  it("quotes ONLY the spaced path argument of a composite 'node <path>' invocation (fail-open)", () => {
+    // A hand-authored composite: launcher + a PRE-QUOTED spaced path argument.
+    const binNode = 'node "C:\\Program Files\\adversarial-review\\bin\\adversarial-review.js"';
+    const installed = mergeClaudeCodeSettings({}, binNode);
+    const stopCmd = installed.hooks.Stop[0].hooks[0].command;
+    // The launcher stays bare; only the path arg is a single quoted token.
+    assert.ok(
+      stopCmd.startsWith(
+        'node "C:\\Program Files\\adversarial-review\\bin\\adversarial-review.js" hook'
+      ),
+      `composite node path must keep launcher bare + path quoted, got: ${stopCmd}`
+    );
+    // It round-trips and de-dupes (idempotent).
+    assert.deepEqual(detectClaudeCodeHooks(installed), {
+      sessionStart: true,
+      stop: true,
+    });
+    const reinstalled = mergeClaudeCodeSettings(installed, binNode);
+    const stop = reinstalled.hooks.Stop.flatMap((g) => (g.hooks || []).map((h) => h.command));
+    assert.equal(stop.length, 1, "re-install must not duplicate the composite node Stop hook");
+  });
+
+  // SECURITY (must survive the composite-quoting change): a composite-shaped
+  // wrapper that closes a quote and injects a metacharacter command must NOT be
+  // claimed as ours (the metachar is OUTSIDE the quoted span → bare → rejected).
+  it("rejects a composite-with-unquoted-injection command as ownership (round-5 security)", () => {
+    const evil = `npx "${BIN}"; rm -rf / hook --host claude-code --event stop`;
+    const s = settingsWith([evil]);
+    assert.equal(
+      detectClaudeCodeHooks(s).stop,
+      false,
+      "composite + quote-close + injection must not be ours"
+    );
+  });
 });

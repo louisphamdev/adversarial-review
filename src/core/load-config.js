@@ -12,6 +12,7 @@
 // user-level and never under `cwd`.
 
 import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_CONFIG, sanitizeProjectConfig, deepAssign, applyPolicyFloor } from "./config.js";
@@ -52,6 +53,43 @@ async function readJsonTolerant(file, io, label) {
 }
 
 /**
+ * Whether the project config file's REAL path stays inside the workspace root,
+ * so a committed symlink cannot redirect the read to an out-of-tree file.
+ *
+ * Returns true when the file does not exist / cannot be resolved (the tolerant
+ * reader then yields `{}`), and when the resolved path is contained in the
+ * resolved workspace root. Returns false ONLY when the resolved file escapes the
+ * workspace — in which case the caller treats the project config as absent.
+ *
+ * @param {string} cwd
+ * @param {string} fullPath  - <cwd>/.adversarial-review/config.json
+ * @param {object} [io]      - { stderr }
+ * @returns {boolean}
+ */
+function projectConfigWithinWorkspace(cwd, fullPath, io) {
+  let rootReal;
+  let fileReal;
+  try {
+    rootReal = realpathSync(cwd);
+  } catch {
+    return true; // can't resolve the root: let the tolerant reader handle it
+  }
+  try {
+    fileReal = realpathSync(fullPath);
+  } catch {
+    return true; // file missing / unreadable: tolerant reader returns {}
+  }
+  const rel = path.relative(rootReal, fileReal);
+  const inside = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  if (!inside && io?.stderr) {
+    io.stderr.write(
+      `adversarial-review: ignoring project config whose real path escapes the workspace: ${fullPath}\n`
+    );
+  }
+  return inside;
+}
+
+/**
  * Load the effective config for a workspace.
  *
  * Merge precedence (lowest to highest):
@@ -79,11 +117,18 @@ export async function loadEffectiveConfig(cwd, io = {}) {
     io,
     "user config"
   );
-  const projectConfig = await readJsonTolerant(
-    path.join(cwd, PROJECT_CONFIG_REL),
-    io,
-    "project config"
-  );
+  // The PROJECT config lives in the (untrusted) repo. A hostile repo could
+  // commit `.adversarial-review/config.json` as a SYMLINK pointing OUTSIDE the
+  // workspace (e.g. -> ~/.aws/credentials.json) to make the gate read an
+  // arbitrary file (a parse-error then leaks a fragment to stderr, or an
+  // attacker-controlled out-of-tree file is used as config). Read it ONLY when
+  // its real path stays inside the workspace; otherwise treat it as absent. The
+  // user config + policy floor live under the trusted home dir, so they are not
+  // guarded.
+  const projectConfigPath = path.join(cwd, PROJECT_CONFIG_REL);
+  const projectConfig = projectConfigWithinWorkspace(cwd, projectConfigPath, io)
+    ? await readJsonTolerant(projectConfigPath, io, "project config")
+    : {};
   const userPolicyFloor = await readJsonTolerant(
     path.join(home, USER_POLICY_REL),
     io,
@@ -134,6 +179,11 @@ export async function loadEffectiveConfig(cwd, io = {}) {
   // could produce an empty diff and BYPASS the gate; `runtime.timeoutSec` /
   // `blockCap` are security timers a project could DoS. None are project-tunable.
   merged.runtime = structuredClone(baseline.runtime);
+
+  // The config schema `version` selects how the runtime interprets the config;
+  // an untrusted project must not be able to downgrade it (a v1 interpretation
+  // could skip invariants the v2 schema enforces). Pin it to the baseline.
+  merged.version = baseline.version;
 
   // The temp-file permission mode is a security setting (a loose mode leaks the
   // diff/brief to other local users); pin it so a project cannot relax it.
@@ -259,23 +309,29 @@ function applyReviewerTrustFloor(merged, userConfig) {
         ? userReviewers[id]
         : null;
 
-    // Trust floor: only the user config can grant trust.
-    if (entry.trusted === true && userEntry?.trusted !== true) {
+    // Trust floor: only the user config can grant trust. A project may set a
+    // TRUTHY NON-BOOLEAN (`trusted:1`, `"true"`, `[true]`) that a `=== true`
+    // guard misses; coerce ANY value the user did not explicitly confirm to a
+    // strict `false`, and canonicalize a user-confirmed grant to `true`.
+    if (userEntry?.trusted === true) {
+      entry.trusted = true;
+    } else if ("trusted" in entry) {
       entry.trusted = false;
     }
 
-    // Security-relevant reviewer fields a PROJECT layer must NEVER set, for
-    // EVERY reviewer (built-in opencode/codex AND custom):
-    //   - models: the fallback model list — a hostile repo could pin a
-    //     weak/colluding model to obtain a rubber-stamp review;
-    //   - requiredDimensions: the review dimensions — a project could shrink it
-    //     to [] to weaken the review;
-    //   - timeoutSec: the reviewer timeout — a project could set 0/negative to
-    //     instantly time the reviewer out (DoS / wedge the gate).
-    // All three are sourced from the trusted USER config ONLY (the plugin ships
-    // no per-reviewer defaults); any project-supplied value is dropped so it
-    // fails closed to the gate's built-in defaults.
-    for (const field of ["models", "requiredDimensions", "timeoutSec"]) {
+    // Security-relevant reviewer fields a PROJECT layer must NEVER set, for EVERY
+    // reviewer (built-in opencode/codex AND custom). Each is sourced from the
+    // trusted USER config ONLY; any project-supplied value is dropped:
+    //   - type:    the ADAPTER selector — a project must not turn a built-in into
+    //              a custom reviewer, nor redirect it to a different adapter with
+    //              different isolation properties;
+    //   - command/args: a custom reviewer's executable + args — never project-set;
+    //   - models:  the fallback model list (no weak/colluding rubber-stamp model);
+    //   - requiredDimensions: the review dimensions (no shrinking to []);
+    //   - timeoutSec: the reviewer timeout (no 0/negative DoS).
+    // The plugin ships no per-reviewer defaults, so a dropped field fails closed
+    // to the gate's built-in defaults / a runtime rejection.
+    for (const field of ["type", "command", "args", "models", "requiredDimensions", "timeoutSec"]) {
       if (userEntry && field in userEntry && userEntry[field] !== undefined) {
         entry[field] = structuredClone(userEntry[field]);
       } else {
@@ -283,41 +339,18 @@ function applyReviewerTrustFloor(merged, userConfig) {
       }
     }
 
-    // Custom-reviewer floor: type/command/args AND the readOnlyConfig isolation
-    // assertion come from the user config only (requiredDimensions/timeoutSec
-    // are already handled by the generic field floor above).
-    const isCustom = entry.type === "custom" || userEntry?.type === "custom";
-    if (isCustom) {
-      if (userEntry && userEntry.type === "custom") {
-        // Take the type/command/args from the trusted user config, dropping any
-        // project-supplied values.
-        entry.type = "custom";
-        if ("command" in userEntry) {
-          entry.command = userEntry.command;
-        } else {
-          delete entry.command;
-        }
-        if ("args" in userEntry) {
-          entry.args = structuredClone(userEntry.args);
-        } else {
-          delete entry.args;
-        }
-        // readOnlyConfig is the SOLE isolation assertion for a custom reviewer
-        // (no bundled-agent anchor). Source it ONLY from the trusted user config;
-        // a project-set value must NEVER grant isolation. Coerce to a strict
-        // boolean so a non-true user value cannot accidentally assert isolation.
-        entry.readOnlyConfig = userEntry.readOnlyConfig === true;
-      } else {
-        // The user config did not define this custom reviewer. Strip any
-        // project-supplied command/args so it fails closed (no command -> rejected
-        // at runtime). Keep type so the custom adapter still recognizes the entry
-        // and refuses it via the missing-command / untrusted checks. Also strip
-        // the readOnlyConfig isolation flag a project may have injected
-        // (models/requiredDimensions/timeoutSec were already cleared above).
-        delete entry.command;
-        delete entry.args;
-        delete entry.readOnlyConfig;
-      }
+    // readOnlyConfig (isolation assertion):
+    //  - CUSTOM reviewer (user-declared type:"custom"): the SOLE isolation
+    //    assertion (no bundled-agent anchor) — sourced from the trusted user
+    //    config only, coerced to a strict boolean;
+    //  - built-in opencode/codex: a project value is intentionally allowed, since
+    //    their isolation is anchored to the forced bundled read-only agent /
+    //    sandbox in enforced/strict, not to this flag;
+    //  - any OTHER (unknown) reviewer id a project injected: strip it.
+    if (entry.type === "custom") {
+      entry.readOnlyConfig = userEntry?.readOnlyConfig === true;
+    } else if (id !== "opencode" && id !== "codex") {
+      delete entry.readOnlyConfig;
     }
   }
   return merged;

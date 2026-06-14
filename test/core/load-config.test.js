@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadEffectiveConfig, resolveStateDir, resolveHomeDir } from "../../src/core/load-config.js";
@@ -225,6 +225,42 @@ describe("loadEffectiveConfig with user-level config", () => {
     await writeJson(join(cwd, CONFIG_REL), { sensitivity: { extraSensitive: [] } }); // try to drop them
     const cfg = await loadEffectiveConfig(cwd, io());
     assert.ok(cfg.sensitivity.extraSensitive.includes("infra/.*"), "user sensitive pattern survives");
+  });
+
+  it("R5: project cannot grant trust via a TRUTHY NON-BOOLEAN value", async () => {
+    await writeJson(join(cwd, CONFIG_REL), { reviewers: { ev: { type: "custom", trusted: 1, command: "x" } } });
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.notEqual(cfg.reviewers.ev?.trusted, 1, "`trusted:1` must not survive");
+    assert.notEqual(cfg.reviewers.ev?.trusted, true, "project must not self-grant trust");
+  });
+
+  it("R5: project cannot change a built-in reviewer's adapter TYPE or inject a command", async () => {
+    await writeJson(join(home, CONFIG_REL), { reviewers: { opencode: { readOnlyConfig: true } } });
+    await writeJson(join(cwd, CONFIG_REL), { reviewers: { opencode: { type: "custom", command: "echo pass" } } });
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.notEqual(cfg.reviewers.opencode.type, "custom", "project cannot make opencode a custom adapter");
+    assert.equal(cfg.reviewers.opencode.command, undefined, "injected command dropped");
+    assert.equal(cfg.reviewers.opencode.readOnlyConfig, true, "opencode readOnlyConfig preserved (anchored)");
+  });
+
+  it("R5: project cannot downgrade the config schema version", async () => {
+    await writeJson(join(cwd, CONFIG_REL), { version: 1, policy: { mode: "soft" } });
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.equal(cfg.version, 2, "version pinned to baseline");
+  });
+
+  it("R5: a symlinked project config escaping the workspace is ignored", async (t) => {
+    if (process.platform === "win32") return t.skip("symlink creation needs privilege on win32");
+    const outside = await mkdtemp(join(tmpdir(), "ar-outside-"));
+    try {
+      await writeFile(join(outside, "evil.json"), JSON.stringify({ policy: { mode: "soft" } }));
+      await mkdir(join(cwd, ".adversarial-review"), { recursive: true });
+      await symlink(join(outside, "evil.json"), join(cwd, CONFIG_REL));
+      const cfg = await loadEffectiveConfig(cwd, io());
+      assert.equal(cfg.policy.mode, "enforced", "escaping-symlink project config ignored -> default enforced");
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("user policy floor cannot be loosened by user config", async () => {

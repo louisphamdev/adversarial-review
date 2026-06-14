@@ -1,8 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm, mkdir, symlink, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { mkdtemp, writeFile, rm, mkdir, symlink, readFile, realpath } from "node:fs/promises";
+import { join, sep } from "node:path";
+import { tmpdir, platform } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   captureBaseline,
@@ -886,5 +886,187 @@ describe("git() bounds stderr accumulation", () => {
       /stderrBytes\s*>=\s*MAX_STDERR_BYTES|stderrBytes\s*\+/.test(src),
       "git.js must bound stderr accumulation against the cap"
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND5 finding 2 — deterministic snapshot/diff order: the SAME change set must
+// yield an IDENTICAL diffHash regardless of the underlying filesystem's readdir
+// order, so the review cache does not suffer spurious misses across runs/OSes.
+// snapshotWorkspace sorts each directory's entries by name to remove the
+// dependence on readdir order.
+// ---------------------------------------------------------------------------
+
+describe("snapshot/diff order is deterministic (round5 #2)", () => {
+  let dir;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-determinism-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("produces an identical diffHash for the same change set regardless of file creation order", async () => {
+    // Two workspaces with byte-identical content but files created in OPPOSITE
+    // order. On filesystems where readdir reflects creation/inode order, an
+    // unsorted walk would emit diff blocks in different order -> different
+    // diffHash (a spurious cache miss). The entry-sort fix makes both identical.
+    const buildWs = async (label, names) => {
+      const ws = join(dir, label);
+      await mkdir(join(ws, "sub"), { recursive: true });
+      const baseline = await captureBaseline(ws); // empty baseline
+      for (const n of names) {
+        await writeFile(join(ws, n), `const ${n[0]} = 1;\n`);
+      }
+      await writeFile(join(ws, "sub", "z.js"), "const z = 1;\n");
+      const diff = await buildReviewDiff(ws, baseline);
+      return diff.diffHash;
+    };
+
+    const order1 = ["c.js", "a.js", "b.js", "m.js"];
+    const order2 = [...order1].reverse(); // m, b, a, c
+    const h1 = await buildWs("order1", order1);
+    const h2 = await buildWs("order2", order2);
+    assert.equal(
+      h1,
+      h2,
+      "diffHash must be identical for the same content created in different order"
+    );
+  });
+
+  it("emits diff blocks in deterministic sorted order in the diff text", async () => {
+    // The synthesized diff text must list file blocks in a stable, sorted order
+    // so it hashes the same across runs/OSes for the same change set.
+    const ws = join(dir, "blockorder");
+    await mkdir(ws, { recursive: true });
+    const baseline = await captureBaseline(ws);
+    for (const n of ["d.js", "a.js", "c.js", "b.js"]) {
+      await writeFile(join(ws, n), `const ${n[0]} = 1;\n`);
+    }
+    const diff = await buildReviewDiff(ws, baseline);
+    const blockOrder = [...diff.text.matchAll(/diff --git a\/([^ ]+) b\//g)].map((m) => m[1]);
+    assert.deepEqual(
+      blockOrder,
+      ["a.js", "b.js", "c.js", "d.js"],
+      "diff blocks must appear in sorted order"
+    );
+  });
+
+  it("orders snapshot entries within a directory by name (stable across runs)", async () => {
+    const ws = join(dir, "ordered");
+    await mkdir(ws, { recursive: true });
+    // Creation order is intentionally NOT alphabetical.
+    for (const n of ["zebra.txt", "alpha.txt", "mango.txt", "beta.txt"]) {
+      await writeFile(join(ws, n), "x\n");
+    }
+    const { files } = await snapshotWorkspace(ws);
+    const keys = [...files.keys()];
+    const sorted = [...keys].sort();
+    assert.deepEqual(
+      keys,
+      sorted,
+      "single-directory snapshot keys must be in sorted (deterministic) order"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROUND5 finding 1 — workspace-escape guard: a directory entry that resolves
+// OUTSIDE the canonical workspace root (Windows NTFS junction via `mklink /J`,
+// or any symlinked directory that slips past the symlink branch) must NOT be
+// recursed into. Otherwise the walk reads external files into the snapshot and
+// a junction to a huge tree (e.g. C:\Windows) overflows maxFiles -> truncation.
+// The cross-platform fix resolves each directory's realpath and recurses only
+// when it stays within the root.
+// ---------------------------------------------------------------------------
+
+describe("workspace-escape guard for junction/symlinked dirs (round5 #1)", () => {
+  let dir;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-escape-"));
+  });
+
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // POSIX repro: a symlinked DIRECTORY pointing outside the workspace. (On
+  // Windows the equivalent is an NTFS junction, covered by the test below;
+  // a directory symlink also requires privilege on Windows so this case is
+  // skipped there.)
+  it("does not read external files via a symlinked directory that escapes the root", async (t) => {
+    const ws = join(dir, "ws-symdir");
+    const outside = join(dir, "OUTSIDE-symdir");
+    await mkdir(ws, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(ws, "inside.txt"), "in\n");
+    await writeFile(join(outside, "EXTERNAL_SECRET.txt"), "leaked external content\n");
+
+    // Create a directory symlink inside the workspace -> outside. Needs
+    // privilege on Windows; skip gracefully if denied/unsupported.
+    try {
+      await symlink(outside, join(ws, "escape"), "dir");
+    } catch (err) {
+      return t.skip(`directory symlink unsupported here: ${err.code || err.message}`);
+    }
+
+    const { files } = await snapshotWorkspace(ws);
+    const keys = [...files.keys()];
+    assert.ok(keys.includes("inside.txt"), "the in-workspace file must be captured");
+    assert.equal(
+      keys.some((k) => k.includes("EXTERNAL_SECRET")),
+      false,
+      "an external file must NOT be read in via the escaping directory link"
+    );
+  });
+
+  // Windows repro: an NTFS junction (mklink /J) reports isDirectory()=true and
+  // isSymbolicLink()=false on some Node/OS combos, so it can slip past the
+  // symlink branch and be walked as a real directory. The realpath containment
+  // guard must stop the walk from escaping the workspace root.
+  it("does not recurse into an NTFS junction that escapes the root (windows)", async (t) => {
+    if (platform() !== "win32") return t.skip("junction repro is windows-only");
+    const ws = join(dir, "ws-junc");
+    const outside = join(dir, "OUTSIDE-junc");
+    await mkdir(ws, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(ws, "inside.txt"), "in\n");
+    await writeFile(join(outside, "EXTERNAL_SECRET.txt"), "leaked external content\n");
+
+    const r = spawnSync("cmd", ["/c", "mklink", "/J", join(ws, "junc"), outside], {
+      encoding: "utf8",
+    });
+    if (r.status !== 0) {
+      return t.skip(`junction creation unsupported here: ${r.stderr || r.stdout}`);
+    }
+
+    const { files } = await snapshotWorkspace(ws);
+    const keys = [...files.keys()];
+    assert.ok(keys.includes("inside.txt"), "the in-workspace file must be captured");
+    assert.equal(
+      keys.some((k) => k.includes("EXTERNAL_SECRET")),
+      false,
+      "an external file must NOT be read in via the junction"
+    );
+  });
+
+  // Containment must NOT reject a legitimate in-workspace sibling whose path
+  // merely SHARES the root as a string prefix (".../ws" vs ".../ws-evil"), and
+  // must keep walking ordinary nested directories.
+  it("still walks ordinary nested directories within the workspace", async () => {
+    const ws = join(dir, "ws-normal");
+    await mkdir(join(ws, "nested", "deeper"), { recursive: true });
+    await writeFile(join(ws, "top.txt"), "1\n");
+    await writeFile(join(ws, "nested", "mid.txt"), "2\n");
+    await writeFile(join(ws, "nested", "deeper", "leaf.txt"), "3\n");
+
+    const { files } = await snapshotWorkspace(ws);
+    const keys = [...files.keys()];
+    assert.ok(keys.includes("top.txt"));
+    assert.ok(keys.includes("nested/mid.txt"));
+    assert.ok(keys.includes("nested/deeper/leaf.txt"), "deeply nested in-root files must be walked");
   });
 });

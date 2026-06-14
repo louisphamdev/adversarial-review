@@ -181,6 +181,18 @@ function reviewableChangedPaths(changedFiles, config) {
 // detection/freshness is intact), but the reviewer never SAW the post-cap bytes.
 const TRUNCATION_MARKER = "coverage limitation: diff text capped at";
 
+// The marker withTruncationMarker (diff.js) appends when a WHOLE `git diff`
+// stdout exceeded git.js's 64 MiB buffer cap. Unlike TRUNCATION_MARKER this is
+// NOT per-file: the tail of the diff (everything past the 64 MiB cap) is missing
+// entirely, so it cannot be mapped to a specific changed file. A reviewer never
+// saw that tail, yet diff/payload hashes bind only to the captured (truncated)
+// text — so a malicious payload placed past the cap would pass review unseen.
+// This must be treated as a GLOBAL coverage limitation (block enforced/strict,
+// advisory soft) before any pass is accepted. (audit ROUND5 finding 1 / GPT-5.5)
+// Must match the exact text emitted by diff.js withTruncationMarker.
+const GIT_OUTPUT_TRUNCATION_MARKER =
+  "[git output truncated: exceeded buffer cap; diff is incomplete]";
+
 // Reviewable changed files whose diff text was truncated at the size cap, so the
 // reviewer could not have seen the full change. A "pass" cannot be trusted for
 // such a file (a malicious payload could hide past the cap) even though the
@@ -204,6 +216,16 @@ function truncatedReviewablePaths(diffText, reviewablePaths) {
     if (reviewable.has(path) && !out.includes(path)) out.push(path);
   }
   return out;
+}
+
+// True when the WHOLE git-diff stdout was truncated at git.js's 64 MiB buffer
+// cap (diff.js withTruncationMarker). This is a GLOBAL coverage limitation: the
+// missing tail cannot be attributed to any specific file, so it is detected with
+// a plain substring scan over the full diff text rather than per-file sectioning.
+// (audit ROUND5 finding 1 / GPT-5.5: a >64 MiB git diff would otherwise pass —
+// the reviewer never saw the tail, and the hashes bind only to the truncated text.)
+function gitOutputTruncated(diffText) {
+  return Boolean(diffText) && String(diffText).includes(GIT_OUTPUT_TRUNCATION_MARKER);
 }
 
 // True when any reviewable changed file is also sensitive.
@@ -520,6 +542,38 @@ function deferredCheckFailure(verdict, job, reviewablePaths) {
   return coverageFailure(verdict, reviewablePaths);
 }
 
+// HARDENING (audit ROUND5 finding 2 / GPT-5.5: forgeable pass cache): a cache HIT
+// is no longer trusted on its own. The cache value MUST be the VALIDATED verdict
+// object that produced the original pass, and on every hit we RE-RUN the exact same
+// acceptance checks against the CURRENT job before honoring it:
+//   - validateVerdict re-binds job_id/diff_hash/payload_hash/reviewer/level and
+//     re-applies the forced-fail rule (any Critical/Important finding => "fail");
+//   - the verdict must still be "pass" after that;
+//   - the deferred checks (payload_hash match + coverage of every reviewable file)
+//     re-run in enforced/strict, exactly as on a fresh pass.
+// A bare `true`, a missing/non-object entry, or any entry that fails revalidation
+// is a cache MISS (returns false) so the gate re-reviews instead of allowing.
+//
+// RESIDUAL RISK: a local agent that controls the user-level state dir can still
+// pre-write a FULL forged verdict object (correct job_id/diff_hash/payload_hash —
+// all deterministic from the current diff) to forge a hit. That is the SAME
+// inherent limitation as native self-review (the gate trusts host/state honesty
+// and cannot cryptographically distinguish an honest reviewer from a colluding one
+// in-process). This fix raises the bar — a trivial `{cache:{<key>:true}}` forge no
+// longer works — but it is NOT airtight. See README "Residual Risks".
+function cachedVerdictHonored(entry, job, reviewablePaths, enforced) {
+  // Only a stored verdict OBJECT can be honored; bare `true`/missing/non-object
+  // entries (incl. the legacy `true` shape and any hand-forged truthy value) MISS.
+  if (!entry || typeof entry !== "object") return false;
+  const revalidated = validateVerdict(entry, job);
+  if (!revalidated.ok) return false;
+  if (revalidated.verdict.verdict !== "pass") return false;
+  if (enforced && deferredCheckFailure(revalidated.verdict, job, reviewablePaths)) {
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Native self-review verification (verdict-based; replaces the old timestamp /
 // sentinel "already_reviewed" branch)
@@ -734,6 +788,32 @@ export async function evaluateGate(input) {
   const cache = state.cache || {};
   const enforced = config.policy.mode === "enforced" || isStrict(config);
 
+  // (6a) GLOBAL GIT-OUTPUT TRUNCATION (audit ROUND5 finding 1 / GPT-5.5): when the
+  // WHOLE `git diff` stdout exceeded git.js's 64 MiB buffer cap, diff.js appended a
+  // git-output truncation marker and the diff TAIL (everything past the cap) is
+  // missing entirely. This is NOT per-file and cannot be attributed to any specific
+  // changed file, so the per-file check below would never catch it — a malicious
+  // payload placed past the 64 MiB cap would pass review unseen (the reviewer never
+  // saw the tail, and diff/payload hashes bind only to the captured/truncated text).
+  // Treat it as a GLOBAL coverage limitation and FAIL CLOSED: block in enforced/strict,
+  // advisory in soft. Checked BEFORE the native self-review / external paths so no pass
+  // can be accepted on an incomplete diff.
+  if (gitOutputTruncated(diff.text)) {
+    const msg =
+      "git diff output exceeded the buffer cap, so the diff is incomplete and the " +
+      "reviewer could not see the full change (the tail past the cap is missing)";
+    if (enforced) {
+      return block(
+        `Adversarial review could not complete: ${msg} (fail-closed). Reduce the change size ` +
+          "or review the omitted tail manually before completing.",
+        { gitOutputTruncated: true }
+      );
+    }
+    return advisory(`${msg}; the review is based on incomplete diff content.`, {
+      gitOutputTruncated: true,
+    });
+  }
+
   // (6b) TRUNCATED REVIEWABLE CONTENT (audit #22): a reviewable file whose diff
   // text was capped at the per-file size limit means the reviewer NEVER SAW the
   // post-cap payload — a "pass" cannot be trusted for it, yet the diff/payload
@@ -946,9 +1026,14 @@ export async function evaluateGate(input) {
     diffText: diff.text,
   };
 
-  // Cache hit: a prior identical review already passed.
+  // Cache hit: a prior identical review already passed. HARDENING (audit ROUND5
+  // finding 2 / GPT-5.5): the cache now stores the VALIDATED verdict object, not a
+  // bare `true`. Re-validate it against the CURRENT job AND re-run the deferred
+  // coverage checks before honoring the hit; a bare `true` / missing / invalid /
+  // non-passing entry is a cache MISS that falls through to a fresh review. This
+  // defeats a trivially pre-written `{cache:{<key>:true}}` forge.
   const cacheKey = cacheKeyFor(job, config);
-  if (cache[cacheKey]) {
+  if (cachedVerdictHonored(cache[cacheKey], job, reviewablePaths, enforced)) {
     const extra = { reason: "cached_pass", cached: true, level };
     if (secretWarning) extra.systemMessage = secretWarning;
     return allow(extra);
@@ -1031,9 +1116,12 @@ export async function evaluateGate(input) {
     }
   }
 
-  // Pass accepted: cache it (so a re-run of the identical review is instant).
+  // Pass accepted: cache the VALIDATED verdict object (not a bare `true`) so a
+  // re-run of the identical review is instant AND the cache hit can be re-validated
+  // against the current job (audit ROUND5 finding 2). The stored object is the same
+  // shape validateVerdict re-checks on a hit, so a genuine pass round-trips cleanly.
   if (stateDir) {
-    const nextCache = { ...cache, [cacheKey]: true };
+    const nextCache = { ...cache, [cacheKey]: verdict };
     await writeSessionState(stateDir, sessionId, { ...state, cache: nextCache });
   }
   const passExtra = { reason: "external_pass", level, cached: false };

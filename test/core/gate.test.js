@@ -15,7 +15,7 @@ import {
 } from "../../src/core/gate.js";
 import { captureBaseline, buildReviewDiff } from "../../src/core/diff.js";
 import { mergeConfig } from "../../src/core/config.js";
-import { readSessionState } from "../../src/core/state.js";
+import { readSessionState, writeSessionState } from "../../src/core/state.js";
 import { sha256, stableJson } from "../../src/core/hash.js";
 
 // ---------------------------------------------------------------------------
@@ -1173,9 +1173,14 @@ describe("evaluateGate external reviewer", () => {
     assert.equal(first.reason, "external_pass");
     assert.equal(runner.calls.length, 1);
 
-    // State should now hold a cache entry.
+    // State should now hold a cache entry. ROUND5 finding 2: the cached value must
+    // be the VALIDATED verdict OBJECT (not a bare `true`) so a hit can be re-validated.
     const state = await readSessionState(stateDir, sessionId);
     assert.ok(state.cache && Object.keys(state.cache).length === 1);
+    const storedEntry = state.cache[Object.keys(state.cache)[0]];
+    assert.equal(typeof storedEntry, "object", "cache must store the verdict object, not a bare true");
+    assert.equal(storedEntry.verdict, "pass");
+    assert.equal(storedEntry.payload_hash, runner.calls[0].payloadHash);
 
     // Second identical call: cache hit, runner not invoked again.
     const second = await evaluateGate({
@@ -1191,6 +1196,95 @@ describe("evaluateGate external reviewer", () => {
     assert.equal(second.action, "allow");
     assert.equal(second.reason, "cached_pass");
     assert.equal(runner.calls.length, 1); // not called again
+  });
+
+  // ROUND5 finding 2 (GPT-5.5): a forged bare-`true` cache entry (the legacy shape a
+  // local agent controlling the state dir could trivially pre-write) must NOT be
+  // honored. The gate re-reviews instead of returning cached_pass on a bare `true`.
+  it("CACHE-FORGE: a pre-written bare-`true` cache entry is NOT honored (re-reviews)", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const stateDir = await tmpStateDir();
+    const sessionId = "sess-forge-true";
+
+    // First, a genuine pass to discover the real cache KEY this job produces.
+    const runner = capturingRunner((job) => ({ ok: true, verdict: makeVerdict(job) }));
+    const first = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir,
+      sessionId,
+    });
+    assert.equal(first.reason, "external_pass");
+    const state = await readSessionState(stateDir, sessionId);
+    const cacheKey = Object.keys(state.cache)[0];
+
+    // Now OVERWRITE that key with a forged bare `true` (the trivial pre-write).
+    await writeSessionState(stateDir, sessionId, { ...state, cache: { [cacheKey]: true } });
+
+    // Re-run: the bare `true` must be a cache MISS -> the reviewer runs again.
+    const runner2 = capturingRunner((job) => ({ ok: true, verdict: makeVerdict(job) }));
+    const second = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner2,
+      stateDir,
+      sessionId,
+    });
+    assert.equal(second.action, "allow");
+    assert.equal(second.reason, "external_pass", "bare `true` must NOT yield cached_pass");
+    assert.equal(runner2.calls.length, 1, "reviewer MUST re-run on a forged bare-`true` entry");
+  });
+
+  // ROUND5 finding 2: a forged FULL verdict object whose payload_hash does NOT match
+  // the current job (e.g. copied from a different diff) is rejected by re-validation
+  // on the cache hit, so the gate re-reviews rather than honoring the stale/forged
+  // object. (A correctly-forged object remains possible — documented residual risk.)
+  it("CACHE-FORGE: a cached verdict with a mismatched payload_hash is re-reviewed", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": "const a = 1;\n" });
+    track(cwd);
+    const stateDir = await tmpStateDir();
+    const sessionId = "sess-forge-obj";
+
+    const runner = capturingRunner((job) => ({ ok: true, verdict: makeVerdict(job) }));
+    const first = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner,
+      stateDir,
+      sessionId,
+    });
+    assert.equal(first.reason, "external_pass");
+    const state = await readSessionState(stateDir, sessionId);
+    const cacheKey = Object.keys(state.cache)[0];
+
+    // Corrupt the stored verdict's payload_hash so re-validation fails on the hit.
+    const forged = { ...state.cache[cacheKey], payload_hash: "deadbeef-not-the-real-payload" };
+    await writeSessionState(stateDir, sessionId, { ...state, cache: { [cacheKey]: forged } });
+
+    const runner2 = capturingRunner((job) => ({ ok: true, verdict: makeVerdict(job) }));
+    const second = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: runner2,
+      stateDir,
+      sessionId,
+    });
+    assert.equal(second.reason, "external_pass", "a mismatched-payload cached verdict must NOT be honored");
+    assert.equal(runner2.calls.length, 1, "reviewer MUST re-run on a non-revalidating cache entry");
   });
 
   it("passes the built diff text to the reviewer runner via job.diffText", async () => {
@@ -1227,8 +1321,10 @@ describe("evaluateGate external reviewer", () => {
 // ---------------------------------------------------------------------------
 
 // An obviously FAKE AWS access key id (AKIA + 16 chars) used only to exercise the
-// scanner. It is not a real credential.
-const FAKE_AWS_KEY = "AKIAABCDEFGH12345678";
+// scanner. It is not a real credential. The "AKIA" prefix is split from the body
+// so no contiguous AWS-key literal exists in the file (keeps GitHub secret
+// scanning / push protection from flagging this synthetic test fixture).
+const FAKE_AWS_KEY = "AKIA" + "ABCDEFGH12345678";
 // An obviously FAKE PEM private-key header. Not a real key.
 const FAKE_PEM = "-----BEGIN RSA PRIVATE KEY-----\nFAKEFAKEFAKE\n-----END RSA PRIVATE KEY-----";
 
@@ -1566,6 +1662,59 @@ describe("evaluateGate guards", () => {
     assert.equal(decision.action, "block", "truncation of a ' b/' path must still block");
     assert.ok((decision.truncatedPaths || []).includes(rel), `expected ${rel} in truncatedPaths`);
     assert.equal(reviewerCalled, false);
+  });
+
+  // ROUND5 finding 1 (GPT-5.5): when the WHOLE `git diff` stdout exceeds git.js's
+  // 64 MiB buffer cap, diff.js withTruncationMarker appends a GLOBAL git-output
+  // truncation marker (distinct from the per-file size-cap marker). The diff TAIL
+  // past the cap is missing, so a malicious payload placed there would pass review
+  // unseen. The gate must detect THIS marker too and fail closed (block enforced).
+  // The marker text below MUST match src/core/diff.js withTruncationMarker.
+  const GIT_OUTPUT_TRUNCATION_LINE =
+    "... [git output truncated: exceeded buffer cap; diff is incomplete] ...";
+
+  it("BLOCKS in enforced when the whole git diff output was truncated (>64 MiB)", async () => {
+    // A reviewable change whose diff text carries the git-output truncation marker
+    // (the diff tail is missing). gitOutputTruncated scans the full diff text for
+    // the marker substring, so a file containing the marker line reproduces the
+    // condition without materializing a real >64 MiB diff.
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/big.js": `const a = 1;\n${GIT_OUTPUT_TRUNCATION_LINE}\n` }
+    );
+    track(cwd);
+    let reviewerCalled = false;
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript("src/big.js"),
+      stateDir: await tmpStateDir(),
+      reviewerRunner: async () => {
+        reviewerCalled = true;
+        return { ok: true, verdict: { verdict: "pass" } };
+      },
+    });
+    assert.equal(decision.action, "block", "git-output-truncated diff must block in enforced");
+    assert.equal(decision.gitOutputTruncated, true);
+    assert.equal(reviewerCalled, false, "must block before running the reviewer / accepting any pass");
+  });
+
+  it("downgrades to advisory in soft mode when the whole git diff output was truncated", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/big.js": `const a = 1;\n${GIT_OUTPUT_TRUNCATION_LINE}\n` }
+    );
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft" } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/big.js"),
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.gitOutputTruncated, true);
+    assert.notEqual(decision.action, "block", "soft mode advises, does not hard-block");
   });
 
   it("allows when stop_hook_active recursion guard is set", async () => {

@@ -58,21 +58,117 @@ function escapeRegExp(s) {
 const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 
 /**
+ * Whether a bin string is a COMPOSITE invocation (a launcher token followed by
+ * one or more argument tokens, e.g. `npx adversarial-review-gate` or
+ * `node "C:\Program Files\...\ar.js"`) versus a SINGLE executable path that may
+ * merely contain spaces (e.g. `C:\Users\John Doe\...\ar.js`).
+ *
+ * The discriminator is the FIRST whitespace-delimited token: a composite
+ * invocation begins with a bare LAUNCHER WORD — a PATH-resolved command name
+ * (`npx`, `node`, ...) that carries NO path separator and NO drive-letter prefix.
+ * A single spaced path instead begins with a path fragment (`C:\Users\John`,
+ * `/opt/my dir/...`) whose first token already contains a separator/drive, so
+ * the whole string must be treated as ONE path token (and quoted as a unit).
+ *
+ * This is the line the round-2 single-path test encodes (`C:\Users\John Doe\..`
+ * → one quoted token) while letting the real installer inputs
+ * (`npx adversarial-review-gate`) be recognized as a launcher + arg so the
+ * launcher is NOT swallowed into a single bogus `"npx adversarial-review-gate"`
+ * token that the shell would look up as a literal (space-containing) executable
+ * name → fail-open (FINDING: multi-token binPath quoting).
+ *
+ * @param {string} bin
+ * @returns {boolean}
+ */
+function looksLikeComposite(bin) {
+  // Find the first whitespace run; if none, it is a single token.
+  const m = /\s/.exec(bin);
+  if (!m) return false;
+  const firstToken = bin.slice(0, m.index);
+  // A launcher word: no path separator, no drive-letter prefix, no metachars.
+  // (A leading absolute interpreter path like `C:\Program Files\nodejs\node.exe`
+  // is itself a spaced path and is handled by the single-path branch.)
+  if (/[\\/]/.test(firstToken)) return false; // has a path separator
+  if (/^[A-Za-z]:/.test(firstToken)) return false; // drive-letter prefix
+  if (SHELL_META_RE.test(firstToken)) return false;
+  return firstToken.length > 0;
+}
+
+/**
+ * Split a composite bin invocation into argv tokens, honoring any double-quoted
+ * spans the caller already supplied (so a pre-quoted path arg
+ * `node "C:\Program Files\ar.js"` yields exactly `["node", "C:\\Program
+ * Files\\ar.js"]` rather than splitting the path at its space). Backslash-escaped
+ * quotes inside a quoted span are preserved as a literal `"`.
+ *
+ * @param {string} bin
+ * @returns {string[]}
+ */
+function tokenizeBin(bin) {
+  const tokens = [];
+  let cur = "";
+  let inQuote = false;
+  let started = false; // whether `cur` holds an in-progress token
+  for (let i = 0; i < bin.length; i++) {
+    const ch = bin[i];
+    if (inQuote) {
+      if (ch === "\\" && bin[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuote = false;
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuote = true;
+      started = true;
+    } else if (/\s/.test(ch)) {
+      if (started) {
+        tokens.push(cur);
+        cur = "";
+        started = false;
+      }
+    } else {
+      cur += ch;
+      started = true;
+    }
+  }
+  if (started) tokens.push(cur);
+  return tokens;
+}
+
+/** Quote a SINGLE token if it contains whitespace or a shell metacharacter. */
+function quoteToken(token) {
+  if (!/\s/.test(token) && !SHELL_META_RE.test(token)) return token;
+  return `"${token.replace(/"/g, '\\"')}"`;
+}
+
+/**
  * Shell-quote a bin invocation for embedding in a `type: command` hook string.
  *
  * FINDING 1 (fail-open): an unquoted bin path containing a space (extremely
  * common on Windows, e.g. `C:\Users\John Doe\...`) is split by the shell at the
  * space — the first fragment is run as the executable, fails, no block JSON is
- * emitted, and Claude Code ALLOWS the change: a silent gate bypass. We therefore
- * double-quote any bin that contains a space or a shell metacharacter, escaping
- * embedded double-quotes. A clean, special-char-free bin (the common
- * `adversarial-review-gate` / `npx adversarial-review-gate` forms) is left
- * unquoted so the emitted command stays human-readable and the existing canonical
- * forms are unchanged.
+ * emitted, and Claude Code ALLOWS the change: a silent gate bypass.
  *
- * The quoting is the SAME shape isOurHookLeaf recognizes, so a command this
- * produces always round-trips through ownership detection (FINDING 2: re-install
- * dedupes its own prior entry even when the bin path carries `(`/`)`/space).
+ * MULTI-TOKEN FINDING (fail-open): wrapping the ENTIRE bin in one pair of quotes
+ * is correct ONLY when the bin is a single executable path. For a COMPOSITE
+ * invocation (`npx adversarial-review-gate` — the installer's DEFAULT fallback —
+ * or `node "C:\Program Files\...\ar.js"`), wrapping the whole string makes the
+ * shell look up a literal executable named `npx adversarial-review-gate` (with
+ * the embedded space), which does not exist → the hook errors → no block JSON →
+ * the Stop gate ALLOWS the change (silent bypass). We therefore TOKENIZE a
+ * composite invocation and quote each token independently (quoting only the
+ * tokens that actually need it — typically just the path argument), leaving the
+ * bare launcher word unquoted. A single executable path (one token, or a spaced
+ * path whose first token is already path-like) is still wrapped as a unit.
+ *
+ * The output is always one of the shapes isOurBinPrefix() recognizes (a single
+ * quoted token, a metachar-free bare invocation, or a composite of bare/quoted
+ * tokens), so a command this produces round-trips through ownership detection and
+ * re-install stays idempotent (FINDING 2) even when the bin path carries
+ * `(`/`)`/space.
  *
  * @param {string} bin
  * @returns {string}
@@ -80,6 +176,12 @@ const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 function quoteBin(bin) {
   // Already needs no quoting: no whitespace and no shell metacharacters.
   if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
+  // Composite invocation (launcher + args): quote each token independently so the
+  // launcher word is not swallowed into a single bogus quoted executable name.
+  if (looksLikeComposite(bin)) {
+    return tokenizeBin(bin).map(quoteToken).join(" ");
+  }
+  // Single executable path that contains a space / metachar: wrap as one token.
   return `"${bin.replace(/"/g, '\\"')}"`;
 }
 
@@ -105,15 +207,19 @@ const QUOTED_BIN_RE = /^"(?:[^"\\]|\\.)*"$/;
 
 /**
  * Whether the portion of a command preceding the canonical tail is one of OUR
- * bin invocations — and NOT an attacker wrapper. Two accepted shapes:
+ * bin invocations — and NOT an attacker wrapper. Accepted shapes:
  *   (a) a single fully double-quoted token (`"C:\Program Files (x86)\...\ar.js"`),
  *       which neutralizes any interior metachar, OR
  *   (b) a bare, metachar-FREE invocation (`adversarial-review-gate`,
- *       `npx adversarial-review-gate`).
- * In both shapes the prefix MUST carry the package marker. A wrapper such as
- * `true # adversarial-review` or `foo; bar` fails both shapes (it is neither a
- * lone quoted token nor metachar-free), so the gate cannot be neutered while
- * still matching.
+ *       `npx adversarial-review-gate`), OR
+ *   (c) a COMPOSITE of bare metachar-free words and fully double-quoted tokens
+ *       (`node "C:\Program Files\...\ar.js"`), which is exactly what quoteBin()
+ *       emits for a launcher + spaced-path argument.
+ * In every shape the prefix MUST carry the package marker (in a bare word or
+ * inside a quoted token). A wrapper such as `true # adversarial-review` or
+ * `"foo"; bar` fails all shapes (the `;`/`#` is an UNQUOTED metachar, so the
+ * out-of-quote remainder is not metachar-free), so the gate cannot be neutered
+ * while still matching.
  *
  * @param {string} prefix - normalized command text before ` <tail>` (trimmed)
  * @returns {boolean}
@@ -126,9 +232,94 @@ function isOurBinPrefix(prefix) {
     const inner = prefix.slice(1, -1).replace(/\\"/g, '"');
     return inner.includes(AR_HOOK_MARKER);
   }
-  // Unquoted shape: must be metachar-free AND carry the marker.
-  if (SHELL_META_RE.test(prefix)) return false;
-  return prefix.includes(AR_HOOK_MARKER);
+  // Composite/bare shape: split into tokens honoring quotes, then require EVERY
+  // token to be either a PURE double-quoted span (metachars inert) or a bare
+  // metachar-free word, with the marker present in at least one token.
+  // Concatenating tokens and re-scanning (the old single-string check) is unsafe:
+  // an injected `"foo"; bar` has its `;` OUTSIDE the quote. Tokenization with a
+  // per-token "pure-quoted vs. bare" flag catches it — `"foo";` is a MIXED token
+  // (quoted span + bare `;`), so it is scrutinized as bare and the `;` rejects.
+  const tokens = tokenizeBinForOwnership(prefix);
+  if (!tokens) return false; // unbalanced quotes / unparseable → not ours
+  let sawMarker = false;
+  for (const t of tokens) {
+    if (t.pureQuoted) {
+      // Entire token is a single quoted span: interior metachars are inert.
+      if (t.value.includes(AR_HOOK_MARKER)) sawMarker = true;
+    } else {
+      // A bare token (or a token that MIXES bare chars with a quoted span) must
+      // be free of shell metacharacters to be inert to the shell. t.value holds
+      // the post-unquote content, so an injected `;`/`#`/etc. is caught here.
+      if (SHELL_META_RE.test(t.value)) return false;
+      if (t.value.includes(AR_HOOK_MARKER)) sawMarker = true;
+    }
+  }
+  return sawMarker;
+}
+
+/**
+ * Tokenize a normalized bin prefix into `{ value, pureQuoted }` tokens, honoring
+ * double-quoted spans. `value` is the post-unquote content. `pureQuoted` is true
+ * ONLY when the ENTIRE token is a single quoted span with NO bare characters
+ * around or between quoted spans — i.e. a token whose metachars are genuinely
+ * inert to the shell. A token that mixes a quoted span with bare characters
+ * (`"x";rm` → value `x;rm`) is NOT pureQuoted, so the caller scrutinizes it as
+ * bare and the injected `;` is rejected. Returns null on an unbalanced quote (an
+ * attacker who opens a quote that never closes must NOT be accepted). Single-
+ * space separated input is assumed (the caller normalizes whitespace first).
+ *
+ * @param {string} prefix
+ * @returns {Array<{value:string, pureQuoted:boolean}>|null}
+ */
+function tokenizeBinForOwnership(prefix) {
+  const tokens = [];
+  let cur = "";
+  let started = false;
+  let hadQuoted = false; // token contained at least one quoted span
+  let hadBare = false; // token contained at least one bare (non-quoted) char
+  let i = 0;
+  const flush = () => {
+    tokens.push({ value: cur, pureQuoted: hadQuoted && !hadBare });
+    cur = "";
+    started = false;
+    hadQuoted = false;
+    hadBare = false;
+  };
+  while (i < prefix.length) {
+    const ch = prefix[i];
+    if (ch === '"') {
+      // Consume a quoted span (allowing \" escapes) into the current token.
+      hadQuoted = true;
+      started = true;
+      i++;
+      let closed = false;
+      while (i < prefix.length) {
+        const c = prefix[i];
+        if (c === "\\" && prefix[i + 1] === '"') {
+          cur += '"';
+          i += 2;
+        } else if (c === '"') {
+          closed = true;
+          i++;
+          break;
+        } else {
+          cur += c;
+          i++;
+        }
+      }
+      if (!closed) return null; // unbalanced quote → reject
+    } else if (/\s/.test(ch)) {
+      if (started) flush();
+      i++;
+    } else {
+      cur += ch;
+      started = true;
+      hadBare = true;
+      i++;
+    }
+  }
+  if (started) flush();
+  return tokens;
 }
 
 /**

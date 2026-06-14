@@ -5,6 +5,54 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-06-14
+
+A fourth independent review round — driven by deliberately DIFFERENT model
+families (DeepSeek / GLM / Kimi / GPT), each monitored by its own subagent — found
+issues the earlier (Qwen-dominant) rounds missed, including a **fail-open on the
+default install**. All confirmed findings were reproduced, fixed fail-closed, and
+regression-tested. 673 tests, 667 pass, 6 platform-skips.
+
+### Security
+- **Default install no longer fails open (critical):** the Stop-hook/wrapper bin
+  command for the common `npx adversarial-review-gate` invocation was quoted as a
+  single token (`"npx adversarial-review-gate"`), so the shell could not find it,
+  the hook errored, and — emitting no block — the change was ALLOWED. Composite
+  invocations are now tokenized and quoted per-token (the launcher stays bare).
+- **Install no longer launders untrusted config:** the installer derives the
+  written policy-floor mode from trusted inputs only (default `enforced` / an
+  existing user floor / a new `--mode` flag), never the untrusted project config,
+  and whitelist-sanitizes the written config (stripping `command`/`args`/`type`/
+  `trusted`/`skipPatterns`/unknown keys).
+- **Fail-open on detection failure closed:** when gate evaluation OR diff/baseline
+  detection fails (e.g. a corrupted `.git` that yields an empty diff without
+  throwing), the gate now BLOCKS in enforced/strict instead of allowing
+  `fail_open_no_evidence`; `check.js` treats a baseline-capture failure as a block;
+  `run` blocks an unobservable (persistently-unbuildable) workspace; `--host=` with
+  an empty value is rejected (it had silently downgraded to un-reviewed self-review).
+- **Verdict parser:** a finding whose `severity` is non-string / unrecognized is now
+  treated as BLOCKING (was silently ignored, letting a smuggled Critical pass).
+- **Gate:** a whole-`git-diff`-output truncation (>64 MiB) now blocks in enforced
+  (the per-file cap marker missed it); the pass cache stores the validated verdict
+  and re-validates on every hit (a pre-written bare-`true` cache entry no longer
+  forges a pass).
+- **Config trust floor:** a truthy non-boolean `trusted` (`1`/`"true"`) is coerced
+  to false; a project cannot change a reviewer's adapter `type` or inject
+  `command`/`args`; `version` and `runtime` are pinned; a project config whose real
+  path escapes the workspace (a committed symlink) is ignored.
+- **Filesystem snapshot:** Windows junctions / escaping directories are no longer
+  walked (workspace-escape guard); entries are sorted for a deterministic diffHash.
+- **Reviewer timers:** `sanePositiveSec` is clamped so a huge configured timeout
+  cannot overflow `setTimeout` to 1 ms (a self-DoS); custom-reviewer temp files are
+  owner-only; atomic writes use an unguessable name + `O_EXCL`.
+
+### Added
+- `install --mode <soft|enforced|strict-ci>`: explicitly set the written policy
+  floor (tighten-only; never below `enforced`).
+- Documented the **monitor-subagent-per-reviewer-shell** outsourcing strategy in
+  the self-review orchestrator prompt (the agent-host equivalent of the Node
+  adapter's watchdog + model-fallback chain).
+
 ## [2.2.0] - 2026-06-13
 
 Reviewer resilience plus a deep security-hardening pass driven by an independent,

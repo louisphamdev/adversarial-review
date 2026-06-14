@@ -36,9 +36,25 @@ export async function checkCommand(argv, io) {
   // (`fail_open_no_evidence`) even when the workspace really changed. We pass the
   // captured baseline so fail-closed can detect edit evidence and block in
   // enforced/strict.
+  //
+  // ROUND 5 (Finding 2): `captureBaseline` can ITSELF throw (e.g. a broken cwd or
+  // git-plumbing failure). If it does, `baseline` stays undefined and edit
+  // detection is impossible — fail-closed must NOT treat that as a clean "no
+  // evidence" allow. We capture the baseline-capture error separately and forward
+  // it so failClosedDecision routes through its detection-failed path (block in
+  // enforced/strict), rather than diffing against an empty baseline.
   let baseline;
+  let baselineError;
   try {
-    baseline = await captureBaseline(cwd);
+    try {
+      baseline = await captureBaseline(cwd);
+    } catch (capErr) {
+      // Record the capture failure and re-throw INTO the fail-closed catch below so
+      // the same fail-closed decision path runs (now with the detection-failed
+      // signal). evaluateGate is not run against a missing baseline.
+      baselineError = capErr;
+      throw capErr;
+    }
     decision = await evaluateGate({
       config,
       cwd,
@@ -56,9 +72,13 @@ export async function checkCommand(argv, io) {
   } catch (err) {
     // HARDENING #2: fail closed. `check` has no transcript, so edit evidence is
     // whatever the live diff shows; failClosedDecision recomputes that from the
-    // captured baseline (may be undefined if captureBaseline itself threw, in
-    // which case failClosedDecision computes against an empty baseline).
-    decision = await failClosedDecision({ config, cwd, baseline, transcript: "", err, io });
+    // captured baseline. ROUND 5 (Finding 2): if captureBaseline ITSELF threw,
+    // `baseline` is undefined and `baselineError` is set — we forward that so
+    // failClosedDecision treats it as a DETECTION FAILURE (block in
+    // enforced/strict) instead of computing against an empty baseline and silently
+    // failing open. (The previous comment claiming it "computes against an empty
+    // baseline" was misleading: an undefined baseline gave no evidence at all.)
+    decision = await failClosedDecision({ config, cwd, baseline, baselineError, transcript: "", err, io });
   }
 
   if (json) {

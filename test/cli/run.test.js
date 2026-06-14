@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, readFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { runCommand } from "../../src/cli/run.js";
+import { runCommand, stillChangingScope } from "../../src/cli/run.js";
 import { resolveExecutable } from "../../src/core/process.js";
 import { makeIsolatedEnv } from "../helpers/isolated-env.js";
 
@@ -197,6 +197,70 @@ describe("run command", () => {
       assert.equal(process.exitCode, 2, "unknown flag must produce a usage error (exit 2)");
       assert.equal(decision, undefined, "must not run the wrapped command on a usage error");
       assert.match(err.join(""), /unknown flag/i);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await iso.cleanup();
+    }
+  });
+
+  it("ROUND5 finding 4: rejects an empty --host= value before -- (usage error)", async () => {
+    // `--host=` yields host='' which previously routed SILENTLY to native
+    // self-review (reviewerMappingFor("")==="none"), running the wrapped command
+    // unreviewed under a likely typo. It must now be a hard usage error, mirroring
+    // the `--host <value>` missing-value handling.
+    const cwd = await tmpDir("ar-run-emptyhost-");
+    const iso = await makeIsolatedEnv();
+    try {
+      const { io, err } = makeIo(cwd, iso.env);
+      process.exitCode = 0;
+      const decision = await runCommand(
+        ["--host=", "--", "node", "-e", "process.exit(0)"],
+        io
+      );
+      assert.equal(process.exitCode, 2, "empty --host= must produce a usage error (exit 2)");
+      assert.equal(decision, undefined, "must not run the wrapped command on a usage error");
+      assert.match(err.join(""), /--host requires a non-empty value/i);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await iso.cleanup();
+    }
+  });
+
+  it("ROUND5 finding 3: a persistently-unbuildable diff is NOT declared 'settled'", async () => {
+    // stillChangingScope used to return false (== "not changing", i.e. settled)
+    // whenever buildReviewDiff threw — INCLUDING when EVERY sample threw, so a
+    // persistently-unbuildable diff bypassed the quiescence guard. It now reports a
+    // tri-state { stillChanging, persistentFailure }: when no sample ever builds,
+    // persistentFailure is true so runCommand can fail closed in enforced.
+    //
+    // A filesystem baseline with a poisoned `snapshot` getter makes buildReviewDiff
+    // throw on EVERY sample (deterministic, no timing).
+    const poisoned = { type: "filesystem", cwd: "/nonexistent" };
+    Object.defineProperty(poisoned, "snapshot", {
+      get() {
+        throw new Error("persistently unbuildable diff");
+      },
+    });
+    const res = await stillChangingScope("/nonexistent", poisoned, 1);
+    assert.equal(res.persistentFailure, true, "all samples threw => persistentFailure");
+    assert.equal(res.stillChanging, false, "no buildable movement observed");
+  });
+
+  it("ROUND5 finding 3 (transient tolerance preserved): a buildable static baseline is settled, not a failure", async () => {
+    // A normal, buildable baseline that does not change must report settled WITHOUT
+    // a persistentFailure (transient tolerance unchanged: a single stray throw on a
+    // mostly-buildable run does not wedge, and a fully-buildable stable run is
+    // simply quiescent).
+    const cwd = await tmpDir("ar-run-still-static-");
+    const iso = await makeIsolatedEnv();
+    try {
+      const { captureBaseline } = await import("../../src/core/diff.js");
+      const baseline = await captureBaseline(cwd); // empty, buildable filesystem baseline
+      const res = await stillChangingScope(cwd, baseline, 1);
+      assert.equal(res.persistentFailure, false, "a buildable baseline is not a detection failure");
+      assert.equal(res.stillChanging, false, "a static workspace is settled");
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

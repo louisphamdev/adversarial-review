@@ -70,7 +70,29 @@ export async function runCommand(argv, io) {
 
   // Wait for filesystem quiescence, then confirm the workspace has settled.
   await sleep(quiescenceMs);
-  const stillChanging = await stillChangingScope(cwd, baseline, quiescenceMs);
+  const { stillChanging, persistentFailure } = await stillChangingScope(cwd, baseline, quiescenceMs);
+
+  // ROUND 5 (Finding 3): the review scope was NEVER observable — buildReviewDiff
+  // threw on every quiescence sample (e.g. a persistently corrupted/unbuildable
+  // diff). We cannot confirm the workspace settled, so do not treat it as
+  // quiescent. Fail closed in enforced/strict (block); warn in soft.
+  if (persistentFailure && enforced) {
+    io.stderr.write(
+      "BLOCK: the review scope could not be built after the command exited (the diff was " +
+        "persistently unbuildable), so the workspace could not be confirmed settled; cannot " +
+        "review (fail-closed). Re-run once the workspace/repo is in a buildable state.\n"
+    );
+    process.exitCode = BLOCK_EXIT_CODE;
+    return { action: "block", reason: "scope_unobservable" };
+  }
+  if (persistentFailure) {
+    io.stderr.write(
+      "WARNING: the review scope could not be built after the command exited (the diff was " +
+        "persistently unbuildable); the workspace could not be confirmed settled (soft mode does " +
+        "not block). Re-run once the workspace/repo is in a buildable state.\n"
+    );
+  }
+
   if (stillChanging && enforced) {
     io.stderr.write(
       "BLOCK: workspace is still being written after the command exited; cannot review a " +
@@ -189,31 +211,54 @@ function signalNumber(signal) {
 // workspace settled. A single two-snapshot compare can land both samples in the
 // same quiet gap of a periodic/bursty writer and wrongly report "settled";
 // requiring several consecutive stable samples widens the window so a writer that
-// touches files between cycles is far more likely to be caught. Returns true as
-// soon as ANY two adjacent snapshots differ (still changing). Tolerant: a build
-// failure returns false (do not wedge on a diff error — the gate's own
-// internal-error handling covers an unbuildable diff).
-async function stillChangingScope(cwd, baseline, quiescenceMs) {
+// touches files between cycles is far more likely to be caught.
+//
+// Returns { stillChanging, persistentFailure }:
+//   - stillChanging: true as soon as ANY two adjacent BUILDABLE snapshots differ;
+//   - persistentFailure: true when buildReviewDiff threw on EVERY sample, so the
+//     scope could never be observed at all.
+//
+// ROUND 5 (Finding 3): a single build failure used to return false ("not
+// changing"), which is fine when it is TRANSIENT (a later sample succeeds and the
+// stability check still runs). But if ALL samples throw, the diff is persistently
+// unbuildable and the workspace was NEVER actually observed — declaring it
+// "settled" silently bypasses the quiescence guard. We now report that as
+// `persistentFailure` so the caller fails closed in enforced (warn in soft) rather
+// than treating an unobservable workspace as quiescent. Transient tolerance is
+// preserved: as long as at least one sample builds, a stray failure does not wedge.
+// Exported for unit tests of the Finding-3 persistent-failure tri-state.
+export async function stillChangingScope(cwd, baseline, quiescenceMs) {
   let prevHash;
+  let anyBuilt = false;
   try {
     prevHash = (await buildReviewDiff(cwd, baseline)).diffHash;
+    anyBuilt = true;
   } catch {
-    return false;
+    prevHash = undefined;
   }
-  // We already have sample #1; take (STABLE_SAMPLES - 1) more and compare each to
-  // the previous. Any mismatch => still changing.
+  // We already attempted sample #1; take (STABLE_SAMPLES - 1) more and compare each
+  // buildable sample to the previous buildable one. Any mismatch => still changing.
   for (let i = 1; i < QUIESCENCE_STABLE_SAMPLES; i += 1) {
     await sleep(quiescenceMs);
     let nextHash;
     try {
       nextHash = (await buildReviewDiff(cwd, baseline)).diffHash;
     } catch {
-      return false;
+      // Transient build failure on this sample: skip it (do not wedge), but keep
+      // looking — a later sample may build and reveal movement.
+      continue;
     }
-    if (nextHash !== prevHash) return true;
+    if (anyBuilt && nextHash !== prevHash) {
+      return { stillChanging: true, persistentFailure: false };
+    }
     prevHash = nextHash;
+    anyBuilt = true;
   }
-  return false;
+  // If no sample ever built, the scope is persistently unobservable.
+  if (!anyBuilt) {
+    return { stillChanging: false, persistentFailure: true };
+  }
+  return { stillChanging: false, persistentFailure: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +295,18 @@ function parseArgs(argv) {
       }
       i += 1;
     } else if (tok.startsWith("--host=")) {
+      const value = tok.slice("--host=".length);
+      // ROUND 5 (Finding 4): reject an EMPTY value (`--host=`) with a clear usage
+      // error, mirroring the `--host <value>` missing-value handling. Otherwise an
+      // empty host silently routes to native self-review (reviewerMappingFor("")
+      // => "none") and the wrapped command runs unreviewed under a likely typo —
+      // argument confusion that must not pass quietly.
+      if (!value) {
+        error = error || "--host requires a non-empty value";
+        break;
+      }
       if (!hostSeen) {
-        host = tok.slice("--host=".length);
+        host = value;
         hostSeen = true;
       } else {
         error = error || "duplicate --host flag";

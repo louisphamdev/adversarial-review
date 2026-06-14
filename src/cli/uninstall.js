@@ -20,6 +20,7 @@
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import {
   removeClaudeCodeHooks,
@@ -68,8 +69,11 @@ function normalizeRegistryKey(dir) {
 async function atomicWrite(filePath, content, mode = 0o644) {
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.tmp${Date.now()}`;
-  await writeFile(tmp, content, { encoding: "utf8", mode });
+  // FINDING 3 (ROUND 5): an UNPREDICTABLE temp name + O_EXCL ("wx") so a local
+  // attacker cannot pre-create a symlink at a guessed temp path and have our
+  // write follow it to clobber an arbitrary file. Mirrors install.js atomicWrite.
+  const tmp = `${filePath}.tmp.${randomUUID()}`;
+  await writeFile(tmp, content, { encoding: "utf8", mode, flag: "wx" });
   const { rename } = await import("node:fs/promises");
   try {
     await rename(tmp, filePath);

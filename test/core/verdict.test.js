@@ -204,9 +204,10 @@ describe("parseVerdict", () => {
 
   // --- FIX 2 regression tests: severity type guard ---
 
-  it("FIX2: verdict stays pass when severity is an array containing 'Critical' (non-string bypass attempt)", () => {
-    // A malformed finding with severity:["Critical"] must NOT trigger forced-fail.
-    // The finding is simply ignored; the stated verdict of pass is preserved.
+  it("FIX2/R5: a non-string severity (array containing 'Critical') now forces fail (fail-closed)", () => {
+    // ROUND 5: the old round-2 contract IGNORED non-string severities, letting a real
+    // blocking finding with severity:["Critical"] pass open. That is the hole. A
+    // malformed/non-string severity is no longer a benign signal; it MUST force fail.
     const job = makeJob();
     const payload = makePayload({
       verdict: "pass",
@@ -214,9 +215,12 @@ describe("parseVerdict", () => {
     });
     const output = wrap(payload);
     const result = parseVerdict(output, job);
-    // Must not throw, must return ok:true, verdict must remain pass
     assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
-    assert.equal(result.verdict.verdict, "pass", "Non-string severity must not trigger forced-fail");
+    assert.equal(
+      result.verdict.verdict,
+      "fail",
+      "Non-string severity must fail closed, not be silently ignored"
+    );
   });
 
   it("FIX2: proper string severity:Critical with verdict:pass is forced to fail", () => {
@@ -409,20 +413,35 @@ describe("parseVerdict", () => {
     }
   });
 
-  it("AUDIT-C: a non-string severity is still ignored (FIX2 contract preserved)", () => {
-    // Regression guard: making unrecognized STRINGS blocking must not change the
-    // FIX2 behaviour that NON-string severities (array/object/number/null) are ignored.
+  it("AUDIT-C/R5: every non-string severity now fails CLOSED (array/object/number/null/undefined)", () => {
+    // ROUND 5 regression: a present finding with a non-string severity must force fail,
+    // including the array-wrapped 'Critical' smuggling vector and bare malformed values.
+    // (Previously these were ignored — the round-2 hole this fix closes.)
     const job = makeJob();
-    for (const sev of [["Critical"], { x: 1 }, 42, null]) {
+    for (const sev of [["Critical"], { x: 1 }, 42, null, undefined, true]) {
       const payload = makePayload({ verdict: "pass", findings: [{ severity: sev }] });
       const result = parseVerdict(wrap(payload), job);
       assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
       assert.equal(
         result.verdict.verdict,
-        "pass",
-        `Non-string severity ${JSON.stringify(sev)} must be ignored, not force-fail`
+        "fail",
+        `Non-string severity ${JSON.stringify(sev)} must fail closed, not be ignored`
       );
     }
+  });
+
+  it("R5: a real blocking finding smuggled via array severity (repro) is forced to fail", () => {
+    // Direct repro from the round-5 finding: a correct-binding PASS verdict whose
+    // findings carry a genuine Critical hidden behind severity:["Critical"] must NOT
+    // be accepted as a pass — the blocking finding is forced through to fail.
+    const job = makeJob();
+    const payload = makePayload({
+      verdict: "pass",
+      findings: [{ severity: ["Critical"], title: "auth bypass", message: "smuggled critical" }],
+    });
+    const result = parseVerdict(wrap(payload), job);
+    assert.equal(result.ok, true, `Expected ok:true but got error: ${result.error}`);
+    assert.equal(result.verdict.verdict, "fail", "Smuggled Critical must force the verdict to fail");
   });
 
   // --- ROUND-2 FINDING: verdict block embedded inside a code fence ---

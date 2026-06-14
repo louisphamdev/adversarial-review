@@ -148,6 +148,171 @@ describe("check command", () => {
     }
   });
 
+  it("ROUND5 finding 1: evaluateGate threw AND a corrupted git baseline yields a vacuous empty diff => BLOCK, not fail_open (enforced)", async () => {
+    // Repro for fail-closed.js: when evaluateGate throws AND edit-evidence
+    // DETECTION also fails, hasEditEvidence used to return false UNCONDITIONALLY so
+    // the gate FAILED OPEN (`fail_open_no_evidence`) even in enforced. The subtle
+    // case: a CORRUPTED git repo does NOT make buildReviewDiff throw — git resolves
+    // non-zero with EMPTY stdout, so the diff comes back vacuously empty (no text,
+    // no changedFiles) while the baseline is still a valid `type:"git"` baseline.
+    // The old hasEditEvidence treated that empty diff as "no evidence" and allowed.
+    //
+    // We capture a REAL git baseline (so baseline.type==="git" with a valid HEAD),
+    // THEN corrupt .git so the baseline-range diff is unbuildable, then drive
+    // failClosedDecision directly (the surface check.js relies on). Detection failed
+    // + enforced => must BLOCK, never fail_open.
+    const { failClosedDecision } = await import("../../src/cli/fail-closed.js");
+    const { captureBaseline } = await import("../../src/core/diff.js");
+    const cwd = await tmpDir("ar-check-fc-corrupt-");
+    try {
+      const runGit = async (...args) => {
+        const r = await git(args, cwd);
+        assert.equal(r.code, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+      };
+      if ((await git(["--version"], cwd)).code !== 0) return; // git unavailable: skip.
+      await runGit("init", "-q");
+      await runGit("config", "user.email", "t@t.t");
+      await runGit("config", "user.name", "t");
+      await runGit("config", "commit.gpgsign", "false");
+      await writeFile(join(cwd, "base.txt"), "baseline\n");
+      await runGit("add", "base.txt");
+      await runGit("commit", "-q", "-m", "baseline");
+
+      // Capture a VALID git baseline (HEAD resolves) BEFORE corrupting the repo.
+      const baseline = await captureBaseline(cwd);
+      assert.equal(baseline.type, "git", "precondition: a git baseline was captured");
+
+      // Now corrupt .git so the baseline-range diff is unbuildable (git resolves
+      // non-zero with empty stdout => a vacuous empty diff, NOT a throw).
+      const { rm: rmFs } = await import("node:fs/promises");
+      await rmFs(join(cwd, ".git"), { recursive: true, force: true });
+      await writeFile(join(cwd, ".git"), "corrupted");
+
+      const config = { policy: { mode: "enforced" } };
+      const out = [];
+      const io = { stderr: { write: (s) => out.push(String(s)) } };
+      const decision = await failClosedDecision({
+        config,
+        cwd,
+        baseline,
+        transcript: "",
+        err: new Error("simulated evaluateGate failure"),
+        io,
+      });
+
+      assert.equal(decision.action, "block", `expected block, got: ${JSON.stringify(decision)}`);
+      assert.notEqual(decision.reason, "fail_open_no_evidence", "must not fail open when detection failed");
+      assert.equal(decision.detectionFailed, true, "decision must be flagged as a detection failure");
+      assert.match(out.join(""), /detection FAILED/i);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("ROUND5 finding 1 (control): a clean git baseline with genuinely no edits still ALLOWS fail_open_no_evidence", async () => {
+    // Guards against over-blocking: when the git repo is HEALTHY and there are
+    // genuinely no edits since the baseline, an evaluateGate throw must still
+    // produce the legitimate `fail_open_no_evidence` allow (detection SUCCEEDED and
+    // found nothing). Only a FAILED detection blocks.
+    const { failClosedDecision } = await import("../../src/cli/fail-closed.js");
+    const { captureBaseline } = await import("../../src/core/diff.js");
+    const cwd = await tmpDir("ar-check-fc-clean-");
+    try {
+      const runGit = async (...args) => {
+        const r = await git(args, cwd);
+        assert.equal(r.code, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+      };
+      if ((await git(["--version"], cwd)).code !== 0) return;
+      await runGit("init", "-q");
+      await runGit("config", "user.email", "t@t.t");
+      await runGit("config", "user.name", "t");
+      await runGit("config", "commit.gpgsign", "false");
+      await writeFile(join(cwd, "base.txt"), "baseline\n");
+      await runGit("add", "base.txt");
+      await runGit("commit", "-q", "-m", "baseline");
+
+      const baseline = await captureBaseline(cwd); // healthy git baseline, no edits after
+      const config = { policy: { mode: "enforced" } };
+      const decision = await failClosedDecision({
+        config,
+        cwd,
+        baseline,
+        transcript: "",
+        err: new Error("boom"),
+        io: { stderr: { write() {} } },
+      });
+      assert.equal(decision.action, "allow", `clean no-edits must allow, got ${JSON.stringify(decision)}`);
+      assert.equal(decision.reason, "fail_open_no_evidence");
+      assert.notEqual(decision.detectionFailed, true, "a clean detection is NOT a failure");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("ROUND5 finding 2: a baseline-capture failure (baselineError) => BLOCK, not fail_open (enforced)", async () => {
+    // Repro for check.js + fail-closed.js: when captureBaseline ITSELF throws,
+    // `baseline` stays undefined. Previously failClosedDecision received
+    // baseline:undefined and, with no transcript, hasEditEvidence returned false
+    // => FAIL OPEN (`fail_open_no_evidence`). check.js now forwards a
+    // `baselineError` so fail-closed routes through the DETECTION-FAILED path and
+    // BLOCKS in enforced. (captureBaseline is hardened against throwing on normal
+    // FS errors — snapshotWorkspace swallows per-dir failures — so this latent
+    // fail-open is exercised here at the failClosedDecision contract level, which
+    // is the exact surface check.js relies on.)
+    const { failClosedDecision } = await import("../../src/cli/fail-closed.js");
+    const cwd = await tmpDir("ar-check-fc-baselineerr-");
+    try {
+      const config = { policy: { mode: "enforced" } };
+      const err = new Error("evaluateGate failed (and baseline was never captured)");
+      const out = [];
+      const io = { stderr: { write: (s) => out.push(String(s)) } };
+      const decision = await failClosedDecision({
+        config,
+        cwd,
+        baseline: undefined,
+        baselineError: new Error("captureBaseline threw"),
+        transcript: "",
+        err,
+        io,
+      });
+      assert.equal(decision.action, "block", `expected block, got: ${JSON.stringify(decision)}`);
+      assert.notEqual(decision.reason, "fail_open_no_evidence", "captureBaseline failure must not fail open");
+      assert.equal(decision.detectionFailed, true, "baseline-capture failure must be a detection failure");
+      assert.match(out.join(""), /detection FAILED/i);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("ROUND5 finding 2 (soft): a baseline-capture failure follows soft onInternalError (advisory, no block)", async () => {
+    // The detection-failed path must respect policy: in SOFT mode the default
+    // onInternalError is "allow", so a detection failure yields an advisory allow
+    // (with detectionFailed flagged) rather than a hard block. This proves the fix
+    // never weakens enforced while not over-blocking soft.
+    const { failClosedDecision } = await import("../../src/cli/fail-closed.js");
+    const cwd = await tmpDir("ar-check-fc-baselineerr-soft-");
+    try {
+      const config = { policy: { mode: "soft" } };
+      const decision = await failClosedDecision({
+        config,
+        cwd,
+        baseline: undefined,
+        baselineError: new Error("captureBaseline threw"),
+        transcript: "",
+        err: new Error("boom"),
+        io: { stderr: { write() {} } },
+      });
+      assert.equal(decision.action, "allow", "soft onInternalError=allow => advisory allow");
+      assert.equal(decision.detectionFailed, true, "still flagged as a detection failure");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("HARDENING #1: resolveStateDir is outside cwd", () => {
     const cwd = process.cwd();
     // Default (no override) must be user-level, never under cwd.

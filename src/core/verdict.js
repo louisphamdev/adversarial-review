@@ -31,21 +31,29 @@ function normalizeSeverity(severity) {
 }
 
 /**
- * Classify a finding's severity. Non-string severities are ignored (return
- * "ignore") to preserve the type-guard contract (an array/object/number severity
- * is not a usable signal and must not force-fail). String severities are
- * normalized and classified fail-closed: recognized non-blocking => "nonblocking",
- * recognized blocking OR any unrecognized string => "blocking".
+ * Classify a finding's severity, fail-closed. ONLY an explicitly recognized
+ * non-blocking STRING (minor/advisory, incl. whitespace/case/zero-width variants)
+ * is "nonblocking". Everything else is "blocking":
+ *  - recognized blocking strings (Critical/Important);
+ *  - unrecognized strings (homoglyph/typo/garbage);
+ *  - NON-string severities (array/object/number/null/undefined).
+ * FIX (finding 4 / round 5): the round-2 contract treated a non-string severity as
+ * "ignore" (never force-fail). That is a smuggling hole — a real blocking finding
+ * with e.g. severity:["Critical"] passed open. A present finding whose severity is
+ * non-string or unrecognized must now be BLOCKING so it cannot evade the forced-fail
+ * net. The "ignore" classification is removed entirely.
  * @param {unknown} severity the finding.severity value
- * @returns {"blocking"|"nonblocking"|"ignore"}
+ * @returns {"blocking"|"nonblocking"}
  */
 function classifySeverity(severity) {
-  if (typeof severity !== "string") return "ignore";
+  // Non-string severity is not a usable benign signal; fail closed (blocking).
+  if (typeof severity !== "string") return "blocking";
   const norm = normalizeSeverity(severity);
-  if (BLOCKING_SEVERITIES.has(norm)) return "blocking";
   if (NONBLOCKING_SEVERITIES.has(norm)) return "nonblocking";
-  // FIX (finding 3): unrecognized string severity (homoglyph, typo, garbage) is
-  // treated as blocking so it cannot silently pass off a real Critical as benign.
+  // Recognized blocking (Critical/Important) AND any unrecognized string
+  // (homoglyph/typo/garbage) are treated as blocking. BLOCKING_SEVERITIES is kept
+  // as documentation of the recognized blocking tokens, but the fail-closed default
+  // already covers them, so a separate check is unnecessary.
   return "blocking";
 }
 
@@ -316,11 +324,12 @@ export function validateVerdict(parsed, job) {
       return { ok: false, error: `missing_dimension:${dimension}` };
     }
   }
-  // FIX 2 + FIX (finding 3): non-string severities are ignored (so a malformed
-  // array/object/number severity cannot itself force-fail), but every STRING
-  // severity is normalized and classified fail-closed: recognized blocking
-  // (Critical/Important, incl. whitespace/case/zero-width variants) AND any
-  // unrecognized string (homoglyph/typo/garbage) force the verdict to fail.
+  // FIX (finding 4 / round 5): force fail for ANY present finding whose severity is
+  // not an explicitly recognized non-blocking string. classifySeverity now fails
+  // closed for non-string severities too (e.g. severity:["Critical"]), so a real
+  // blocking finding can no longer be smuggled past the forced-fail net by giving it
+  // a malformed array/object/number severity. Only an explicit minor/advisory string
+  // (incl. whitespace/case/zero-width variants) is non-blocking.
   const forcedFail = parsed.findings.some(
     (finding) => finding && classifySeverity(finding.severity) === "blocking"
   );

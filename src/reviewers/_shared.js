@@ -40,6 +40,15 @@ export const FORCE_KILL_GRACE_MS = 2000;
 // Sentinel value returned by the timeout race arm.
 export const TIMEOUT_SENTINEL = Symbol("timeout");
 
+// Upper bound (seconds) for any configured timeout. Callers do `seconds * 1000`
+// and pass the result to setTimeout, whose delay is a 32-bit signed int: a value
+// whose ms product exceeds 2_147_483_647 is SILENTLY clamped by Node to 1ms (with
+// a TimeoutOverflowWarning), which would fire the inactivity / hard-cap watchdog
+// at ~1ms and force-kill EVERY review instantly (TIMEOUT_SENTINEL) — a self-DoS.
+// 2_147_483 s (~24.8 days) is far above any real reviewer run, and ×1000 stays
+// under the int32 max, so clamping here keeps the timers honest.
+export const MAX_SANE_SEC = 2_147_483;
+
 /**
  * Clamp a configured seconds value to a sane positive number, else the fallback.
  *
@@ -49,12 +58,19 @@ export const TIMEOUT_SENTINEL = Symbol("timeout");
  * a project from setting these, but a malformed user value or test override is
  * neutralized here too.
  *
+ * An absurdly LARGE value is just as dangerous: callers multiply by 1000 for ms,
+ * and setTimeout's int32 delay silently clamps anything over ~2.1e9 ms down to
+ * 1ms, firing the watchdog instantly and self-DoSing the gate. So the value is
+ * also clamped to MAX_SANE_SEC, keeping seconds×1000 under the int32 max.
+ *
  * @param {*} value
  * @param {number} fallback
  * @returns {number}
  */
 export function sanePositiveSec(value, fallback) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.min(value, MAX_SANE_SEC)
+    : fallback;
 }
 
 /**

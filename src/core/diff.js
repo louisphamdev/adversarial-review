@@ -1,5 +1,5 @@
 import { readFile, readdir, stat, readlink } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { sha256 } from "./hash.js";
@@ -82,6 +82,17 @@ export async function snapshotWorkspace(cwd, options = {}) {
   const files = new Map();
   let truncated = false;
 
+  // Canonical workspace root used for the directory-containment check below.
+  // realpathSync collapses junctions / symlinked parents so the comparison is
+  // against the TRUE root, not an aliased path. If the root itself cannot be
+  // resolved (race/permission) fall back to the literal cwd.
+  let realRoot;
+  try {
+    realRoot = realpathSync(cwd);
+  } catch {
+    realRoot = cwd;
+  }
+
   // Iterative stack walk to avoid deep recursion on large trees.
   const stack = [cwd];
   while (stack.length > 0) {
@@ -97,10 +108,24 @@ export async function snapshotWorkspace(cwd, options = {}) {
       // Unreadable directory (permissions, race): skip it.
       continue;
     }
+    // Sort entries by name so the walk order is deterministic and independent of
+    // the underlying filesystem's readdir order. Without this the synthesized
+    // diff TEXT (and thus diffHash) varies across runs/OSes for the SAME change
+    // set, causing spurious review-cache misses.
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of entries) {
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name)) continue;
+        // Workspace-escape guard. A directory entry may be a Windows NTFS
+        // junction (mklink /J reports isDirectory()=true, isSymbolicLink()=false)
+        // or any symlinked/reparse-point directory that slips past the symlink
+        // branch on some Node/OS combos. Resolve its REAL path and only recurse
+        // when it stays WITHIN the canonical workspace root; otherwise treat the
+        // directory as a boundary and do not walk into it (which would read
+        // external files into the snapshot and could overflow maxFiles). A dir
+        // whose realpath cannot be resolved is also treated as a boundary.
+        if (!isWithinRoot(realRoot, absolute)) continue;
         stack.push(absolute);
         continue;
       }
@@ -204,6 +229,26 @@ function bufferHasNul(buf) {
 // Normalize an absolute path to a POSIX-style path relative to `cwd`.
 function toPosixRel(cwd, absolute) {
   return path.relative(cwd, absolute).split(path.sep).join("/");
+}
+
+// True iff the REAL path of `dir` is the canonical workspace root or lives
+// strictly beneath it. Resolving with realpathSync collapses junctions /
+// symlinked directories to their true target so an entry that escapes the
+// workspace (NTFS junction to C:\Windows, a symlinked dir to /etc, …) is
+// rejected. The prefix test compares against `root + sep` so a sibling whose
+// name merely shares the root as a string prefix (e.g. ".../ws-evil" vs
+// ".../ws") is NOT mistaken for a child. A path that cannot be resolved is
+// treated as NOT contained (fail closed: do not recurse).
+function isWithinRoot(root, dir) {
+  let real;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    return false;
+  }
+  if (real === root) return true;
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  return real.startsWith(rootWithSep);
 }
 
 // ---------------------------------------------------------------------------
