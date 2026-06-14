@@ -12,6 +12,7 @@ import {
   advisory,
   canonicalizePath,
   citationVariants,
+  hasUnmappableTruncation,
 } from "../../src/core/gate.js";
 import { captureBaseline, buildReviewDiff } from "../../src/core/diff.js";
 import { mergeConfig } from "../../src/core/config.js";
@@ -1662,6 +1663,85 @@ describe("evaluateGate guards", () => {
     assert.equal(decision.action, "block", "truncation of a ' b/' path must still block");
     assert.ok((decision.truncatedPaths || []).includes(rel), `expected ${rel} in truncatedPaths`);
     assert.equal(reviewerCalled, false);
+  });
+
+  // ROUND6 (Gemini): a reviewable file whose PATH contains a literal newline
+  // (`src/evil\n.js`, legal on POSIX, reachable via the non-git filesystem snapshot)
+  // splits its synthesized `diff --git a/<p> b/<p>` header across lines. The header
+  // regex's `.` does not cross the newline, so truncatedReviewablePaths fails to map
+  // the per-file TRUNCATION_MARKER to a reviewable path and returns [] — a >cap file
+  // with a payload hidden past the size cap would pass review UNSEEN (fail-open).
+  // hasUnmappableTruncation detects the unparseable marker-bearing section so the gate
+  // can fail closed. These unit cases pin the detection cross-platform (Windows cannot
+  // even create a newline-named file, so the end-to-end test below is POSIX-only).
+  const CAP_MARKER_LINE =
+    "(coverage limitation: diff text capped at 1000000 bytes; full content was hashed for change detection)";
+
+  it("R6: hasUnmappableTruncation flags a marker-bearing section whose newline path won't parse", () => {
+    const rel = "src/evil\n.js"; // literal newline in the path
+    const section =
+      `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n+const payload=1;\n` +
+      `... [truncated: 999 bytes not shown] ...\n${CAP_MARKER_LINE}\n`;
+    assert.equal(hasUnmappableTruncation(section), true, "unparseable truncation must be flagged");
+  });
+
+  it("R6: hasUnmappableTruncation does NOT flag a normal (parseable) truncated section", () => {
+    const rel = "src/big.js";
+    const section =
+      `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n+const a=1;\n` +
+      `... [truncated: 999 bytes not shown] ...\n${CAP_MARKER_LINE}\n`;
+    // A parseable marker section is handled by truncatedReviewablePaths, not here.
+    assert.equal(hasUnmappableTruncation(section), false, "a parseable truncation must NOT be over-flagged");
+  });
+
+  it("R6: hasUnmappableTruncation does NOT flag a diff with no truncation marker at all", () => {
+    const text = "diff --git a/src/x.js b/src/x.js\nnew file mode 100644\n+const a=1;\n";
+    assert.equal(hasUnmappableTruncation(text), false, "no marker => nothing to fail closed on");
+  });
+
+  // End-to-end fail-closed wiring: a real reviewable file whose name contains a
+  // newline, truncated at the per-file cap, must BLOCK in enforced (and the reviewer
+  // must never run). POSIX-only: NTFS forbids newlines in filenames, so creating the
+  // fixture throws on Windows; the unit cases above cover detection on every platform.
+  const itPosix = process.platform === "win32" ? it.skip : it;
+  itPosix("R6: BLOCKS in enforced when a reviewable file with a newline path is truncated", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, {});
+    track(cwd);
+    baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
+    const rel = "src/evil\n.js"; // literal newline in the filename
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, rel), "// " + "a".repeat(400) + "\nconst payload = require('child_process');\n");
+    let reviewerCalled = false;
+    const decision = await evaluateGate({
+      config: mergeConfig(), // enforced
+      cwd,
+      baseline,
+      transcript: editTranscript(rel),
+      stateDir: await tmpStateDir(),
+      host: { reviewerMapping: "codex" },
+      reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
+    });
+    assert.equal(decision.action, "block", "unmappable truncated reviewable content must block in enforced");
+    assert.equal(decision.unmappableTruncation, true);
+    assert.equal(reviewerCalled, false, "must block before running the reviewer / accepting any pass");
+  });
+
+  itPosix("R6: downgrades to advisory in soft mode for an unmappable (newline-path) truncation", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, {});
+    track(cwd);
+    baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
+    const rel = "src/evil\n.js";
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, rel), "// " + "a".repeat(400) + "\nconst x = 1;\n");
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft" } }),
+      cwd,
+      baseline,
+      transcript: editTranscript(rel),
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.unmappableTruncation, true);
+    assert.notEqual(decision.action, "block", "soft mode advises, does not hard-block");
   });
 
   // ROUND5 finding 1 (GPT-5.5): when the WHOLE `git diff` stdout exceeds git.js's

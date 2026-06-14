@@ -44,7 +44,7 @@ export async function hookCommand(argv, io) {
   // The host payload carries the authoritative cwd; fall back to the process cwd.
   const cwd = (payload && typeof payload.cwd === "string" && payload.cwd) || io.cwd;
   const sessionId = (payload && payload.session_id) || "default";
-  const stateDir = resolveStateDir(env);
+  const stateDir = resolveStateDir(env, cwd);
   // Key state by session id AND canonical workspace root so distinct workspaces
   // never share a baseline even when they share a session_id (cross-workspace
   // baseline-collision bypass). This composite key is used both for direct

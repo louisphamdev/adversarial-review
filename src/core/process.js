@@ -116,6 +116,18 @@ const CMD_METACHAR_RE = /[&|<>^"%()\r\n]/;
  * Non-batch (`.exe`/direct) targets are spawned via CreateProcess with no shell
  * and are unaffected by this check.
  *
+ * PROCESS GROUP (POSIX): the child is spawned with `detached: true` so it becomes
+ * the leader of a NEW process group (its pid == its pgid). A reviewer that forks a
+ * descendant — or whose shell wrapper backgrounds a process — then lives in that
+ * group, so forceKill can signal the WHOLE group (`process.kill(-child.pid, ...)`)
+ * and no orphaned descendant survives the watchdog still holding the gate's
+ * ambient permissions. detached does NOT change stdio (the adapters' piped
+ * stdin/stdout/stderr is preserved) and we deliberately do NOT call child.unref()
+ * — the gate awaits the child, so the parent must stay attached. On Windows
+ * detached is NOT set: forceKill already does a `taskkill /F /T` TREE kill there,
+ * and a detached child with inherited stdio could spawn a new console window, so
+ * Windows behavior is left exactly as before.
+ *
  * @param {string}   resolvedPath  - absolute path returned by resolveExecutable
  * @param {string[]} args
  * @param {object}   options       - { cwd, env, stdio }
@@ -150,6 +162,11 @@ export function spawnResolved(resolvedPath, args, options = {}) {
     shell: false,
     stdio: options.stdio || ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    // POSIX only: new process group/session so a forked descendant is killable as
+    // a group (see forceKill). Never on Windows (taskkill /F /T already tree-kills,
+    // and a detached console would change inherited-stdio behavior). We do NOT
+    // unref() — the gate awaits this child.
+    detached: process.platform !== "win32",
   });
 }
 

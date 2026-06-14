@@ -218,6 +218,35 @@ function truncatedReviewablePaths(diffText, reviewablePaths) {
   return out;
 }
 
+// True when the diff text bears the per-file TRUNCATION_MARKER in a section whose
+// path CANNOT be mapped to a changed-file path — i.e. the `diff --git a/<p> b/<p>`
+// header regex fails to match that marker-bearing section. This is the fail-OPEN
+// case that truncatedReviewablePaths cannot report: `.` in the header regex does
+// not match a newline, so a reviewable file whose PATH contains a literal newline
+// (`src/evil\n.js` — legal on POSIX, reachable via the non-git filesystem snapshot)
+// splits the header across lines, the regex misses, and the truncation marker is
+// silently dropped instead of being attributed to a reviewable path → a >cap file
+// with a payload past the size cap would pass review unseen (audit ROUND6 / Gemini).
+//
+// We CANNOT safely re-map such a section back to a reviewable path (the path itself
+// is ambiguous once it contains the section delimiter), so an unparseable truncation
+// MUST fail closed: it is a coverage limitation of unknown extent. A marker-bearing
+// section whose header DOES parse is handled by truncatedReviewablePaths (mapped to a
+// specific reviewable file, or correctly ignored when it maps to a non-reviewable
+// file such as a truncated docs file); only the UNPARSEABLE sections are reported here.
+// Exported for unit tests of the ROUND6 newline-in-path unmappable-truncation case.
+export function hasUnmappableTruncation(diffText) {
+  if (!diffText) return false;
+  for (const section of String(diffText).split(/(?=^diff --git )/m)) {
+    if (!section.includes(TRUNCATION_MARKER)) continue;
+    // A marker-bearing section MUST be a synthesized `diff --git a/<p> b/<p>` block.
+    // If the backreference header regex cannot match it, the path is unparseable
+    // (e.g. it contains a newline), so the truncation is UNMAPPABLE — fail closed.
+    if (!/^diff --git a\/(.+) b\/\1(?:\s|$)/m.test(section)) return true;
+  }
+  return false;
+}
+
 // True when the WHOLE git-diff stdout was truncated at git.js's 64 MiB buffer
 // cap (diff.js withTruncationMarker). This is a GLOBAL coverage limitation: the
 // missing tail cannot be attributed to any specific file, so it is detected with
@@ -717,6 +746,28 @@ export async function evaluateGate(input) {
   const changedFiles = diff?.changedFiles || [];
   const hasEditEvidence = lastEditKey > 0 || editedPaths.size > 0 || changedFiles.length > 0;
 
+  // (3b) The diff FAILED TO BUILD (buildReviewDiff threw -> null) — e.g. a `git
+  // diff` errored on a corrupted .git/index, which would otherwise return an
+  // empty diff that reads as "no changes". A null diff means we CANNOT confirm a
+  // clean workspace, so fail closed in enforced/strict BEFORE the no_edits allow,
+  // even with no other evidence (a corrupted repo must not pass unreviewed). A
+  // genuinely-clean workspace returns an empty-but-NON-null diff, so this never
+  // over-blocks a clean check. (round 6 / GPT-5.5 + Gemini)
+  if (diff === null) {
+    const enforcedBuild = config.policy.mode === "enforced" || isStrict(config);
+    if (enforcedBuild) {
+      return block(
+        "Adversarial review could not complete: the diff could not be built (the repository may be " +
+          "corrupted), so a clean workspace cannot be confirmed (fail-closed).",
+        { detectionFailed: true }
+      );
+    }
+    return advisory(
+      "The diff could not be built (the repository may be corrupted); allowed per soft policy.",
+      { detectionFailed: true }
+    );
+  }
+
   // No reviewable changed files AND no edit evidence -> nothing happened.
   if (!hasReviewableFile(changedFiles, config) && !hasEditEvidence) {
     return allow({ reason: "no_edits" });
@@ -834,6 +885,36 @@ export async function evaluateGate(input) {
       `Reviewable file(s) were truncated at the size cap; the reviewer saw incomplete content: ${list}.`,
       { truncated: true, truncatedPaths: truncated }
     );
+  }
+
+  // (6c) UNMAPPABLE PER-FILE TRUNCATION (audit ROUND6 / Gemini): the diff text
+  // bears the per-file size-cap TRUNCATION_MARKER, but the marker-bearing section's
+  // `diff --git a/<p> b/<p>` header does NOT parse, so the truncation cannot be
+  // attributed to a specific changed file (above, truncatedReviewablePaths returned
+  // []). The classic trigger is a path containing a literal newline (`src/evil\n.js`,
+  // legal on POSIX and reachable via the non-git filesystem snapshot): the header
+  // regex's `.` does not cross the newline, the section silently fails to map, and a
+  // >cap reviewable file with a payload hidden past the size cap would otherwise pass
+  // review unseen. An UNPARSEABLE truncation is a coverage limitation of unknown
+  // extent and MUST fail closed: block in enforced/strict, advisory in soft —
+  // exactly like the global git-output truncation. Checked AFTER the mappable
+  // per-file check so a normal truncation still reports its concrete path list.
+  if (hasUnmappableTruncation(diff.text)) {
+    const msg =
+      "the diff text was truncated at the per-file size cap but the truncated section's " +
+      "path could not be parsed (an unparseable/ambiguous file path), so the reviewer " +
+      "could not see the full change and it cannot be attributed to a specific file";
+    if (enforced) {
+      return block(
+        `Adversarial review could not complete: ${msg} (fail-closed). Rename the offending file ` +
+          "(remove unusual characters such as newlines from its path) or review the truncated content manually before completing.",
+        { truncated: true, unmappableTruncation: true }
+      );
+    }
+    return advisory(`${msg}; the review is based on incomplete diff content.`, {
+      truncated: true,
+      unmappableTruncation: true,
+    });
   }
 
   // (7) Native self-review detection (verdict-based). A timestamp or a forgeable

@@ -164,11 +164,41 @@ async function hasEditEvidence({ cwd, baseline, baselineError, transcript }) {
   // — Finding 1). Verify the git baseline is still usable; if not, this empty diff
   // is a detection failure, not a clean result.
   if (baseline.type === "git") {
-    if (!(await gitBaselineUsable(cwd, baseline))) {
-      return { evidence: false, detectionFailed: true };
-    }
+    const probe = await gitDiffProbe(cwd, baseline);
+    if (probe === "failed") return { evidence: false, detectionFailed: true };
+    // The committed-range diff was empty but `git diff` reports uncommitted
+    // changes that buildReviewDiff's (silently-failed) output missed: real evidence.
+    if (probe === "changes") return { evidence: true, detectionFailed: false };
+    // probe === "clean": genuinely no changes — fall through to the clean result.
   }
   return { evidence: false, detectionFailed: false };
+}
+
+// Classify a git baseline whose buildReviewDiff came back EMPTY:
+//  - "failed"  — the repo cannot be compared (HEAD/baseline commit unresolvable,
+//                OR a `git diff` command exits with an ERROR, e.g. exit code > 1
+//                from a corrupted `.git/index` — Finding round 6 / GPT-5.5). An
+//                empty diff from this state is NOT trustworthy.
+//  - "changes" — `git diff --quiet` (working tree) or `git diff --cached --quiet`
+//                (staged) exits 1, i.e. there ARE uncommitted changes that the
+//                (silently-failed) buildReviewDiff output missed. This is evidence.
+//  - "clean"   — every probe exits 0: genuinely no changes.
+// `git diff --quiet` exit codes: 0 = no diff, 1 = differences, >1 = error.
+// (gitBaselineUsable alone was insufficient: `git rev-parse` does NOT read the
+// index, so a corrupted index still "resolved" while `git diff` failed.)
+async function gitDiffProbe(cwd, baseline) {
+  if (!(await gitBaselineUsable(cwd, baseline))) return "failed";
+  for (const args of [["diff", "--quiet", "HEAD"], ["diff", "--cached", "--quiet"]]) {
+    let r;
+    try {
+      r = await git(args, cwd);
+    } catch {
+      return "failed";
+    }
+    if (r.code === 1) return "changes";
+    if (r.code !== 0) return "failed";
+  }
+  return "clean";
 }
 
 // Re-verify that a git baseline is still comparable: the repo must be a usable git

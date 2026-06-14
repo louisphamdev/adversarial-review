@@ -96,6 +96,27 @@ describe("buildReviewDiff (git)", () => {
     assert.ok(diff.text.includes("evil.js"), "a new file in a zero-commit repo must be visible to the gate");
   });
 
+  it("R6: buildReviewDiff THROWS when a git diff command errors (corrupted index), not empty", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "corrupt-index");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "app.js"), "const a = 1;\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+    // Make a real edit, then CORRUPT the index so `git diff HEAD` / `--cached`
+    // exit non-zero with empty stdout. The old code returned that empty output =>
+    // the gate read a corrupted repo as a clean, change-free workspace (fail-open).
+    await writeFile(join(repo, "app.js"), "const a = 2; // hidden change\n");
+    await writeFile(join(repo, ".git", "index"), "not a real git index file");
+    await assert.rejects(
+      () => buildReviewDiff(repo, baseline),
+      /git_diff_command_failed/,
+      "a corrupted-index git diff must THROW (detection failure), not return an empty diff"
+    );
+  });
+
   it("reports a staged file", async (t) => {
     if (!GIT_AVAILABLE) return t.skip("git not on PATH");
     const repo = join(dir, "staged");

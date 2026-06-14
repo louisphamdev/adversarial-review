@@ -24,7 +24,7 @@ export async function checkCommand(argv, io) {
   const env = io.env || process.env;
 
   const config = await loadEffectiveConfig(cwd, io);
-  const stateDir = resolveStateDir(env);
+  const stateDir = resolveStateDir(env, cwd);
   const { hostDescriptor, reviewerRunner } = buildHostRouting(host, config, env);
 
   let decision;

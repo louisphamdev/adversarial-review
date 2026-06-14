@@ -7,6 +7,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   runWithTimeout,
   runWithWatchdog,
@@ -18,6 +21,7 @@ import {
   MAX_OUTPUT_BYTES,
   TIMEOUT_SENTINEL,
 } from "../../src/reviewers/_shared.js";
+import { spawnResolved } from "../../src/core/process.js";
 
 /** Spawn a short Node child running inline source. */
 function spawnNode(src) {
@@ -311,15 +315,28 @@ describe("forceKill", () => {
     if (process.platform === "win32") {
       return; // POSIX-signal behavior only.
     }
-    // Trap (ignore) SIGTERM and stay alive; only an unconditional SIGKILL ends it.
-    const child = spawn(
+    // Spawn via spawnResolved so the child is detached (a group leader) — the same
+    // path the reviewer adapters use. Trap (ignore) SIGTERM and stay alive; only
+    // an unconditional SIGKILL ends it. The child prints READY only AFTER the
+    // SIGTERM handler is installed, so we never race forceKill against a child that
+    // would still take the default (terminating) SIGTERM action before trapping.
+    const child = spawnResolved(
       process.execPath,
-      ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],
-      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+      ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('READY'); setInterval(() => {}, 1000);"],
+      { stdio: ["ignore", "pipe", "pipe"] }
     );
+    let out = "";
+    child.stdout.on("data", (c) => { out += c.toString(); });
     const exited = new Promise((resolve) => {
       child.on("close", (code, signal) => resolve({ code, signal }));
     });
+    // Wait until the SIGTERM trap is installed (READY printed) before killing.
+    const readyDeadline = Date.now() + 5000;
+    while (!out.includes("READY") && Date.now() < readyDeadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(out.includes("READY"), "child must signal it installed the SIGTERM trap");
+
     forceKill(child);
     // Race the exit against a generous deadline: SIGKILL fires after the ~2s grace
     // period, so the child must be gone well within ~6s.
@@ -329,5 +346,89 @@ describe("forceKill", () => {
     ]);
     assert.notEqual(result, "survived", "a SIGTERM-trapping child must be SIGKILLed, not survive");
     assert.equal(result.signal, "SIGKILL", `expected SIGKILL, got ${JSON.stringify(result)}`);
+  });
+
+  // REGRESSION (Round 6 / Finding HIGH): on POSIX, forceKill must kill the WHOLE
+  // PROCESS GROUP, not just the direct child. A reviewer that forks a descendant
+  // (or whose shell wrapper backgrounds a process) would otherwise leave that
+  // descendant ALIVE after the watchdog fires — an orphan still holding the gate's
+  // ambient permissions, accumulating across model-fallback retries.
+  //
+  // Repro: spawnResolved spawns the direct child DETACHED (a process-group leader),
+  // and that child forks a DESCENDANT that TRAPS SIGTERM (so only a group-wide
+  // SIGKILL ends it). The descendant proves it is alive by advancing a HEARTBEAT
+  // counter file every 100ms. After forceKill + the grace period, the heartbeat
+  // must STOP advancing (descendant dead). A frozen heartbeat is the reliable
+  // liveness signal: `process.kill(pid, 0)` cannot be used because a just-killed
+  // descendant becomes a ZOMBIE (its pid still resolves until reaped), which kill 0
+  // reports as "alive" — only a stopped heartbeat proves it no longer executes.
+  // Pre-fix (no detached, direct-child-only kill) the descendant outlives the child
+  // and the heartbeat keeps advancing — the leak this guards against.
+  // Skipped on Windows (taskkill /F /T already tree-kills there).
+  it("kills a forked descendant (whole process group) on POSIX", async () => {
+    if (process.platform === "win32") {
+      return; // taskkill /F /T already tree-kills on Windows.
+    }
+    const dir = await mkdtemp(join(tmpdir(), "ar-group-kill-"));
+    const hbFile = join(dir, "heartbeat.txt");
+    const readHb = async () => {
+      try { return (await readFile(hbFile, "utf8")).trim(); } catch { return ""; }
+    };
+    let parent;
+    try {
+      // Grandchild: trap SIGTERM, then tick a monotonically-increasing heartbeat
+      // counter to hbFile every 100ms (proof-of-life that a zombie cannot fake).
+      const grandchildSrc =
+        "const fs=require('fs');" +
+        "process.on('SIGTERM',()=>{});" + // trap -> only a group SIGKILL ends it
+        "let n=0;" +
+        `setInterval(()=>{n++;try{fs.writeFileSync(${JSON.stringify(hbFile)},String(n));}catch{}},100);`;
+      // Parent: fork the grandchild (no detached -> it inherits the parent's process
+      // group; the parent is the group leader because spawnResolved spawned it
+      // detached), trap SIGTERM, and stay alive so the group persists past SIGTERM.
+      const parentSrc =
+        "const {spawn}=require('child_process');" +
+        `spawn(process.execPath,['-e',${JSON.stringify(grandchildSrc)}],{stdio:'ignore'});` +
+        "process.on('SIGTERM',()=>{});" +
+        "setInterval(()=>{},1000);";
+
+      parent = spawnResolved(process.execPath, ["-e", parentSrc], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      // Wait until the grandchild's heartbeat starts (it is then alive and trapping).
+      const startDeadline = Date.now() + 5000;
+      while ((await readHb()) === "" && Date.now() < startDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const beforeKill = await readHb();
+      assert.notEqual(beforeKill, "", "grandchild must have started its heartbeat");
+
+      // Fire the watchdog kill on the PARENT only.
+      forceKill(parent);
+
+      // Wait past the SIGTERM->SIGKILL grace period (~2s) plus slack so the group
+      // SIGKILL has fired, then take two heartbeat snapshots ~700ms apart. A killed
+      // descendant's heartbeat is frozen (snap1 === snap2); a leaked one keeps
+      // advancing.
+      await new Promise((r) => setTimeout(r, 3500));
+      const snap1 = await readHb();
+      await new Promise((r) => setTimeout(r, 700));
+      const snap2 = await readHb();
+
+      assert.equal(
+        snap1,
+        snap2,
+        `forceKill must kill the forked DESCENDANT (whole process group): heartbeat kept advancing (${snap1} -> ${snap2}), so the descendant leaked`
+      );
+    } finally {
+      // Best-effort cleanup: SIGKILL the whole group then the lone parent pid so a
+      // failure never leaks processes across the suite.
+      if (parent && parent.pid) {
+        try { process.kill(-parent.pid, "SIGKILL"); } catch { /* gone */ }
+        try { process.kill(parent.pid, "SIGKILL"); } catch { /* gone */ }
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

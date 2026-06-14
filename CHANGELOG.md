@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-06-14
+
+A fifth review round using yet another model family (Google **Gemini 3.5**,
+plus GPT-5.5 / DeepSeek / GLM / Kimi), each driven by its own monitor subagent.
+It found parser bypasses and gaps in the round-5 fixes themselves. All confirmed
+findings reproduced, fixed fail-closed, and regression-tested. 690 tests, 682
+pass, 8 platform-skips.
+
+### Security
+- **Verdict parser — two forged-PASS bypasses closed:** a present `findings`
+  field that is NOT an array (e.g. an object hiding a Critical) is now rejected
+  instead of silently coerced to `[]`; the markdown code-fence detector now tracks
+  the fence delimiter char + length (CommonMark), so a longer outer fence with a
+  shorter inner fence can no longer expose a quoted forged verdict block.
+- **Hook/wrapper command-substitution rejected:** a bin path containing `$` or a
+  backtick (which expand even inside double quotes on POSIX) is now refused at
+  install time in BOTH the Claude Code hook and the wrapper instructions, instead
+  of emitting a command that could execute injected shell code or fail open.
+- **Corrupted-repo fail-open closed:** a `git diff` that exits non-zero (e.g. a
+  corrupted `.git/index`) is now treated as a detection failure — `buildReviewDiff`
+  throws and the gate blocks in enforced/strict — rather than returning an empty
+  diff that read as a clean, change-free workspace.
+- **Reviewer process-group kill (POSIX):** reviewers are spawned in their own
+  process group and the whole group is signalled on timeout, so a reviewer that
+  forks a descendant can no longer leave orphaned processes after the watchdog
+  fires (Windows already tree-killed via `taskkill /T`).
+- **Truncation detection fail-closed:** a per-file truncation marker whose diff
+  header cannot be parsed (e.g. a filename containing a newline) now blocks in
+  enforced instead of being silently skipped.
+- **Config trust floor:** an absolute `ADVERSARIAL_REVIEW_HOME` /
+  `ADVERSARIAL_REVIEW_STATE_DIR` that resolves INSIDE the workspace is now ignored
+  (a repo-controlled env must not relocate the trusted user base or pre-seed the
+  pass cache).
+- **Install no longer reads the legacy config from the untrusted cwd during a
+  `--user`/`--global` install** (it reads from the scope base / home), closing a
+  legacy-config laundering vector into the trusted machine-wide config.
+
 ## [2.2.1] - 2026-06-14
 
 A fourth independent review round — driven by deliberately DIFFERENT model

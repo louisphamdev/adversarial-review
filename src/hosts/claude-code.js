@@ -57,6 +57,40 @@ function escapeRegExp(s) {
 // are inert to the shell and are explicitly allowed; see isOurBinPrefix.)
 const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 
+// Command-substitution metacharacters. Unlike the other shell metachars, `$` and
+// backtick are NOT neutralized by DOUBLE quotes: in POSIX shells `$VAR`, `$(...)`
+// and `` `...` `` STILL EXPAND inside double quotes. The bin path/command is
+// computed at INSTALL time from a path on disk and is never meant to carry shell
+// command substitution, so a `$`/backtick in it is either a broken install input
+// or an attacker trying to smuggle code into the hook command (which the host
+// later runs through a POSIX shell — the substitution could even change the
+// executable path so no block JSON is emitted: a fail-OPEN bypass). We therefore
+// REJECT it (fail CLOSED) rather than attempt a cross-platform-safe quoting that
+// would also have to survive cmd.exe. (Single-quoting on POSIX would help, but the
+// emitted command string is platform-agnostic and runs under cmd.exe on Windows
+// too, where single quotes are literal — so a hard REJECT is the clean choice.)
+const COMMAND_SUBST_RE = /[$`]/;
+
+/**
+ * Reject a bin invocation that contains POSIX command-substitution metacharacters
+ * (`$` or backtick). These expand even inside double quotes, so there is no safe
+ * cross-platform way to embed them in the platform-agnostic hook command string;
+ * we fail CLOSED with a clear error rather than emit a command that could execute
+ * attacker-controlled shell code (or fail open) when the host runs it.
+ *
+ * @param {string} bin
+ * @throws {Error} when `bin` contains `$` or a backtick
+ */
+function assertNoCommandSubstitution(bin) {
+  if (COMMAND_SUBST_RE.test(bin)) {
+    throw new Error(
+      `adversarial-review: refusing to build a hook command from a bin path ` +
+        `containing a '$' or backtick (POSIX command-substitution metacharacter, ` +
+        `which is NOT neutralized by double quotes): ${bin}`
+    );
+  }
+}
+
 /**
  * Whether a bin string is a COMPOSITE invocation (a launcher token followed by
  * one or more argument tokens, e.g. `npx adversarial-review-gate` or
@@ -174,6 +208,10 @@ function quoteToken(token) {
  * @returns {string}
  */
 function quoteBin(bin) {
+  // Reject command-substitution metacharacters ($ / backtick) FIRST: they expand
+  // even inside double quotes on POSIX, so no quoting can make them safe in the
+  // platform-agnostic hook command — fail closed at the source. (round 6)
+  assertNoCommandSubstitution(bin);
   // Already needs no quoting: no whitespace and no shell metacharacters.
   if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
   // Composite invocation (launcher + args): quote each token independently so the

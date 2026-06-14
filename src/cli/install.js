@@ -583,7 +583,14 @@ export async function installCommand(argv, io) {
   const existingProjectConfig = await readJsonTolerant(projectConfigPath2);
 
   // --- Read legacy config and merge ---
-  const legacyFragment = await readLegacyConfig(cwd);
+  // Read the legacy config from the SAME scope base as the rest of the config
+  // (cwd for a project install, home for --user/--global). Reading it from the
+  // untrusted cwd during a USER-scope install would launder a cloned repo's
+  // legacy thresholds / timeout / engine into the TRUSTED machine-wide user
+  // config. (round 6: the specific reviewer.models/privacy launder reported was a
+  // false positive — readLegacyConfig only migrates thresholds/engine/timeout and
+  // user-scope reads the rest from home — but legacy-from-cwd was a real vector.)
+  const legacyFragment = await readLegacyConfig(scopeBase);
 
   // Build initial project config by DEEP-layering: legacy <- existing (existing
   // wins on a leaf conflict). A shallow Object.assign replaced whole nested

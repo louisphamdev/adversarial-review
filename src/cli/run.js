@@ -58,7 +58,7 @@ export async function runCommand(argv, io) {
 
   const config = await loadEffectiveConfig(cwd, io);
   const enforced = config.policy.mode === "enforced" || isStrict(config);
-  const stateDir = resolveStateDir(env);
+  const stateDir = resolveStateDir(env, cwd);
   const quiescenceMs = config.runtime?.quiescenceMs ?? DEFAULT_QUIESCENCE_MS;
 
   // Capture baseline BEFORE running so post-run diff reflects only the wrapped

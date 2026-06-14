@@ -81,3 +81,16 @@ describe("wrapper host: bin quoting in printed launch command", () => {
     assert.match(r.residualRisk, /reviewer: codex/);
   });
 });
+
+describe("wrapper command-substitution rejection (round 6)", () => {
+  it("R6: rejects a binPath containing $() command substitution", () => {
+    assert.throws(
+      () => wrapperInstructions({ host: "codex", binPath: "/tmp/$(touch /tmp/pwned)/bin/ar" }),
+      /command-substitution|\$/,
+      "a $()-bearing binPath must be rejected, not printed as an injectable command"
+    );
+  });
+  it("R6: rejects a binPath containing a backtick", () => {
+    assert.throws(() => wrapperInstructions({ host: "codex", binPath: "/x/`id`/ar" }), /command-substitution|backtick/);
+  });
+});

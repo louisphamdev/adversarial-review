@@ -11,6 +11,23 @@
 // path/arg does not shell-split. Mirrors SHELL_META_RE in src/hosts/claude-code.js.
 const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 
+// Command-substitution metacharacters ($ / backtick): unlike other metachars
+// these STILL EXPAND inside double quotes on POSIX, so the printed wrapper
+// command would execute attacker code (or fail to launch) when the user pastes
+// it into a shell. A bin path is never meant to carry them. Reject (fail closed)
+// rather than emit an injectable command. Mirrors claude-code.js.
+const COMMAND_SUBST_RE = /[$`]/;
+
+/** Throw when `bin` contains a `$` or backtick (POSIX command substitution). */
+function assertNoCommandSubstitution(bin) {
+  if (COMMAND_SUBST_RE.test(bin)) {
+    throw new Error(
+      `adversarial-review: refusing to build a wrapper command from a bin path ` +
+        `containing a '$' or backtick (POSIX command-substitution metacharacter): ${bin}`
+    );
+  }
+}
+
 /**
  * Whether a bin string is a COMPOSITE invocation (a bare launcher word followed
  * by argument tokens, e.g. `npx adversarial-review-gate` or
@@ -92,6 +109,8 @@ function quoteToken(token) {
  * @returns {string}
  */
 function quoteBin(bin) {
+  // Reject command-substitution metacharacters first (fail closed): see above.
+  assertNoCommandSubstitution(bin);
   if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
   if (looksLikeComposite(bin)) {
     return tokenizeBin(bin).map(quoteToken).join(" ");

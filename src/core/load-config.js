@@ -111,7 +111,9 @@ function projectConfigWithinWorkspace(cwd, fullPath, io) {
  * @returns {Promise<object>} resolved config
  */
 export async function loadEffectiveConfig(cwd, io = {}) {
-  const home = resolveHomeDir(io.env);
+  // Pass cwd so an ADVERSARIAL_REVIEW_HOME override pointing INSIDE the workspace
+  // is rejected (a repo-controlled env must not relocate the trusted user base).
+  const home = resolveHomeDir(io.env, cwd);
   const userConfig = await readJsonTolerant(
     path.join(home, USER_CONFIG_REL),
     io,
@@ -368,16 +370,40 @@ function applyReviewerTrustFloor(merged, userConfig) {
  * @param {object} [env=process.env]
  * @returns {string} absolute state dir path
  */
-export function resolveStateDir(env = process.env) {
+export function resolveStateDir(env = process.env, cwd) {
   // Read case-insensitively: a plain-object/native-Windows env may carry the key
   // in a non-canonical case (e.g. "Adversarial_Review_State_Dir").
   const override = getEnvCaseInsensitive(env, "ADVERSARIAL_REVIEW_STATE_DIR");
-  // Only honor an ABSOLUTE override. A RELATIVE value would resolve under the
-  // current cwd — a project-writable location where a malicious repo could
-  // pre-seed the review-pass cache. A relative override is ignored so the state
-  // dir is always the user-level, non-repo-relative default.
-  if (override && path.isAbsolute(override)) return path.resolve(override);
-  return path.join(resolveHomeDir(env), ".adversarial-review", "state");
+  // Only honor an ABSOLUTE override that does NOT resolve INSIDE the workspace.
+  // A relative value, OR an absolute path under `cwd`, is a project-writable
+  // location where a malicious repo (or a repo-controlled env, e.g. an npm
+  // script / CI wrapper that sets ADVERSARIAL_REVIEW_STATE_DIR=$PWD/...) could
+  // pre-seed the review-pass cache and bypass review. Such overrides are ignored
+  // so the state dir is always the user-level, non-repo-relative default.
+  if (override && path.isAbsolute(override) && !overrideInsideCwd(cwd, override)) {
+    return path.resolve(override);
+  }
+  return path.join(resolveHomeDir(env, cwd), ".adversarial-review", "state");
+}
+
+/**
+ * Whether an absolute override path resolves INSIDE the workspace `cwd`. Used to
+ * reject ADVERSARIAL_REVIEW_HOME / ADVERSARIAL_REVIEW_STATE_DIR overrides that
+ * point into the (untrusted) repo, which would relocate the trusted user-level
+ * base or pass cache into a project-writable location. Pure path math (the dir
+ * may not exist yet), so `..` segments are collapsed by path.resolve. When `cwd`
+ * is not provided the check is a no-op (false).
+ *
+ * @param {string|undefined} cwd
+ * @param {string} overrideAbs  - an absolute override path
+ * @returns {boolean}
+ */
+function overrideInsideCwd(cwd, overrideAbs) {
+  if (!cwd) return false;
+  const root = path.resolve(cwd);
+  const cand = path.resolve(overrideAbs);
+  const rel = path.relative(root, cand);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 /**
@@ -405,16 +431,19 @@ export function resolveStateDir(env = process.env) {
  * @param {object} [env]  - environment variables
  * @returns {string} absolute home dir path
  */
-export function resolveHomeDir(env) {
+export function resolveHomeDir(env, cwd) {
   if (env) {
     const override = getEnvCaseInsensitive(env, "ADVERSARIAL_REVIEW_HOME");
-    // Only honor an ABSOLUTE override. A RELATIVE value would resolve under the
-    // current cwd, putting the user-level base (config, policy floor, state/pass
-    // cache, install registry) inside a project-writable location — a malicious
-    // repo could then pre-seed a review-pass cache entry. A relative override is
-    // ignored so the trusted user-level base is never repo-relative. (Mirrors the
-    // ADVERSARIAL_REVIEW_STATE_DIR guard in resolveStateDir.)
-    if (override && path.isAbsolute(override)) return override;
+    // Only honor an ABSOLUTE override that does NOT resolve INSIDE the workspace.
+    // A relative value, OR an absolute path under `cwd`, would put the trusted
+    // user-level base (config, policy floor, state/pass cache, install registry)
+    // inside a project-writable location — a malicious repo (or a repo-controlled
+    // env) could then supply a fake "user" config/policy that loosens the
+    // baseline, or pre-seed the pass cache. Such overrides are ignored so the
+    // trusted user-level base is never repo-relative. (Mirrors resolveStateDir.)
+    if (override && path.isAbsolute(override) && !overrideInsideCwd(cwd, override)) {
+      return override;
+    }
 
     const home = getEnvCaseInsensitive(env, "HOME");
     const userProfile = getEnvCaseInsensitive(env, "USERPROFILE");

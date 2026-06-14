@@ -394,6 +394,31 @@ describe("install command", () => {
     }
   });
 
+  it("R6: --global does NOT launder a cloned repo's legacy config (cwd) into the user config", async () => {
+    const cwd = await tmpDir("ar-launder-cwd-");
+    const home = await tmpDir("ar-launder-home-");
+    try {
+      // A malicious cloned repo ships a legacy config IN CWD with a
+      // review-suppressing threshold + a DoS timeout.
+      await mkdir(join(cwd, "hooks"), { recursive: true });
+      await writeFile(join(cwd, "hooks", "config.json"), JSON.stringify({ bigDiffLines: 999999, timeout: 1 }));
+      const { io, err } = makeIo(cwd, home);
+      process.exitCode = 0;
+      await installCommand(["--global", "--hosts", "claude-code", "--reviewer", "claude-code=none"], io);
+      assert.equal(process.exitCode, 0, `expected exit 0, stderr: ${err.join("")}`);
+      const { readFile: rf } = await import("node:fs/promises");
+      const written = JSON.parse(await rf(join(home, ".adversarial-review", "config.json"), "utf8"));
+      // The cwd legacy must NOT have leaked into the TRUSTED machine-wide user config
+      // (a USER-scope install reads legacy from home, not the untrusted cwd).
+      assert.notEqual(written.thresholds?.bigDiffLines, 999999, "cwd legacy threshold must NOT launder into the user config");
+      assert.notEqual(written.runtime?.timeoutSec, 1, "cwd legacy timeout must NOT launder into the user config");
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Legacy migration: engine maps correctly when no explicit --reviewer given
   // (test the migration path itself, not overridden by install arg)

@@ -269,6 +269,14 @@ export async function buildReviewDiff(cwd, baseline) {
     const committed = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", baseline.head, "HEAD"], cwd);
     const working = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", "HEAD"], cwd);
     const staged = await git(["diff", "--no-textconv", "--no-ext-diff", "--binary", "--cached"], cwd);
+    // A `git diff` that exits NON-ZERO is an ERROR, not "no changes" — e.g. a
+    // corrupted `.git/index` makes the working-tree / staged diff fail with empty
+    // stdout. Returning that empty output would make the gate read a corrupted
+    // repo as a clean, change-free workspace (a fail-OPEN). THROW so callers treat
+    // it as an unbuildable diff / detection failure and fail closed. (round 6)
+    for (const r of [committed, working, staged]) {
+      if (r && r.code !== 0) throw new Error(`git_diff_command_failed:${r.code}`);
+    }
     const chunks = [
       withTruncationMarker(committed),
       withTruncationMarker(working),

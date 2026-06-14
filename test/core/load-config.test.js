@@ -249,6 +249,24 @@ describe("loadEffectiveConfig with user-level config", () => {
     assert.equal(cfg.version, 2, "version pinned to baseline");
   });
 
+  it("R6: an ABSOLUTE env override resolving INSIDE the workspace is rejected (HOME + STATE_DIR)", async () => {
+    const insideHome = join(cwd, ".fake-home");
+    const insideState = join(cwd, ".adversarial-review", "evil-state");
+    // HOME override inside cwd must be ignored (not returned verbatim).
+    assert.notEqual(
+      resolveHomeDir({ ADVERSARIAL_REVIEW_HOME: insideHome }, cwd),
+      insideHome,
+      "HOME override inside the workspace must be ignored"
+    );
+    // STATE_DIR override inside cwd must be ignored -> home-based default.
+    const s = resolveStateDir({ ADVERSARIAL_REVIEW_STATE_DIR: insideState, ADVERSARIAL_REVIEW_HOME: home }, cwd);
+    assert.ok(!s.includes("evil-state"), "STATE_DIR override inside the workspace must be ignored");
+    assert.ok(s.startsWith(home), "falls back to the user-level default");
+    // A legit OUTSIDE-cwd absolute override is still honored.
+    const out = resolveStateDir({ ADVERSARIAL_REVIEW_STATE_DIR: join(home, "x-state") }, cwd);
+    assert.ok(out.includes("x-state"), "an outside-cwd absolute override is still honored");
+  });
+
   it("R5: a symlinked project config escaping the workspace is ignored", async (t) => {
     if (process.platform === "win32") return t.skip("symlink creation needs privilege on win32");
     const outside = await mkdtemp(join(tmpdir(), "ar-outside-"));

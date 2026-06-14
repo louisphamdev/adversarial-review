@@ -192,19 +192,69 @@ export function waitForExit(child) {
 }
 
 /**
+ * Send a POSIX signal to the child's whole PROCESS GROUP, falling back to the lone
+ * child pid if the group send is not possible.
+ *
+ * The reviewer children are spawned with `detached: true` (see
+ * core/process.js spawnResolved), which on POSIX makes the child a process-group
+ * LEADER (pgid == pid). `process.kill(-pid, sig)` then delivers `sig` to EVERY
+ * process in that group — the child AND any descendant it forked (or any process
+ * its shell wrapper backgrounded). Signalling only the direct child (`child.kill`)
+ * would leave such descendants ALIVE after the watchdog fires: orphaned processes
+ * that keep consuming resources and hold the gate's ambient permissions,
+ * accumulating across opencode's model-fallback retries.
+ *
+ * The group send can fail in two ways that BOTH require the direct-child fallback,
+ * so any failure falls through to `child.kill(signal)`:
+ *   - ESRCH on `-pid` is AMBIGUOUS: it means either the detached group is already
+ *     gone (child exited — the fallback then no-ops with its own swallowed ESRCH),
+ *     OR the child was NOT spawned detached so no group is named `pid` even though
+ *     the child is still ALIVE (the fallback then signals it). Treating `-pid`
+ *     ESRCH as unconditional success would silently leak a live non-detached child.
+ *   - any other error (e.g. EPERM/unsupported) — fall back so a hung child is still
+ *     terminated rather than the send silently no-op'ing.
+ * The direct-child fallback swallows its OWN ESRCH (the child exited in the
+ * meantime), so a genuinely-gone process is a clean no-op on every path.
+ *
+ * @param {import("node:child_process").ChildProcess} child
+ * @param {NodeJS.Signals} signal
+ */
+function signalGroup(child, signal) {
+  const pid = child.pid;
+  if (!pid) return;
+  try {
+    // Negative pid => the whole process group led by `pid`.
+    process.kill(-pid, signal);
+  } catch {
+    // Group send failed (gone, no group, or unsupported). Fall back to the direct
+    // child so a live non-detached child is still terminated; swallow ESRCH there
+    // (the child already exited).
+    try {
+      child.kill(signal);
+    } catch (err2) {
+      if (err2 && err2.code === "ESRCH") return;
+      /* already gone / cannot signal — ignore */
+    }
+  }
+}
+
+/**
  * Kill a child process tree as forcefully as possible.
  * On Windows, cmd.exe /c wrappers spawn node as a child; killing only the
  * cmd.exe parent leaves the node child running. Use taskkill /F /T to
  * terminate the entire process tree (already unconditional/forceful).
  *
- * On POSIX, send SIGTERM first (graceful) but ESCALATE to SIGKILL after a short
- * grace period: a child that traps or ignores SIGTERM (e.g. a malicious custom
- * reviewer running `trap '' TERM; sleep 3600`) would otherwise survive the
- * watchdog kill as a zombie still holding the gate's full permissions — and with
- * opencode's model-fallback chain, each timed-out model iteration could leak
- * another. The follow-up SIGKILL is unconditional, so a hung/malicious reviewer
- * is reliably terminated. The escalation timer is unref()'d so it never holds the
- * Node event loop open if the gate is otherwise done.
+ * On POSIX, signal the child's whole PROCESS GROUP (the children are spawned
+ * `detached`, so the child is a group leader): send SIGTERM first (graceful) but
+ * ESCALATE to SIGKILL after a short grace period. A child that traps or ignores
+ * SIGTERM (e.g. a malicious custom reviewer running `trap '' TERM; sleep 3600`),
+ * OR a descendant the reviewer forked, would otherwise survive the watchdog kill
+ * as a zombie still holding the gate's full permissions — and with opencode's
+ * model-fallback chain, each timed-out model iteration could leak another. The
+ * group-wide follow-up SIGKILL is unconditional, so a hung/malicious reviewer and
+ * all of its descendants are reliably terminated. The escalation timer is
+ * unref()'d so it never holds the Node event loop open if the gate is otherwise
+ * done.
  *
  * @param {import("node:child_process").ChildProcess} child
  */
@@ -216,17 +266,20 @@ export function forceKill(child) {
         windowsHide: true,
       });
     } else {
-      // Graceful first, then an unconditional SIGKILL after the grace period so a
-      // SIGTERM-trapping child cannot survive as a zombie.
-      child.kill("SIGTERM");
+      // Graceful first (whole group), then an unconditional group-wide SIGKILL
+      // after the grace period so neither a SIGTERM-trapping child NOR a forked
+      // descendant can survive as a zombie.
+      signalGroup(child, "SIGTERM");
       const killTimer = setTimeout(() => {
         try {
-          // child.killed only reflects that a signal was delivered, not that the
-          // process exited; re-send SIGKILL unconditionally. exitCode === null &&
-          // signalCode === null means it has not yet been reaped.
-          if (child.exitCode === null && child.signalCode === null) {
-            child.kill("SIGKILL");
-          }
+          // Re-send SIGKILL to the whole GROUP UNCONDITIONALLY after the grace
+          // period. We deliberately do NOT gate on `child.exitCode === null`: a
+          // descendant the reviewer forked can OUTLIVE the direct child (which may
+          // have exited on SIGTERM and already been reaped), so guarding on the
+          // leader's exit would skip the SIGKILL and leak the descendant. A
+          // group-wide SIGKILL to an already-empty group is a harmless ESRCH
+          // (swallowed by signalGroup), so the unconditional send is safe.
+          signalGroup(child, "SIGKILL");
         } catch { /* already gone */ }
       }, FORCE_KILL_GRACE_MS);
       if (killTimer && typeof killTimer.unref === "function") killTimer.unref();

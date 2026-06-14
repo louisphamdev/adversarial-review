@@ -317,3 +317,14 @@ describe("claude-code host: strict canonical hook ownership", () => {
     );
   });
 });
+
+describe("claude-code command-substitution rejection (round 6)", () => {
+  it("R6: refuses to build a hook command from a binPath with $() / backtick", () => {
+    assert.throws(
+      () => mergeClaudeCodeSettings({}, "/tmp/$(touch /tmp/pwned)/bin/adversarial-review.js"),
+      /command-substitution|\$/,
+      "a $()-bearing binPath must fail closed, not emit an injectable hook command"
+    );
+    assert.throws(() => mergeClaudeCodeSettings({}, "/x/`id`/ar.js"), /command-substitution|backtick/);
+  });
+});

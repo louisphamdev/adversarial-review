@@ -257,6 +257,91 @@ describe("spawnResolved batch-wrapper safety", () => {
 });
 
 // ---------------------------------------------------------------------------
+// spawnResolved — POSIX process-group leadership (Round 6 group-kill fix)
+// ---------------------------------------------------------------------------
+
+describe("spawnResolved process group (POSIX)", () => {
+  // REGRESSION (Round 6 / Finding HIGH): on POSIX the child must be spawned in its
+  // OWN process group/session (detached:true) so forceKill can signal the WHOLE
+  // group (process.kill(-pid,...)) and no forked descendant survives the watchdog.
+  // A group LEADER has pgid == pid, so a process group whose id equals the child's
+  // pid EXISTS — which we probe portably with `process.kill(-child.pid, 0)` (signal
+  // 0 = existence check). For a detached leader this SUCCEEDS; for a NON-detached
+  // child (sharing the parent's group) no group is named `child.pid`, so it would
+  // throw ESRCH. (process.getpgid is NOT used: it is unavailable on some Node POSIX
+  // builds.) Skipped on Windows (detached is intentionally NOT set there;
+  // taskkill /F /T tree-kills instead).
+  it("spawns the child as a process-group LEADER on POSIX (group id == child pid)", async () => {
+    if (process.platform === "win32") {
+      return; // detached is POSIX-only; Windows uses taskkill /F /T.
+    }
+    // A child that lives ~3s so the group exists while we probe it.
+    const child = spawnResolved(
+      process.execPath,
+      ["-e", "process.stdout.write('UP'); setTimeout(() => {}, 3000);"],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let up = "";
+    child.stdout.on("data", (c) => { up += c.toString(); });
+    const exited = new Promise((resolve) => {
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      // Wait until the child is up so its process group definitely exists.
+      const dl = Date.now() + 3000;
+      while (!up.includes("UP") && Date.now() < dl) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(up.includes("UP"), "child must be up before probing its group");
+
+      // The group whose pgid == child.pid exists IFF the child is its own leader
+      // (i.e. was spawned detached). Signal 0 is an existence/permission check.
+      let groupExists = false;
+      try {
+        process.kill(-child.pid, 0);
+        groupExists = true;
+      } catch (err) {
+        groupExists = false;
+      }
+      assert.ok(
+        groupExists,
+        "a detached child must be its OWN process-group leader (group id == pid) so forceKill can group-kill it"
+      );
+    } finally {
+      // Group-kill the whole group, then the lone pid, so nothing leaks.
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* gone */ }
+      try { process.kill(child.pid, "SIGKILL"); } catch { /* gone */ }
+      await exited;
+    }
+  });
+
+  // The detached process-group change must NOT alter the adapters' piped stdio:
+  // stdin is writable and stdout/stderr are readable exactly as before. (The codex
+  // and opencode adapters write the prompt/brief to the child's stdin and read the
+  // verdict from stdout — that contract must be preserved.)
+  it("preserves piped stdin/stdout (detached does not change stdio)", async () => {
+    // Echo stdin back to stdout: proves stdin is piped/writable AND stdout readable.
+    const child = spawnResolved(
+      process.execPath,
+      ["-e", "process.stdin.pipe(process.stdout)"],
+      { stdio: ["pipe", "pipe", "pipe"] }
+    );
+    assert.ok(child.stdin, "stdin must be a writable pipe");
+    assert.ok(child.stdout, "stdout must be a readable pipe");
+    let out = "";
+    child.stdout.on("data", (c) => { out += c.toString(); });
+    child.stdin.on("error", () => { /* ignore EPIPE on early exit */ });
+    child.stdin.end("round6-payload");
+    const code = await new Promise((resolve) => {
+      child.on("close", resolve);
+      child.on("error", () => resolve(null));
+    });
+    assert.equal(code, 0, "child exits 0");
+    assert.equal(out, "round6-payload", "stdin must reach the child and be echoed back via stdout");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // expandArgs
 // ---------------------------------------------------------------------------
 

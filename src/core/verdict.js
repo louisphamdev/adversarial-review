@@ -204,20 +204,39 @@ function hasDuplicateKeys(source) {
  * @returns {boolean} true if the START marker is inside an open code fence
  */
 function startMarkerIsFenced(text, markerStart) {
-  // Fence delimiter: a line whose first non-space content is ``` or ~~~ (3+).
-  const FENCE = /^[ \t]*(`{3,}|~{3,})/;
+  // Fence delimiter line: optional indent, then a run of 3+ backticks OR 3+
+  // tildes, then the rest of the line (an "info string" on an OPENING fence).
+  const FENCE = /^[ \t]*(`{3,}|~{3,})([^\n]*)$/;
   const prefix = text.slice(0, markerStart);
-  let open = false;
-  // Walk full lines in the prefix. The final (partial) segment is the text on the
-  // marker's own line that precedes the marker.
   const segments = prefix.split("\n");
-  for (let i = 0; i < segments.length - 1; i += 1) {
-    if (FENCE.test(segments[i])) open = !open;
-  }
-  // A fence opener on the marker's own line, before the marker, also fences it.
-  const lastSegment = segments[segments.length - 1];
-  if (FENCE.test(lastSegment)) open = !open;
-  return open;
+  // Track the OPEN fence's delimiter char + length (null => not in a fence).
+  // CommonMark: a fence opened with a run of N <char> is CLOSED only by a line
+  // whose delimiter is the SAME char, length >= N, and carries no info string.
+  // A SHORTER run, a DIFFERENT char, or a run-with-trailing-text inside an open
+  // fence is CONTENT, not a closer — toggling blindly (the old bug) let a 4-tick
+  // outer fence be "closed" by an inner 3-tick line, exposing the marker.
+  // (round 6 / Gemini + DeepSeek)
+  let openChar = null;
+  let openLen = 0;
+  const consider = (line) => {
+    const m = FENCE.exec(line);
+    if (!m) return;
+    const ch = m[1][0];
+    const len = m[1].length;
+    if (openChar === null) {
+      openChar = ch; // opening a fence (an info string is allowed here)
+      openLen = len;
+    } else if (ch === openChar && len >= openLen && m[2].trim() === "") {
+      openChar = null; // a valid matching closer
+      openLen = 0;
+    }
+    // else: a non-matching delimiter line inside an open fence is content.
+  };
+  // Walk full lines in the prefix; the final segment is the text on the marker's
+  // own line that precedes the marker (a fence opener there also fences it).
+  for (let i = 0; i < segments.length - 1; i += 1) consider(segments[i]);
+  consider(segments[segments.length - 1]);
+  return openChar !== null;
 }
 
 // Count non-overlapping occurrences of `needle` in `haystack`. Used to detect
@@ -310,7 +329,17 @@ export function validateVerdict(parsed, job) {
   if (parsed.reviewer !== job.reviewer) return { ok: false, error: "reviewer_mismatch" };
   if (parsed.level !== job.level) return { ok: false, error: "level_mismatch" };
   if (!["pass", "fail"].includes(parsed.verdict)) return { ok: false, error: "invalid_verdict_value" };
-  if (!Array.isArray(parsed.findings)) parsed.findings = [];
+  // A PRESENT `findings` field MUST be an array. Silently coercing a non-array
+  // (e.g. an object `{"severity":"Critical",...}`) to [] would let an untrusted
+  // reviewer SMUGGLE a blocking finding past the forced-fail net: the object is
+  // erased, `forcedFail` sees [], and a "pass" with a hidden Critical is accepted.
+  // Fail closed — a MISSING findings defaults to [], but a present NON-array is
+  // rejected. (round 6 / Gemini + DeepSeek)
+  if (parsed.findings === undefined || parsed.findings === null) {
+    parsed.findings = [];
+  } else if (!Array.isArray(parsed.findings)) {
+    return { ok: false, error: "invalid_findings_type" };
+  }
   if (!parsed.coverage || typeof parsed.coverage !== "object") {
     return { ok: false, error: "missing_coverage" };
   }
