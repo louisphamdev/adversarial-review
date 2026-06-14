@@ -71,6 +71,18 @@ const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 // too, where single quotes are literal — so a hard REJECT is the clean choice.)
 const COMMAND_SUBST_RE = /[$`]/;
 
+// Characters that force a token to be DOUBLE-QUOTED when emitted (a superset of
+// SHELL_META_RE plus whitespace). Beyond the shell metacharacters, a BARE token
+// carrying a single quote (') or a glob char (* ? [ ]) reaches the host's POSIX
+// shell unquoted and breaks the gate OPEN: the ' opens an unterminated quoted
+// string (the Stop-hook command fails to parse → no {"decision":"block"} is emitted
+// → the change is ALLOWED), and an unquoted glob expands to a different / missing
+// executable (same fail-open). All of these are INERT inside double quotes on POSIX
+// (and literal under cmd.exe), so quoting closes the hole. $ and backtick are NOT
+// relied on here — they EXPAND inside double quotes and are rejected outright by
+// assertNoCommandSubstitution before any quoting. (audit ROUND7 / GPT-5.5)
+const QUOTE_TRIGGER_RE = /[\s#;&|`$(){}<>'*?[\]]/;
+
 /**
  * Reject a bin invocation that contains POSIX command-substitution metacharacters
  * (`$` or backtick). These expand even inside double quotes, so there is no safe
@@ -172,9 +184,9 @@ function tokenizeBin(bin) {
   return tokens;
 }
 
-/** Quote a SINGLE token if it contains whitespace or a shell metacharacter. */
+/** Quote a SINGLE token if it contains whitespace, a shell metachar, or a quote/glob. */
 function quoteToken(token) {
-  if (!/\s/.test(token) && !SHELL_META_RE.test(token)) return token;
+  if (!QUOTE_TRIGGER_RE.test(token)) return token;
   return `"${token.replace(/"/g, '\\"')}"`;
 }
 
@@ -212,8 +224,8 @@ function quoteBin(bin) {
   // even inside double quotes on POSIX, so no quoting can make them safe in the
   // platform-agnostic hook command — fail closed at the source. (round 6)
   assertNoCommandSubstitution(bin);
-  // Already needs no quoting: no whitespace and no shell metacharacters.
-  if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
+  // Already needs no quoting: no whitespace, shell metachar, or quote/glob char.
+  if (!QUOTE_TRIGGER_RE.test(bin)) return bin;
   // Composite invocation (launcher + args): quote each token independently so the
   // launcher word is not swallowed into a single bogus quoted executable name.
   if (looksLikeComposite(bin)) {

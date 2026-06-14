@@ -6,7 +6,10 @@ const SECRET_PATTERNS = [
   // [A-Z0-9 ]+ prefix group covers RSA/EC/ECDSA/DSA/OPENSSH/PGP plus the
   // ED25519 and ENCRYPTED (PKCS#8) variants and the bare header.
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/,
-  /\bAKIA[0-9A-Z]{16}\b/,
+  // AWS access key IDs: AKIA (long-lived IAM) and ASIA (STS TEMPORARY credentials).
+  // Matching only AKIA let an ASIA-prefixed temporary key slip past the scanner.
+  // (audit ROUND7 / GPT-5.5)
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
   // GitHub tokens: classic personal/OAuth/server/user/refresh (gh[psoru]_) and
   // the fine-grained personal access token (github_pat_...). Fine-grained PATs
   // contain a `_` separator so they are matched as their own pattern.

@@ -105,7 +105,13 @@ export async function snapshotWorkspace(cwd, options = {}) {
     try {
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
-      // Unreadable directory (permissions, race): skip it.
+      // Unreadable directory (permissions, race): we CANNOT see its contents, so a
+      // change inside it is invisible to the snapshot — a fail-OPEN for the filesystem
+      // baseline (a directory made unreadable after baseline capture could hide a
+      // malicious edit). Mark the snapshot truncated so buildFilesystemReviewDiff
+      // emits the coverage-limitation sentinel and the gate forces review rather than
+      // treating the unreadable subtree as "no change". (audit ROUND7 / GPT-5.5)
+      truncated = true;
       continue;
     }
     // Sort entries by name so the walk order is deterministic and independent of
@@ -176,9 +182,13 @@ async function snapshotFile(absolute, rel, maxFileBytes) {
     const { hash, binary } = await streamHashAndProbe(absolute);
     return { hash, size, binary };
   } catch {
-    // Unreadable content (permissions, race): fall back to a metadata hash so
-    // at least a size change is still detected rather than dropping the file.
-    return { hash: sha256(`${rel}:${size}`), size, binary: true };
+    // Unreadable content (permissions, race): we cannot hash the real bytes, so the
+    // metadata fallback hash is IDENTICAL for two same-size payloads — a same-size
+    // content change would be INVISIBLE (a fail-OPEN). Keep the metadata hash (so a
+    // SIZE change is still detected) but flag the entry `unreadable` so
+    // buildFilesystemReviewDiff surfaces a coverage limitation and forces review
+    // rather than trusting "no change" for it. (audit ROUND7 / GPT-5.5)
+    return { hash: sha256(`${rel}:${size}`), size, binary: true, unreadable: true };
   }
 }
 
@@ -296,8 +306,17 @@ export async function buildReviewDiff(cwd, baseline) {
     return buildFilesystemReviewDiff(cwd, baseline);
   }
 
-  // Unknown baseline shape: no comparison possible. This is not the bypass case
-  // (there is no recorded snapshot to compare against).
+  // A NON-NULL baseline with an UNRECOGNIZED shape (e.g. `{type:"bogus"}`, or a git
+  // baseline missing its head) is a CORRUPTED/FORGED baseline, not "no baseline
+  // recorded". Returning a vacuous empty diff here would let it read as a clean,
+  // change-free workspace (a fail-OPEN) even when the working tree was modified.
+  // THROW so evaluateGate's diff===null path fails closed in enforced/strict (the
+  // same posture as a corrupted .git/index). A genuinely ABSENT baseline
+  // (null/undefined) still returns the empty diff below for the existing no-baseline
+  // handling. (audit ROUND7 / GPT-5.5)
+  if (baseline != null) {
+    throw new Error("unrecognized_baseline_shape");
+  }
   return { text: "", diffHash: sha256(""), changedFiles: [] };
 }
 
@@ -351,8 +370,15 @@ async function buildFilesystemReviewDiff(cwd, baseline) {
   // plus a synthetic reviewable changed-file entry, so the diff is never empty
   // and the gate is forced to treat the change set as needing manual review
   // rather than as "nothing changed".
-  if (baseline.truncated || currentTruncated) {
-    blocks.unshift(truncatedSnapshotBlock(baseline.truncated, currentTruncated));
+  // Also treat an UNREADABLE file (content could not be hashed, in EITHER snapshot)
+  // as a coverage limitation: a same-size content change to it would be invisible, so
+  // it must not pass as "no change". Surface it through the SAME sentinel path.
+  // (audit ROUND7 / GPT-5.5)
+  const anyUnreadable =
+    [...current.values()].some((info) => info && info.unreadable) ||
+    Object.values(baselineSnapshot).some((info) => info && info.unreadable);
+  if (baseline.truncated || currentTruncated || anyUnreadable) {
+    blocks.unshift(truncatedSnapshotBlock(baseline.truncated, currentTruncated || anyUnreadable));
     if (!changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
       changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
     }

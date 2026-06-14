@@ -22,8 +22,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # Zero runtime deps, but `npm ci` works against the lockfile-less manifest
-      # and validates the package can be installed cleanly.
+      # Zero runtime deps, but `npm ci` REQUIRES a committed package-lock.json (it
+      # errors out without one — which previously failed every CI run at this step,
+      # before the test step ever ran). The lockfile is now checked in; `npm ci`
+      # validates a clean, reproducible install against it.
       - name: Install dependencies
         run: npm ci
 

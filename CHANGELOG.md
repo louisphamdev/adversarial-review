@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-06-14
+
+A sixth review round driven by **GPT-5.5 (xhigh reasoning)**, one monitor subagent
+per outsourced reviewer shell. It surfaced gaps the previous five rounds missed —
+two Windows command-search RCE vectors, an unguarded `HOME`/`USERPROFILE`, and a
+handful of filesystem-baseline / quoting fail-opens — plus the reason **CI had been
+red on every recent commit**. All confirmed findings reproduced, fixed fail-closed,
+and regression-tested. 713 tests, 705 pass, 8 platform-skips.
+
+### CI
+- **Every recent CI run was failing before the test step:** the workflow runs
+  `npm ci`, which REQUIRES a `package-lock.json`, but none was committed (`npm ci`
+  errors out without a lockfile). A minimal lockfile (the package has zero runtime
+  deps) is now checked in, so `npm ci` — and therefore the whole pipeline — runs.
+
+### Security
+- **Windows reviewer RCE via bare `cmd.exe` / `taskkill` (two vectors):** spawning a
+  batch (`.cmd`/`.bat`) reviewer wrapper used a bare `cmd.exe`, and the watchdog's
+  force-kill used a bare `taskkill` — both resolved by `CreateProcess` from the
+  UNTRUSTED repo's working directory first, so a repo-local `cmd.exe`/`taskkill.exe`
+  could execute and break the read-only reviewer isolation. Both now anchor to an
+  absolute `%SystemRoot%\System32\…` path.
+- **`HOME`/`USERPROFILE` could relocate the trusted user base into the repo:** the
+  round-6 fix guarded only the dedicated `ADVERSARIAL_REVIEW_HOME` override against
+  pointing inside `cwd`. A repo-controlled wrapper setting `HOME=$PWD` /
+  `USERPROFILE=%CD%` could still move the trusted config/policy/pass-cache into the
+  project-writable tree. The same inside-`cwd` guard now applies to `HOME`/
+  `USERPROFILE`, with an env-independent `os.userInfo()` fallback for the
+  (poisoned-`os.homedir()`) edge.
+- **Filesystem-baseline fail-opens (non-git workspaces):** an unreadable directory
+  was silently skipped (a change inside it vanished), an unreadable same-size file
+  read as "no change", and an unrecognized/corrupted baseline shape returned a
+  vacuous empty diff. All three now fail closed (coverage-limitation sentinel /
+  thrown detection failure → block in enforced).
+- **Hook/wrapper command broke open on `'` or glob chars:** a bin path containing a
+  single quote (unterminated POSIX quote → the Stop hook fails to emit a block) or a
+  glob char (`* ? [ ]`, expands to the wrong/no executable) was emitted unquoted.
+  These are now double-quoted (inert inside double quotes); `$`/backtick stay
+  hard-rejected.
+- **`check` reviewed nothing on a non-git workspace:** it snapshotted the current
+  tree as its own baseline, so already-present (possibly malicious) code passed as
+  clean. `check` now reviews a non-git workspace against an empty baseline.
+- **Project could null out a user-pinned reviewer entry** to drop its
+  models/required-dimensions/timeout back to weaker defaults; a corrupted (null/
+  scalar/array) reviewer entry is now restored from the trusted baseline.
+- **AWS STS temporary keys (`ASIA…`) added to the secret scanner** (only the
+  long-lived `AKIA…` prefix was matched before).
+- **Session-state temp file uses a random UUID** instead of `pid`+`Date.now()`, so
+  two writes in the same process+millisecond can no longer collide.
+
 ## [2.2.2] - 2026-06-14
 
 A fifth review round using yet another model family (Google **Gemini 3.5**,

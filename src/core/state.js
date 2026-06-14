@@ -10,6 +10,7 @@
 
 import { readFile, writeFile, rename, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { sha256 } from "./hash.js";
 
 // Owner read/write only. Honored on POSIX; a no-op effect on Windows but safe.
@@ -65,8 +66,11 @@ export async function readSessionState(stateDir, sessionId) {
 export async function writeSessionState(stateDir, sessionId, state) {
   await mkdir(stateDir, { recursive: true, mode: DIR_MODE });
   const file = join(stateDir, sessionFileName(sessionId));
-  // Unique temp name so concurrent writers do not clobber each other's temp.
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  // Unique temp name so concurrent writers do not clobber each other's temp. Use a
+  // random UUID rather than Date.now(): two writes in the SAME process AND the SAME
+  // millisecond would otherwise pick the same temp path and race (one rename hits
+  // ENOENT, or an update is lost). randomUUID() is collision-free. (audit ROUND7)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   const payload = { ...state, updatedAt: Date.now() };
   await writeFile(tmp, JSON.stringify(payload), { mode: FILE_MODE });
   await rename(tmp, file);

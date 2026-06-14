@@ -48,6 +48,17 @@ export async function checkCommand(argv, io) {
   try {
     try {
       baseline = await captureBaseline(cwd);
+      // captureBaseline returns a GIT baseline (HEAD) when the workspace is a git repo
+      // with commits — `check` then reviews uncommitted changes (correct). But for a
+      // NON-GIT workspace (or a zero-commit repo) it snapshots the CURRENT tree, so
+      // evaluateGate would diff current-vs-current and review NOTHING — a fail-OPEN
+      // that reports already-present (possibly malicious) code as clean. For `check`
+      // — a manual, whole-workspace review — replace that with an EMPTY baseline so
+      // every current file is surfaced as an addition and actually reviewed.
+      // (audit ROUND7 / GPT-5.5)
+      if (baseline && baseline.type === "filesystem") {
+        baseline = { ...baseline, snapshot: {}, truncated: false };
+      }
     } catch (capErr) {
       // Record the capture failure and re-throw INTO the fail-closed catch below so
       // the same fail-closed decision path runs (now with the detection-failed

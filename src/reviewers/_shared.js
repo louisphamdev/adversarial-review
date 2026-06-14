@@ -8,6 +8,7 @@
 // I/O lives in this module.
 
 import { spawnSync } from "node:child_process";
+import { system32Path } from "../core/process.js";
 
 // Default timeout in seconds when neither config nor job specifies one.
 // Used by the FIXED-deadline runWithTimeout (verify() probes). For the actual
@@ -261,7 +262,10 @@ function signalGroup(child, signal) {
 export function forceKill(child) {
   try {
     if (process.platform === "win32" && child.pid) {
-      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
+      // Use a TRUSTED ABSOLUTE taskkill.exe path: a bare "taskkill" would be resolved
+      // by CreateProcess from forceKill's cwd FIRST (commonly the untrusted repo), so
+      // a repo-local taskkill.exe could run on every watchdog timeout — RCE. (ROUND7)
+      spawnSync(system32Path("taskkill.exe"), ["/F", "/T", "/PID", String(child.pid)], {
         stdio: "ignore",
         windowsHide: true,
       });

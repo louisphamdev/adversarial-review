@@ -18,6 +18,16 @@ const SHELL_META_RE = /[#;&|`$(){}<>]|&&|\|\|/;
 // rather than emit an injectable command. Mirrors claude-code.js.
 const COMMAND_SUBST_RE = /[$`]/;
 
+// Characters that force a token to be DOUBLE-QUOTED when emitted (a superset of
+// SHELL_META_RE plus whitespace). A BARE token carrying a single quote (') or a glob
+// char (* ? [ ]) reaches a POSIX shell unquoted and breaks the printed wrapper
+// command: the ' opens an unterminated quoted string (the command fails to parse), an
+// unquoted glob expands to a different / missing executable — either way the user's
+// pasted wrapper does not launch and the review gate is skipped. All are INERT inside
+// double quotes on POSIX (and literal under cmd.exe). $ and backtick are rejected
+// outright by assertNoCommandSubstitution. Mirrors claude-code.js. (audit ROUND7)
+const QUOTE_TRIGGER_RE = /[\s#;&|`$(){}<>'*?[\]]/;
+
 /** Throw when `bin` contains a `$` or backtick (POSIX command substitution). */
 function assertNoCommandSubstitution(bin) {
   if (COMMAND_SUBST_RE.test(bin)) {
@@ -86,9 +96,9 @@ function tokenizeBin(bin) {
   return tokens;
 }
 
-/** Double-quote a single token if it has whitespace or a shell metacharacter. */
+/** Double-quote a single token if it has whitespace, a shell metachar, or a quote/glob. */
 function quoteToken(token) {
-  if (!/\s/.test(token) && !SHELL_META_RE.test(token)) return token;
+  if (!QUOTE_TRIGGER_RE.test(token)) return token;
   return `"${token.replace(/"/g, '\\"')}"`;
 }
 
@@ -111,7 +121,7 @@ function quoteToken(token) {
 function quoteBin(bin) {
   // Reject command-substitution metacharacters first (fail closed): see above.
   assertNoCommandSubstitution(bin);
-  if (!/\s/.test(bin) && !SHELL_META_RE.test(bin)) return bin;
+  if (!QUOTE_TRIGGER_RE.test(bin)) return bin;
   if (looksLikeComposite(bin)) {
     return tokenizeBin(bin).map(quoteToken).join(" ");
   }

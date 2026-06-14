@@ -99,6 +99,30 @@ export async function resolveExecutable(command, env = process.env) {
 const CMD_METACHAR_RE = /[&|<>^"%()\r\n]/;
 
 /**
+ * Resolve a trusted ABSOLUTE path to a Windows System32 executable.
+ *
+ * SECURITY (audit ROUND7 / GPT-5.5): spawning a BARE Windows command name
+ * ("cmd.exe", "taskkill") lets CreateProcess / libuv resolve it from the CHILD's
+ * working directory FIRST. Reviewer children (and the watchdog's forceKill) run with
+ * cwd set to the UNTRUSTED repository, so a repo-local `cmd.exe` / `taskkill.exe`
+ * would execute instead of the system one — arbitrary code execution that breaks the
+ * read-only reviewer isolation boundary. Anchoring to %SystemRoot%\System32\<exe>
+ * (an absolute path, which suppresses the cwd/PATH search) closes this. SystemRoot is
+ * read from the GATE's own trusted process.env (never the child's, possibly
+ * repo-influenced, env), with windir and the canonical C:\Windows as fallbacks.
+ *
+ * @param {string} exe  - bare executable name, e.g. "cmd.exe" / "taskkill.exe"
+ * @returns {string}    - absolute System32 path
+ */
+export function system32Path(exe) {
+  const root =
+    getEnvCaseInsensitive(process.env, "SystemRoot") ||
+    getEnvCaseInsensitive(process.env, "windir") ||
+    "C:\\Windows";
+  return path.join(root, "System32", exe);
+}
+
+/**
  * Spawn a RESOLVED executable path with shell:false.
  *
  * On Windows, `.cmd` and `.bat` files cannot be spawned directly with
@@ -150,8 +174,10 @@ export function spawnResolved(resolvedPath, args, options = {}) {
           throw new Error("unsafe_batch_argument");
         }
       }
-      // Wrap batch files with cmd.exe /c to avoid EINVAL with shell:false.
-      command = "cmd.exe";
+      // Wrap batch files with cmd.exe /c to avoid EINVAL with shell:false. Use a
+      // TRUSTED ABSOLUTE cmd.exe path (not a bare "cmd.exe", which CreateProcess would
+      // resolve from the untrusted repo cwd first → repo-local cmd.exe RCE). (ROUND7)
+      command = system32Path("cmd.exe");
       finalArgs = ["/c", resolvedPath, ...args];
     }
   }

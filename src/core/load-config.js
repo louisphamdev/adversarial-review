@@ -214,6 +214,25 @@ export async function loadEffectiveConfig(cwd, io = {}) {
     merged.reviewers = structuredClone(baseline.reviewers);
   }
 
+  // Per-ENTRY restore: a project `reviewers.opencode = null` (or a scalar/array)
+  // must not WIPE an individual user/baseline reviewer entry either.
+  // applyReviewerTrustFloor SKIPS a corrupted (null/scalar/array) entry, so without
+  // this a project could null out a user-pinned reviewer to drop its models /
+  // requiredDimensions / timeout / readOnlyConfig back to the gate's weaker built-in
+  // defaults (a downgrade the trust floor is meant to prevent). Restore the trusted
+  // baseline entry for any id the project corrupted. (audit ROUND7 / GPT-5.5)
+  if (
+    merged.reviewers && typeof merged.reviewers === "object" && !Array.isArray(merged.reviewers) &&
+    baseline.reviewers && typeof baseline.reviewers === "object"
+  ) {
+    for (const id of Object.keys(baseline.reviewers)) {
+      const entry = merged.reviewers[id];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        merged.reviewers[id] = structuredClone(baseline.reviewers[id]);
+      }
+    }
+  }
+
   return merged;
 }
 
@@ -451,18 +470,63 @@ export function resolveHomeDir(env, cwd) {
     if (process.platform === "win32") {
       // On Windows, prefer USERPROFILE (a real native path) over a possibly
       // POSIX-style HOME. Only trust HOME if it looks like a native Windows path.
-      if (userProfile) return userProfile;
+      if (userProfile && envHomeUsable(cwd, userProfile)) return userProfile;
       if (home) {
         const normalized = normalizeWindowsHome(home);
-        if (normalized) return normalized;
+        if (normalized && envHomeUsable(cwd, normalized)) return normalized;
       }
     } else {
       // POSIX behavior unchanged: HOME first, then USERPROFILE.
-      if (home) return home;
-      if (userProfile) return userProfile;
+      if (home && envHomeUsable(cwd, home)) return home;
+      if (userProfile && envHomeUsable(cwd, userProfile)) return userProfile;
     }
   }
-  return os.homedir();
+  return safeOsHomedir(cwd);
+}
+
+/**
+ * Whether an env-provided home value (HOME / USERPROFILE) is usable as the TRUSTED
+ * user-level base. The dedicated ADVERSARIAL_REVIEW_HOME override is already guarded
+ * against pointing INSIDE cwd; HOME / USERPROFILE are the STANDARD env vars a
+ * repo-controlled wrapper (an npm script / CI step setting HOME=$PWD or
+ * USERPROFILE=%CD%) would set to relocate the trusted base — fake user config/policy
+ * that loosens the baseline, or a pre-seeded pass cache — into the project-writable
+ * tree. Reject an ABSOLUTE value that resolves inside cwd so HOME/USERPROFILE get the
+ * SAME inside-cwd guard as the dedicated override. A relative value (degenerate, rare)
+ * keeps the prior behavior. When cwd is not provided the guard is a no-op.
+ * (audit ROUND7 / GPT-5.5: the round-6 fix guarded only ADVERSARIAL_REVIEW_HOME.)
+ *
+ * @param {string|undefined} cwd
+ * @param {string} value  - a HOME / USERPROFILE env value
+ * @returns {boolean}
+ */
+function envHomeUsable(cwd, value) {
+  if (path.isAbsolute(value) && overrideInsideCwd(cwd, value)) return false;
+  return true;
+}
+
+/**
+ * os.homedir() ITSELF consults HOME (POSIX) / USERPROFILE (win32), so a repo-poisoned
+ * env that points those INSIDE cwd would make even the final fallback resolve into the
+ * repo — re-opening the same hole envHomeUsable closes above. When os.homedir() lands
+ * inside cwd, fall back to os.userInfo().homedir, which reads the OS account database
+ * (POSIX getpwuid / win32 user token) and is NOT influenced by the env. Only if that
+ * is unavailable do we return the (poisoned) os.homedir() value. (audit ROUND7)
+ *
+ * @param {string|undefined} cwd
+ * @returns {string}
+ */
+function safeOsHomedir(cwd) {
+  const h = os.homedir();
+  if (cwd && typeof h === "string" && path.isAbsolute(h) && overrideInsideCwd(cwd, h)) {
+    try {
+      const info = os.userInfo();
+      if (info && typeof info.homedir === "string" && info.homedir) return info.homedir;
+    } catch {
+      /* no OS account entry — fall through to the os.homedir() value */
+    }
+  }
+  return h;
 }
 
 /**
