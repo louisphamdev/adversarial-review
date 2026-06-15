@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] - 2026-06-15
+
+A fix to the **Claude Code plugin manifest** itself — the channel that had silently
+kept the gate from arming on a fresh marketplace install.
+
+### Fixed
+- **Plugin manifest `hooks` had an INVALID schema → plugin failed to load → gate
+  silently OFF.** `.claude-plugin/plugin.json` declared its hooks as a FLAT STRING
+  (`"SessionStart": "node …"`) instead of the nested
+  `[{ "hooks": [{ "type": "command", "command": "…" }] }]` array Claude Code
+  requires. A `marketplace add`/`update` re-clone would fail validation and load no
+  hooks, so the Stop gate never fired — the worst failure mode for a security gate
+  (silently disabled). The manifest now uses the correct nested schema (matching the
+  installer's own output), with the Stop hook's 300s timeout preserved so a real
+  review is not killed mid-flight.
+- **Plugin manifest version drift:** `plugin.json` was pinned at `2.1.0` while the
+  package had moved several patches ahead. It now tracks the package version, and a
+  new meta-test (`test/meta/plugin-manifest.test.js`, run in CI and `prepublishOnly`)
+  fails the pipeline on any future version drift OR a regression back to the invalid
+  flat-string hooks schema — so a broken manifest can never ship again.
+
 ## [2.2.3] - 2026-06-14
 
 A sixth review round driven by **GPT-5.5 (xhigh reasoning)**, one monitor subagent
