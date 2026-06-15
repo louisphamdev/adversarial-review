@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review-gate",
-  "version": "2.2.4",
+  "version": "2.2.5",
   "description": "NodeJS multi-tool adversarial review gate for coding agents.",
   "type": "module",
   "bin": {

@@ -5,7 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.4] - 2026-06-15
+## [2.2.5] - 2026-06-15
+
+`doctor` now recognizes a gate armed via the Claude Code **plugin** — closing a
+false-negative health verdict.
+
+### Fixed
+- **`doctor` falsely reported "not enforced" for a plugin-armed gate.** Its hook-
+  registration check only read `.claude/settings.json`, but Claude Code loads a
+  plugin's hooks from the installed plugin manifest at runtime and never writes them
+  into settings.json. So a gate armed purely by the plugin made `doctor` warn "hooks
+  NOT registered" and exit non-zero (a CI step would fail on a gate that IS enforcing).
+  `doctor` now also reads Claude Code's on-disk plugin state — `installed_plugins.json`
+  (install records + paths), `enabledPlugins` across settings scopes, and the installed
+  manifest's hooks — and counts the gate as enforced when the plugin is **installed AND
+  enabled AND its manifest provides valid canonical SessionStart + Stop hooks**.
+
+### Security / accuracy
+- The plugin path counts as enforced ONLY when all three conditions hold, so an
+  installed-but-**disabled** plugin, or one whose installed manifest hooks are
+  stale/broken (e.g. the pre-2.2.4 flat-string schema), is still reported as NOT
+  enforcing — no false "enforced" confidence. `doctor`'s warning now names the precise
+  cause (disabled vs. stale manifest vs. not installed) and the exact remediation.
+- An adversarial review (GPT-5.5-xhigh, dogfooded via opencode) of this change closed
+  two FALSE-POSITIVE vectors before release: (1) the canonical hook matcher now
+  requires `type:"command"`, so a leaf carrying our command string under a non-command
+  type (which Claude Code never executes) is no longer counted as registered; (2) the
+  plugin detector now verifies the installed manifest's `name` matches our plugin, so a
+  stale/impersonating install record keyed as ours cannot fake an enforced gate.
+
+
 
 A fix to the **Claude Code plugin manifest** itself — the channel that had silently
 kept the gate from arming on a fresh marketplace install.

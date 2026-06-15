@@ -24,6 +24,7 @@ import {
   detectTamperedClaudeCodeHooks,
   claudeCodeSettingsPath,
 } from "../hosts/claude-code.js";
+import { detectClaudeCodePluginGate } from "../hosts/claude-code-plugin.js";
 
 // Paths relative to home / cwd.
 const PROJECT_CONFIG_REL = path.join(".adversarial-review", "config.json");
@@ -72,6 +73,20 @@ async function readPackageVersion() {
   }
 }
 
+/** Read .claude-plugin/plugin.json to get OUR plugin name (used to match the installed
+ *  plugin record in Claude Code's plugin state). Falls back to the stable default. */
+async function readPluginName() {
+  try {
+    const thisFile = fileURLToPath(import.meta.url);
+    const manifestPath = path.join(path.dirname(thisFile), "..", "..", ".claude-plugin", "plugin.json");
+    const raw = await readFile(manifestPath, "utf8");
+    const m = JSON.parse(raw);
+    return (m && typeof m.name === "string" && m.name) || "adversarial-review";
+  } catch {
+    return "adversarial-review";
+  }
+}
+
 /** Check whether a reviewer is available; return { ok, resolvedPath, version, capabilities, reason }. */
 async function checkReviewer(reviewerId, config, env) {
   if (reviewerId === "none") {
@@ -99,8 +114,9 @@ export async function doctorCommand(argv, io) {
   const env = io.env || process.env;
   const home = resolveHomeDir(env);
 
-  // Read package version.
+  // Read package version + our plugin name (for plugin-gate detection).
   const version = await readPackageVersion();
+  const pluginName = await readPluginName();
 
   // Locate config files.
   const projectConfigPath = path.join(cwd, PROJECT_CONFIG_REL);
@@ -184,25 +200,56 @@ export async function doctorCommand(argv, io) {
     if (hostId === "claude-code") {
       const projectRegistered = projectHooks.sessionStart && projectHooks.stop;
       const userRegistered = userHooks.sessionStart && userHooks.stop;
-      const tampered =
+      // ALSO detect a gate armed via the Claude Code PLUGIN system. Plugin-provided
+      // hooks are loaded from the installed plugin manifest at runtime and are NEVER
+      // written into settings.json, so a settings.json-only check is a FALSE NEGATIVE
+      // for a plugin-armed gate (doctor would exit non-zero on a gate that IS
+      // enforcing). Counted as registered ONLY when the plugin is installed AND enabled
+      // AND its manifest provides valid canonical hooks (no false "enforced").
+      const pluginGate = detectClaudeCodePluginGate({ home, cwd, pluginName });
+      const settingsTampered =
         projectTampered.sessionStart ||
         projectTampered.stop ||
         userTampered.sessionStart ||
         userTampered.stop;
+      const tampered = settingsTampered || pluginGate.tampered;
+      const registered = projectRegistered || userRegistered || pluginGate.registered;
       hostReport.hooks = {
         projectSettingsPath,
         userSettingsPath,
         project: projectHooks,
         user: userHooks,
-        registered: projectRegistered || userRegistered,
+        plugin: pluginGate,
+        registered,
+        registeredVia: projectRegistered || userRegistered ? "settings" : pluginGate.registered ? "plugin" : null,
         tampered,
       };
-      if (!hostReport.hooks.registered) {
-        warnings.push(
-          `WARNING: Host "claude-code" is configured but our SessionStart + Stop ` +
-            `hooks are NOT registered in ${projectSettingsPath} (project) or ` +
-            `${userSettingsPath} (user). Run \`adversarial-review install\` to register them.`
-        );
+      if (!registered) {
+        // Tailor the guidance to WHY it is not registered: an installed-but-disabled
+        // plugin (enable it) or a stale/broken plugin manifest (update it) is a
+        // different fix from "not installed at all" (run install).
+        if (pluginGate.installed && !pluginGate.enabled) {
+          warnings.push(
+            `WARNING: Host "claude-code": the adversarial-review PLUGIN is installed but ` +
+              `DISABLED (${pluginGate.key} is not enabled in settings) and no SessionStart+Stop ` +
+              `hooks are registered in settings.json — the gate will NOT run. Enable the plugin ` +
+              `(\`claude plugin enable ${pluginGate.key}\`) or run \`adversarial-review install\`.`
+          );
+        } else if (pluginGate.installed && pluginGate.enabled && !pluginGate.providesHooks) {
+          warnings.push(
+            `WARNING: Host "claude-code": the adversarial-review PLUGIN is enabled but its ` +
+              `installed manifest provides no valid SessionStart+Stop hooks (stale/broken ` +
+              `plugin.json${pluginGate.version ? ` v${pluginGate.version}` : ""}). Update the plugin ` +
+              `(\`claude plugin update\`) so the gate hooks load.`
+          );
+        } else {
+          warnings.push(
+            `WARNING: Host "claude-code" is configured but our SessionStart + Stop ` +
+              `hooks are NOT registered in ${projectSettingsPath} (project) or ` +
+              `${userSettingsPath} (user), and no enabled plugin provides them. ` +
+              `Run \`adversarial-review install\` to register them.`
+          );
+        }
       }
       if (tampered) {
         warnings.push(
@@ -416,10 +463,11 @@ function printHumanReport(report, io) {
       } else {
         w(`    reviewer status: UNAVAILABLE (${h.reviewerReason || "unknown"})\n`);
       }
-      // Native hook registration (claude-code only).
+      // Native hook registration (claude-code only) — via settings.json OR plugin.
       if (h.hooks) {
         w(
           `    native hooks registered: ${h.hooks.registered ? "yes" : "NO"}` +
+            `${h.hooks.registered && h.hooks.registeredVia ? ` (via ${h.hooks.registeredVia})` : ""}` +
             `${h.hooks.tampered ? " (TAMPERED hook present!)" : ""}\n`
         );
         w(
@@ -430,6 +478,15 @@ function printHumanReport(report, io) {
           `      user (${h.hooks.userSettingsPath}): ` +
             `SessionStart=${h.hooks.user.sessionStart} Stop=${h.hooks.user.stop}\n`
         );
+        const p = h.hooks.plugin;
+        if (p && p.installed) {
+          w(
+            `      plugin: installed=yes enabled=${p.enabled} providesHooks=${p.providesHooks}` +
+              `${p.version ? ` v${p.version}` : ""}${p.reason ? ` (${p.reason})` : ""}\n`
+          );
+        } else {
+          w(`      plugin: not installed${p && p.reason ? ` (${p.reason})` : ""}\n`);
+        }
       }
       // opencode reviewer details.
       if (h.opencode) {

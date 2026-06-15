@@ -395,6 +395,12 @@ function tokenizeBinForOwnership(prefix) {
  */
 function isOurHookLeaf(leaf, event) {
   if (!leaf || typeof leaf.command !== "string") return false;
+  // Claude Code only EXECUTES `type:"command"` hooks. A leaf that carries our exact
+  // canonical command string under a non-command type (e.g. `type:"prompt"`) does NOT
+  // actually run the gate, so it must NOT be counted as registered — otherwise doctor
+  // (and the plugin-gate detector that reuses this matcher) would report a FALSE
+  // "enforced" on a gate that never fires. (audit ROUND7 / GPT-5.5-xhigh, doctor-plugin)
+  if (leaf.type !== "command") return false;
   const cmd = normalizeCommand(leaf.command);
   const tail = `hook --host claude-code --event ${event}`;
   if (cmd !== tail && !cmd.endsWith(` ${tail}`)) return false;
