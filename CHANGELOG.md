@@ -5,7 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.5] - 2026-06-15
+## [2.2.6] - 2026-06-15
+
+Fixes a hard `RangeError` that made the gate unusable on workspaces containing a large
+virtualenv whose name was not exactly `.venv`.
+
+### Fixed
+- **`buildReviewDiff` threw `RangeError: Invalid string length` → gate failed closed
+  every turn.** `SKIP_DIRS` only matched the literal `.venv`, so a virtualenv with a
+  variant name (`.venv-mcp`, `venv311`, `virtualenv`, …) was not skipped: every file in
+  it (a torch install is >1 GB) was synthesized into the diff, and the final
+  `chunks.join("\n")` exceeded V8's ~512 MiB max string length. The throw made
+  `evaluateGate` see `diff === null` and block every turn with a misleading "repository
+  may be corrupted". The skip list now matches common virtualenv name **variants** (in
+  both the filesystem walk and the git-untracked filter), kept precise so a real source
+  directory is never skipped (`venvironment`, `env`, `myvenv` are NOT matched).
+
+### Robustness
+- **Total-diff byte budget (defense-in-depth).** Any pathological large untracked/added
+  tree (not just a virtualenv) now degrades to the coverage-limitation sentinel — the
+  gate fails closed with a clear "diff too large, review manually" message — instead of
+  crashing on an over-long string. The synthesized diff can no longer overflow V8's
+  string limit.
+- **`isUnderSkipDir` now matches only PARENT path segments**, so a real source file
+  literally named like a skip directory (e.g. `venv.py`, `node_modules`) is still
+  reviewed rather than silently skipped (a basename match was a latent fail-open).
+
+### Hardened in review (GPT-5.5-xhigh, dogfooded via opencode)
+An adversarial review of this fix surfaced four more issues, all fixed + tested before
+release:
+- **Virtualenv match made precise** — the first regex was too broad and would have
+  SKIPPED real source directories like `venv-api`, `venv_src`, `virtualenv.config` (a
+  fail-open). It now matches dotted `.venv*` broadly but a non-dotted name only when
+  unambiguous (`venv`, `venv311`, `virtualenv`).
+- **Newline-in-filename fail-open closed** — git output is now parsed NUL-delimited
+  (`ls-files -z`, `diff --name-status -z`); previously a file named `src/evil\n.js` was
+  split into fake paths and its real content hidden from the reviewer.
+- **Huge single file no longer OOMs the gate** — synthesized diffs now read at most the
+  per-file cap (+1) instead of loading the whole file, so one 900 MB untracked text file
+  can't crash the gate before the cap applies.
+- **Byte budget covers the base git diff too** — if the committed/working/staged diffs
+  alone exceed the cap (with no untracked files), the coverage sentinel still fires.
+
+
 
 `doctor` now recognizes a gate armed via the Claude Code **plugin** — closing a
 false-negative health verdict.

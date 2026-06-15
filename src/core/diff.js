@@ -1,4 +1,4 @@
-import { readFile, readdir, stat, readlink } from "node:fs/promises";
+import { readFile, readdir, stat, readlink, open } from "node:fs/promises";
 import { createReadStream, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -20,6 +20,38 @@ const SKIP_DIRS = new Set([
   ".venv",
   "__pycache__",
 ]);
+
+// A directory whose name is a Python VIRTUALENV. These hold installed third-party
+// packages (like node_modules) — not the user's reviewable code — and can be ENORMOUS
+// (a torch install is >1 GB). SKIP_DIRS lists only the literal ".venv", but real
+// projects use variant names (".venv-mcp", "venv311", "virtualenv"), none of which
+// matched — so the ENTIRE tree was synthesized into the diff and could overflow V8's
+// ~512 MiB max string length (RangeError → buildReviewDiff throws → the gate reads
+// diff===null and fails closed EVERY turn).
+//
+// PRECISION (a too-broad match is a fail-OPEN: skipping a real source dir hides code
+// from review). A DOTTED ".venv*" name is, by universal convention, a virtualenv, so we
+// match it broadly (optional version digits or a "-_."-separated suffix: ".venv-mcp",
+// ".venv311", ".venv.bak"). A NON-dotted name is only matched when it is unambiguous —
+// exactly "venv", "venv"+digits ("venv311"), or "virtualenv" — so plausible SOURCE
+// directories like "venv-api", "venv_src", "virtualenv.config" are NOT skipped (they
+// fall through to the total-diff byte budget instead, which fails CLOSED, never open).
+// Does NOT match "venvironment", ".venvironment", "env", "myvenv".
+const VENV_DIR_RE = /^(?:\.venv(?:\d+|[-_.].*)?|venv\d*|\.?virtualenv)$/;
+
+/** Whether a single path SEGMENT (a directory name) should be skipped from review. */
+function isSkipSegment(name) {
+  return SKIP_DIRS.has(name) || VENV_DIR_RE.test(name);
+}
+
+// Hard ceiling on the TOTAL bytes of synthesized/joined diff text. Set well under V8's
+// ~512 MiB max string length so the final join() can NEVER throw RangeError, and a sane
+// upper bound on "too large to meaningfully review". A change set that exceeds this
+// degrades to the coverage-limitation sentinel (the gate forces manual review / fails
+// closed with a CLEAR message) instead of crashing buildReviewDiff (which read as
+// diff===null → "repository corrupted"). Defense-in-depth for ANY pathological large
+// untracked/added tree, not just a virtualenv that slipped the skip list.
+const MAX_TOTAL_DIFF_BYTES = 128 * 1024 * 1024; // 128 MiB
 
 // ---------------------------------------------------------------------------
 // Baseline capture
@@ -122,7 +154,7 @@ export async function snapshotWorkspace(cwd, options = {}) {
     for (const entry of entries) {
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) continue;
+        if (isSkipSegment(entry.name)) continue;
         // Workspace-escape guard. A directory entry may be a Windows NTFS
         // junction (mklink /J reports isDirectory()=true, isSymbolicLink()=false)
         // or any symlinked/reparse-point directory that slips past the symlink
@@ -269,7 +301,13 @@ function isWithinRoot(root, dir) {
 // git plumbing; non-git workspaces compare a fresh snapshot against the
 // baseline snapshot. INVARIANT: if any file changed, both `text` and
 // `changedFiles` are non-empty — never a vacuous empty diff.
-export async function buildReviewDiff(cwd, baseline) {
+export async function buildReviewDiff(cwd, baseline, options = {}) {
+  // The total-diff byte budget is overridable (tests pass a tiny value to exercise the
+  // truncation path without synthesizing 128 MiB); production callers omit it.
+  const maxTotalDiffBytes =
+    Number.isFinite(options.maxTotalDiffBytes) && options.maxTotalDiffBytes > 0
+      ? options.maxTotalDiffBytes
+      : MAX_TOTAL_DIFF_BYTES;
   if (baseline?.type === "git" && baseline.head) {
     // --no-textconv / --no-ext-diff: a committed .gitattributes can bind files to
     // a `textconv`/external diff driver that REPLACES the real content shown to
@@ -293,17 +331,39 @@ export async function buildReviewDiff(cwd, baseline) {
       withTruncationMarker(staged),
     ];
     // Gather untracked files WITHOUT --exclude-standard so gitignored-but-present
-    // runtime files cannot hide from review; SKIP_DIRS filtering keeps
-    // node_modules etc. out. This matches the filesystem walk's coverage.
+    // runtime files cannot hide from review; SKIP_DIRS / virtualenv filtering keeps
+    // node_modules / .venv* etc. out. This matches the filesystem walk's coverage.
+    // Accumulate under a TOTAL byte budget so a pathological untracked tree (e.g. a huge
+    // virtualenv that slipped the skip list, or a model cache) can never overflow V8's
+    // max string length on join() — over budget we STOP synthesizing (bounding memory
+    // too) and emit the coverage-limitation sentinel so the gate fails closed clearly.
+    let totalBytes = chunks.reduce((n, c) => n + (c ? Buffer.byteLength(c, "utf8") + 1 : 0), 0);
+    // Initialize from the BASE chunks too: if the committed/working/staged diffs alone
+    // already exceed the budget (and there are no untracked files to trip the loop), the
+    // sentinel must still fire. (audit: budget only checked inside the untracked loop.)
+    let budgetTruncated = totalBytes > maxTotalDiffBytes;
     for (const rel of await gitUntrackedFiles(cwd)) {
-      chunks.push(await synthesizeNewFileDiff(cwd, rel));
+      if (totalBytes > maxTotalDiffBytes) {
+        budgetTruncated = true;
+        break;
+      }
+      const block = await synthesizeNewFileDiff(cwd, rel);
+      if (block) {
+        chunks.push(block);
+        totalBytes += Buffer.byteLength(block, "utf8") + 1;
+      }
     }
+    if (budgetTruncated) chunks.push(totalDiffTruncationBlock("untracked files", maxTotalDiffBytes));
     const text = chunks.filter(Boolean).join("\n");
-    return { text, diffHash: sha256(text), changedFiles: await changedFiles(cwd, baseline) };
+    const changed = await changedFiles(cwd, baseline);
+    if (budgetTruncated && !changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
+      changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
+    }
+    return { text, diffHash: sha256(text), changedFiles: changed };
   }
 
   if (baseline?.type === "filesystem") {
-    return buildFilesystemReviewDiff(cwd, baseline);
+    return buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes);
   }
 
   // A NON-NULL baseline with an UNRECOGNIZED shape (e.g. `{type:"bogus"}`, or a git
@@ -329,7 +389,7 @@ const TRUNCATION_SENTINEL_PATH = ".adversarial-review-snapshot-truncated";
 
 // Compute a real diff for non-git workspaces by comparing the current snapshot
 // against the baseline snapshot.
-async function buildFilesystemReviewDiff(cwd, baseline) {
+async function buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes = MAX_TOTAL_DIFF_BYTES) {
   const { files: current, truncated: currentTruncated } = await snapshotWorkspace(
     cwd,
     baseline.options || {}
@@ -340,16 +400,28 @@ async function buildFilesystemReviewDiff(cwd, baseline) {
 
   const maxFileBytes = (baseline.options && baseline.options.maxFileBytes) || 1_000_000;
 
-  // ADDED + MODIFIED: iterate the current snapshot.
+  // ADDED + MODIFIED: iterate the current snapshot, under the SAME total byte budget as
+  // the git path so a pathological change set can never overflow V8's max string length
+  // on join(). Over budget we stop synthesizing blocks and emit the sentinel below.
+  let totalBytes = 0;
+  let budgetTruncated = false;
   for (const [rel, info] of current) {
+    if (totalBytes > maxTotalDiffBytes) {
+      budgetTruncated = true;
+      break;
+    }
     const prior = baselineSnapshot[rel];
     if (!prior) {
-      blocks.push(await addedBlock(cwd, rel, info, maxFileBytes));
+      const b = await addedBlock(cwd, rel, info, maxFileBytes);
+      blocks.push(b);
+      totalBytes += b ? Buffer.byteLength(b, "utf8") + 1 : 0;
       changed.push({ path: rel, status: "A" });
       continue;
     }
     if (prior.hash !== info.hash) {
-      blocks.push(await modifiedBlock(cwd, rel, prior, info, maxFileBytes));
+      const b = await modifiedBlock(cwd, rel, prior, info, maxFileBytes);
+      blocks.push(b);
+      totalBytes += b ? Buffer.byteLength(b, "utf8") + 1 : 0;
       changed.push({ path: rel, status: "M" });
     }
   }
@@ -384,6 +456,15 @@ async function buildFilesystemReviewDiff(cwd, baseline) {
     }
   }
 
+  // Total-diff byte-budget overflow (a pathological change set): surface the same
+  // coverage-limitation sentinel so the gate fails closed rather than crashing on join.
+  if (budgetTruncated) {
+    blocks.unshift(totalDiffTruncationBlock("changed files", maxTotalDiffBytes));
+    if (!changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
+      changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
+    }
+  }
+
   const text = blocks.filter(Boolean).join("\n");
   return { text, diffHash: sha256(text), changedFiles: changed };
 }
@@ -403,6 +484,22 @@ function truncatedSnapshotBlock(baselineTruncated, currentTruncated) {
     `(${which} snapshot incomplete); some files were not compared so this diff ` +
     `may be missing real changes — review this change set manually and reduce ` +
     `the workspace file count (e.g. add SKIP_DIRS entries) so the snapshot is complete.\n`
+  );
+}
+
+// Coverage-limitation block emitted when the TOTAL synthesized diff hit
+// MAX_TOTAL_DIFF_BYTES (e.g. a huge untracked/added tree). Non-empty + uses the
+// reviewable sentinel path so the gate forces manual review instead of crashing with a
+// RangeError on an over-long join(). (bug: a large non-.venv virtualenv overflowed the
+// join, making the gate fail closed every turn with a misleading "repository corrupted".)
+function totalDiffTruncationBlock(what, capBytes = MAX_TOTAL_DIFF_BYTES) {
+  const human = capBytes >= 1024 * 1024 ? `${Math.round(capBytes / (1024 * 1024))} MiB` : `${capBytes} bytes`;
+  return (
+    `diff --git a/${TRUNCATION_SENTINEL_PATH} b/${TRUNCATION_SENTINEL_PATH}\n` +
+    `coverage limitation: the synthesized diff for ${what} exceeded the ${human} total ` +
+    `cap, so it was truncated and may be missing real changes — review this change set ` +
+    `manually and exclude large generated/dependency trees (e.g. a virtualenv or model ` +
+    `cache) from the workspace so the diff is complete.\n`
   );
 }
 
@@ -430,18 +527,17 @@ async function modifiedBlock(cwd, rel, prior, info, maxFileBytes) {
 // truncation is a diff-text coverage limitation only, marked explicitly.
 export async function synthesizeNewFileDiff(cwd, rel, maxFileBytes = 1_000_000) {
   const absolute = path.resolve(cwd, rel);
-  // Branch on the READ FAILURE, not on `!body`: an empty string ("") is a
-  // perfectly valid empty text file and must render as an empty added file, not
-  // be misreported as "Binary or unreadable". Only a genuine read error
-  // (missing/permission/binary-decode failure) should take the unreadable path.
-  let body;
-  try {
-    body = await readFile(absolute, "utf8");
-  } catch {
+  // Read at most maxFileBytes+1 bytes (NOT the whole file): a multi-GB untracked text
+  // file would otherwise be fully loaded by readFile AND re-buffered by the cap, OOM-
+  // crashing the gate before the per-file cap could apply. A read error (missing /
+  // permission / not a regular file) yields a clearly-flagged non-empty block; an empty
+  // file ("") still renders as a valid empty added file. (audit / GPT-5.5-xhigh)
+  const capped = await readCappedUtf8(absolute, maxFileBytes);
+  if (capped === null) {
     return `diff --git a/${rel} b/${rel}\nnew file mode 100644\nBinary or unreadable file: ${rel}\n`;
   }
-  const { text, marker } = capForDiff(body, maxFileBytes);
-  const lines = renderAddedLines(text);
+  const lines = renderAddedLines(capped.text);
+  const marker = capped.overCap ? capMarker(maxFileBytes, capped.totalBytes) : "";
   return `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n${lines}\n${marker}`;
 }
 
@@ -450,35 +546,67 @@ export async function synthesizeNewFileDiff(cwd, rel, maxFileBytes = 1_000_000) 
 // be non-empty so the gate always sees the change. Inlined content is capped.
 async function synthesizeModifiedFileDiff(cwd, rel, maxFileBytes = 1_000_000) {
   const absolute = path.resolve(cwd, rel);
-  let body;
-  try {
-    body = await readFile(absolute, "utf8");
-  } catch {
-    // On a read failure, emit a clearly-flagged NON-EMPTY block (like the
-    // new-file path) instead of silently producing empty content — an empty
-    // "modified" block would let a changed-but-unreadable file pass with nothing
-    // for the reviewer to see (a fail-open).
+  // Bounded read (see synthesizeNewFileDiff): never load the whole (possibly huge) file.
+  // On a read failure emit a clearly-flagged NON-EMPTY block instead of silently
+  // producing empty content — an empty "modified" block would let a changed-but-
+  // unreadable file pass with nothing for the reviewer to see (a fail-open).
+  const capped = await readCappedUtf8(absolute, maxFileBytes);
+  if (capped === null) {
     return `diff --git a/${rel} b/${rel}\nmodified file mode 100644\nBinary or unreadable file: ${rel}\n`;
   }
-  const { text, marker } = capForDiff(body, maxFileBytes);
-  const lines = renderAddedLines(text);
+  const lines = renderAddedLines(capped.text);
+  const marker = capped.overCap ? capMarker(maxFileBytes, capped.totalBytes) : "";
   return `diff --git a/${rel} b/${rel}\nmodified file mode 100644\n--- a/${rel}\n+++ b/${rel}\n${lines}\n${marker}`;
 }
 
-// Cap inlined diff content at `maxFileBytes`. Returns the (possibly truncated)
-// text plus an explicit marker line noting how many bytes were withheld — this
-// is a diff-text coverage limitation, not a missed change (the full file is
-// always hashed for change detection).
-function capForDiff(body, maxFileBytes) {
-  const totalBytes = Buffer.byteLength(body, "utf8");
-  if (totalBytes <= maxFileBytes) return { text: body, marker: "" };
-  // Slice on the byte buffer to honor the cap, then decode back to a string.
-  const truncated = Buffer.from(body, "utf8").subarray(0, maxFileBytes).toString("utf8");
-  const notShown = totalBytes - Buffer.byteLength(truncated, "utf8");
-  const marker =
+// Read at most `maxFileBytes`+1 bytes of a file as utf8 WITHOUT buffering the whole
+// file. The +1 lets us tell whether the file EXCEEDS the cap (overCap). `totalBytes` is
+// the file's full size (from fstat) for the truncation marker. Returns null on any read
+// error or a non-regular file. Memory stays bounded regardless of file size, so a huge
+// untracked text file can no longer OOM the gate before the cap applies. (audit:
+// synthesize* previously readFile()'d the entire file, then re-buffered it in the cap.)
+async function readCappedUtf8(absolute, maxFileBytes) {
+  let fh;
+  try {
+    fh = await open(absolute, "r");
+    const st = await fh.stat();
+    if (!st.isFile()) return null;
+    const want = maxFileBytes + 1;
+    const buf = Buffer.alloc(want);
+    let bytesRead = 0;
+    // Loop to tolerate short reads (POSIX read() may return fewer bytes than requested).
+    while (bytesRead < want) {
+      const r = await fh.read(buf, bytesRead, want - bytesRead, bytesRead);
+      if (r.bytesRead === 0) break; // EOF
+      bytesRead += r.bytesRead;
+    }
+    const overCap = bytesRead > maxFileBytes;
+    const keep = buf.subarray(0, Math.min(bytesRead, maxFileBytes));
+    return { text: keep.toString("utf8"), overCap, totalBytes: st.size };
+  } catch {
+    return null;
+  } finally {
+    if (fh) {
+      try {
+        await fh.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+// Marker appended when a file's inlined diff text was capped at `maxFileBytes`. It MUST
+// contain the exact "coverage limitation: diff text capped at" substring that gate.js
+// keys on (TRUNCATION_MARKER) to fail closed on a truncated reviewable file. The full
+// content is still HASHED for change detection, so this is a diff-text coverage
+// limitation, not a missed change.
+function capMarker(maxFileBytes, totalBytes) {
+  const notShown = Math.max(0, (Number(totalBytes) || 0) - maxFileBytes);
+  return (
     `... [truncated: ${notShown} bytes not shown] ...\n` +
-    `(coverage limitation: diff text capped at ${maxFileBytes} bytes; full content was hashed for change detection)\n`;
-  return { text: truncated, marker };
+    `(coverage limitation: diff text capped at ${maxFileBytes} bytes; full content was hashed for change detection)\n`
+  );
 }
 
 /**
@@ -536,17 +664,18 @@ function deletionBlock(rel) {
 export async function changedFiles(cwd, baseline) {
   const map = new Map(); // path -> status (first writer wins ordering, last status wins)
 
+  // `-z`: NUL-delimit the output so a path containing a newline/tab is parsed intact.
+  // Without it, splitting on newlines breaks a file like `src/evil\n.js` into fake
+  // paths, hiding its real content from review (a fail-OPEN). (audit / GPT-5.5-xhigh)
   const ranges = [
-    ["diff", "--name-status", baseline.head, "HEAD"],
-    ["diff", "--name-status", "HEAD"],
-    ["diff", "--cached", "--name-status"],
+    ["diff", "--name-status", "-z", baseline.head, "HEAD"],
+    ["diff", "--name-status", "-z", "HEAD"],
+    ["diff", "--cached", "--name-status", "-z"],
   ];
   for (const args of ranges) {
     const result = await git(args, cwd);
     if (result.code !== 0) continue;
-    for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
-      parseNameStatusLine(line, map);
-    }
+    parseNameStatusZ(result.stdout, map);
   }
 
   // Gather untracked files WITHOUT --exclude-standard (then SKIP_DIRS-filter) so
@@ -562,10 +691,13 @@ export async function changedFiles(cwd, baseline) {
 // --exclude-standard), then drop any path that lives under a SKIP_DIRS segment
 // (e.g. node_modules) so the review still ignores dependency/cache trees.
 async function gitUntrackedFiles(cwd) {
-  const result = await git(["ls-files", "--others"], cwd);
+  // `-z`: NUL-delimit so a filename containing a newline stays one path (splitting on
+  // newlines would break it into fake paths whose real content is then never reviewed —
+  // a fail-OPEN). (audit / GPT-5.5-xhigh)
+  const result = await git(["ls-files", "-z", "--others"], cwd);
   if (result.code !== 0) return [];
   return result.stdout
-    .split(/\r?\n/)
+    .split("\0")
     .filter(Boolean)
     .map(toPosixSlashes)
     .filter((rel) => !isUnderSkipDir(rel));
@@ -573,7 +705,15 @@ async function gitUntrackedFiles(cwd) {
 
 // True if any path segment of `rel` is in SKIP_DIRS.
 function isUnderSkipDir(rel) {
-  return rel.split("/").some((segment) => SKIP_DIRS.has(segment));
+  // Only PARENT segments (directories) gate skipping: a FILE whose basename merely
+  // matches a skip name (e.g. a real source file literally named "venv.py" or
+  // "node_modules") must still be REVIEWED — skipping it on a basename match would be a
+  // fail-OPEN. So check every segment EXCEPT the last (the file's basename).
+  const segments = rel.split("/");
+  for (let i = 0; i < segments.length - 1; i++) {
+    if (isSkipSegment(segments[i])) return true;
+  }
+  return false;
 }
 
 // If a git() result was truncated by the stdout cap, append an explicit coverage
@@ -588,22 +728,30 @@ function withTruncationMarker(result) {
   );
 }
 
-// Parse a single `git diff --name-status` line into the path->status map.
-// Handles tab-separated columns; rename/copy lines (Rxxx / Cxxx) carry both old
-// and new paths and emit two entries.
-function parseNameStatusLine(line, map) {
-  const parts = line.split("\t");
-  const code = parts[0];
-  const status = code[0];
-  if (status === "R" || status === "C") {
-    const oldPath = parts[1];
-    const newPath = parts[2];
-    if (oldPath) map.set(toPosixSlashes(oldPath), "D");
-    if (newPath) map.set(toPosixSlashes(newPath), "A");
-    return;
+// Parse NUL-delimited `git diff --name-status -z` output into the path->status map.
+// Verified format: each change is `<status>\0<path>\0`; a rename/copy is
+// `<status>\0<oldpath>\0<newpath>\0` (the status token, e.g. "R100", precedes its 1 or 2
+// path tokens). NUL-delimiting keeps a path that itself contains a newline/tab intact,
+// so a file like `src/evil\n.js` can no longer be split into fake paths that hide its
+// real content from review (fail-open). A trailing empty token (after the final NUL) is
+// skipped.
+function parseNameStatusZ(stdout, map) {
+  const tokens = String(stdout).split("\0");
+  let i = 0;
+  while (i < tokens.length) {
+    const code = tokens[i++];
+    if (!code) continue; // trailing/empty token
+    const status = code[0];
+    if (status === "R" || status === "C") {
+      const oldPath = tokens[i++];
+      const newPath = tokens[i++];
+      if (oldPath) map.set(toPosixSlashes(oldPath), "D");
+      if (newPath) map.set(toPosixSlashes(newPath), "A");
+    } else {
+      const target = tokens[i++];
+      if (target) map.set(toPosixSlashes(target), status);
+    }
   }
-  const target = parts[1];
-  if (target) map.set(toPosixSlashes(target), status);
 }
 
 function toPosixSlashes(p) {
