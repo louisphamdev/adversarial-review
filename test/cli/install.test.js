@@ -827,7 +827,11 @@ describe("install command", () => {
         [
           "--dry-run",
           "--hosts", "claude-code,codex",
-          "--reviewer", "claude-code=codex",
+          // claude-code=none: self-review needs no reviewer BINARY, so this test is
+          // environment-independent (a `claude-code=codex` mapping would FAIL on any
+          // machine without the codex CLI, e.g. CI). The point here is the multi-host +
+          // wrapper-disclosure behavior, not a specific reviewer.
+          "--reviewer", "claude-code=none",
           "--reviewer", "codex=none",
         ],
         io

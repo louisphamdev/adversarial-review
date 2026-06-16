@@ -19,6 +19,11 @@ const SKIP_DIRS = new Set([
   ".cache",
   ".venv",
   "__pycache__",
+  // MCP `spec-workflow` scaffolding (templates/specs written into the workspace at
+  // SessionStart). On a NON-git workspace these are written AFTER the baseline snapshot,
+  // so they read as permanently-"added" in every diff and the gate blocks EVERY Stop
+  // (even no-op turns). They are tool-generated noise, not the agent's reviewable code.
+  ".spec-workflow",
 ]);
 
 // A directory whose name is a Python VIRTUALENV. These hold installed third-party

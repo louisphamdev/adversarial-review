@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.7] - 2026-06-15
+
+Makes CI actually green for the first time (a latent test bug only surfaced once the
+`npm ci` install step was fixed in 2.2.3), and fixes a second non-git "block every turn"
+trigger.
+
+### Fixed
+- **CI test step failed on Node 20/22 — a hook test left a pending promise.** The stdin /
+  transcript read timeouts in the Stop hook were `unref()`'d, relying on the stdin pipe
+  to keep the event loop alive until the timeout fires. A test's mock stdin (and a
+  non-pipe real stdin) does NOT keep the loop alive, so on Node 20/22 the unref'd timer
+  was skipped when the loop drained and the read promise hung forever — which Node's test
+  runner reports as a failure and which would be a fail-OPEN under the real host. The
+  timeouts are no longer unref'd (they are still cleared on the fast path, so a normal
+  read is never delayed). Verified green on Node 20, 22, and 26, Linux + Windows.
+- **`.spec-workflow` scaffolding caused the gate to block every Stop on a non-git
+  workspace.** The MCP `spec-workflow` server writes template/spec files into the
+  workspace at SessionStart — after the gate's baseline snapshot — so on a non-git
+  workspace they read as permanently "added" in every diff and the gate blocked every
+  turn (even no-op turns). `.spec-workflow` is now in the built-in skip list (alongside
+  `node_modules`, `.venv`, etc.), so this tool-generated scaffolding is excluded from
+  review on both the filesystem and git-untracked paths.
+- **FIFO/device transcript path hung the Stop hook on POSIX.** Reading a `transcript_path`
+  that is a FIFO/device opened a stream whose `open()` BLOCKS forever in libuv's thread
+  pool (a FIFO open waits for a writer) and could not be cancelled by the abort timeout —
+  the read promise resolved on the timeout but the leaked thread kept the hook process
+  alive so it never exited (the host then killed it: a fail-OPEN). The transcript reader
+  now `stat()`s the path first (stat never blocks) and treats any non-regular file as
+  empty, skipping the dangerous open entirely.
+
+### CI / tests
+- **The test suite had never run in CI** (every run failed at `npm ci` before 2.2.3), so
+  it had accumulated latent platform/environment failures that only surfaced once the
+  install + hook-hang issues were fixed. Cleaned up so the suite is green on the full CI
+  matrix (Linux + Windows, Node 20/22): a `resolveHomeDir` test used a Windows-only
+  absolute path (not absolute on POSIX); a custom-reviewer stub read the wrong `argv`
+  indices; an install test required the `codex` CLI to be present (now uses a
+  no-binary reviewer); and a wall-clock, background-process-timing test is skipped under
+  CI (its soft-mode behavior is also covered deterministically elsewhere). Verified
+  green on Node 20/22 (Linux, via Docker) and Node 20/22/26 (Windows).
+
 ## [2.2.6] - 2026-06-15
 
 Fixes a hard `RangeError` that made the gate unusable on workspaces containing a large
@@ -47,7 +88,7 @@ release:
 - **Byte budget covers the base git diff too** — if the committed/working/staged diffs
   alone exceed the cap (with no untracked files), the coverage sentinel still fires.
 
-
+## [2.2.5] - 2026-06-15
 
 `doctor` now recognizes a gate armed via the Claude Code **plugin** — closing a
 false-negative health verdict.
@@ -76,7 +117,7 @@ false-negative health verdict.
   plugin detector now verifies the installed manifest's `name` matches our plugin, so a
   stale/impersonating install record keyed as ours cannot fake an enforced gate.
 
-
+## [2.2.4] - 2026-06-15
 
 A fix to the **Claude Code plugin manifest** itself — the channel that had silently
 kept the gate from arming on a fresh marketplace install.

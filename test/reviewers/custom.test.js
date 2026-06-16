@@ -239,8 +239,9 @@ process.exit(0);
       stubPath,
       `
 const fs = require("node:fs");
-const briefPath = process.argv[3];
-const jobPath = process.argv[4];
+// argv = [node, stubPath, briefPath, jobPath] -> briefPath=argv[2], jobPath=argv[3].
+const briefPath = process.argv[2];
+const jobPath = process.argv[3];
 const modes = {
   brief: (fs.statSync(briefPath).mode & 0o777),
   job: (fs.statSync(jobPath).mode & 0o777),

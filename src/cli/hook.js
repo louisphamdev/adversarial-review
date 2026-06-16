@@ -15,7 +15,7 @@
 // repo-relative. HARDENING #2: gate evaluation is wrapped in a fail-closed
 // try/catch that blocks on edit evidence in enforced/strict.
 
-import { realpathSync, createReadStream } from "node:fs";
+import { realpathSync, createReadStream, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { evaluateGate, block } from "../core/gate.js";
 import { captureBaseline } from "../core/diff.js";
@@ -308,6 +308,23 @@ const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024; // 32 MiB
  */
 function readBoundedTranscript(path, maxBytes, signal) {
   return new Promise((resolve) => {
+    // A transcript MUST be a regular file. If transcriptPath is a FIFO / device /
+    // socket, opening it for reading can BLOCK INDEFINITELY in libuv's thread pool (a
+    // FIFO open(O_RDONLY) waits for a writer), and a blocked thread-pool syscall CANNOT
+    // be cancelled by the AbortSignal — the read promise resolves on the timeout, but
+    // the leaked thread keeps the hook process alive so it never exits naturally (the
+    // host then kills the hung hook, emitting no block: a fail-OPEN). stat() never opens
+    // the file, so it never blocks; treat any non-regular file as empty/unreadable and
+    // skip the dangerous open entirely. (audit: FIFO-transcript thread leak on POSIX)
+    try {
+      if (!statSync(path).isFile()) {
+        resolve("");
+        return;
+      }
+    } catch {
+      resolve("");
+      return;
+    }
     let data = "";
     let done = false;
     const finish = () => { if (!done) { done = true; resolve(data); } };
@@ -369,9 +386,10 @@ export async function readTranscriptFile(transcriptPath, timeoutMs = DEFAULT_TRA
       }
       resolve("");
     }, timeoutMs);
-    // unref so the pending timer alone never blocks process exit; the fast path
-    // clears it in finally below.
-    if (timer && typeof timer.unref === "function") timer.unref();
+    // Do NOT unref (see readStream): this timer is the only thing that resolves the read
+    // when transcriptPath is a never-delivering FIFO and may not keep the loop alive on
+    // its own; an unref'd timer would be skipped on loop drain and hang the read. The
+    // finally below clears it on the fast path, so a normal read is never delayed.
   });
 
   // Bounded streaming read: caps peak memory at MAX_TRANSCRIPT_BYTES and aborts
@@ -442,9 +460,12 @@ async function readStream(stdin, timeoutMs = DEFAULT_STDIN_TIMEOUT_MS) {
       tearDownStdin(stdin);
       resolve("");
     }, timeoutMs);
-    // unref() so the pending timer alone never blocks process exit; clearTimeout
-    // below is the primary cleanup for the fast (prompt-close) path.
-    if (timer && typeof timer.unref === "function") timer.unref();
+    // Do NOT unref this timer. When stdin never closes, this timer is the ONLY thing
+    // that resolves the read — and an injected / non-pipe stdin may not keep the event
+    // loop alive on its own. An unref'd timer is then SKIPPED once the loop drains, so
+    // the read promise would hang forever (a fail-OPEN under the real host, and a
+    // "pending promise" failure under Node's test runner on Node 20/22). The finally
+    // below clears it on the fast (prompt-close) path, so it never delays a normal exit.
   });
 
   const drainPromise = (async () => {

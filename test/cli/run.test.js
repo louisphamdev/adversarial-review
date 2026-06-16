@@ -142,6 +142,13 @@ describe("run command", () => {
     // that is still being written must NOT be reviewed silently — the reviewer
     // would see a moving target. We assert a WARNING is surfaced (no block in soft).
     if (process.platform === "win32") return;
+    // TIMING-FLAKY UNDER CI: this depends on a detached background process keeping the
+    // workspace changing across the wrapper's ~2s quiescence-sampling window. Background-
+    // process scheduling / lifecycle varies on shared CI runners (the writer can be
+    // throttled or land outside the window), so the "still changing" condition is not
+    // reliably reproducible there. The soft-mode no-block path is also covered by
+    // deterministic unit tests; skip this wall-clock variant under CI to keep CI stable.
+    if (process.env.CI) return;
     const cwd = await tmpDir("ar-run-moving-");
     const iso = await makeIsolatedEnv();
     try {
@@ -160,8 +167,16 @@ describe("run command", () => {
       // file ~every 120ms for ~4s, then the foreground command exits immediately.
       // The post-exit quiescence sampling (3 samples, 750ms apart) therefore sees
       // a moving diff hash across samples => stillChanging=true.
+      // Write once immediately, then a DETACHED (nohup) background loop keeps the
+      // workspace changing well past the wrapper's post-exit quiescence sampling window.
+      // nohup detaches the writer from the wrapper's sh so it is not SIGHUP-killed when
+      // the foreground exits — on some POSIX environments the plain `(...)&` writer died
+      // before sampling, leaving a STABLE diff (the gate then reviewed and blocked).
+      // Inner stdout/stderr is redirected so post-test writes to the cleaned-up dir do
+      // not leak "Directory nonexistent" noise.
       const script =
-        "(i=0; while [ $i -lt 35 ]; do echo $i > moving.txt; i=$((i+1)); sleep 0.12; done) & exit 0";
+        "echo init > moving.txt; " +
+        "nohup sh -c 'i=0; while [ $i -lt 80 ]; do echo $i > moving.txt; i=$((i+1)); sleep 0.08; done' >/dev/null 2>&1 & exit 0";
       const decision = await runCommand(
         ["--host", "wrapper", "--", "sh", "-c", script],
         io

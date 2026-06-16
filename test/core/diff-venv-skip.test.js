@@ -150,6 +150,35 @@ describe("filesystem-path total-diff byte budget", () => {
   });
 });
 
+describe("MCP spec-workflow scaffolding is skipped (non-git block-every-turn bug)", () => {
+  let dir;
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ar-spec-"));
+    await mkdir(join(dir, ".spec-workflow", "templates"), { recursive: true });
+    await writeFile(join(dir, ".spec-workflow", "templates", "design-template.md"), "# template\n", "utf8");
+    await mkdir(join(dir, "src"), { recursive: true });
+    await writeFile(join(dir, "src", "real.js"), "export const r = 1;\n", "utf8");
+  });
+  after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("snapshot excludes .spec-workflow but keeps real source", async () => {
+    const { files } = await snapshotWorkspace(dir);
+    const paths = [...files.keys()];
+    assert.ok(paths.includes("src/real.js"), "real source must be snapshotted");
+    assert.ok(!paths.some((p) => p.startsWith(".spec-workflow/")), ".spec-workflow scaffolding must be skipped");
+  });
+
+  it("non-git diff vs empty baseline does NOT list .spec-workflow as added (no block-every-turn)", async () => {
+    const baseline = { type: "filesystem", cwd: dir, snapshot: {}, truncated: false };
+    const diff = await buildReviewDiff(dir, baseline);
+    const paths = diff.changedFiles.map((c) => c.path);
+    assert.ok(paths.includes("src/real.js"), "real source is reviewed");
+    assert.ok(!paths.some((p) => p.startsWith(".spec-workflow/")), "scaffolding must not appear as a change");
+  });
+});
+
 describe("bounded per-file read (no whole-file load; cap marker is correct)", () => {
   let dir;
   before(async () => {

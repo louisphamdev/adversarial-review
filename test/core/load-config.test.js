@@ -542,8 +542,12 @@ describe("PLATFORM-1: case-insensitive env reads", () => {
   });
 
   it("resolveHomeDir resolves home from an 'Adversarial_Review_Home' key", () => {
-    const home = resolveHomeDir({ Adversarial_Review_Home: "C:\\override\\home" });
-    assert.equal(home, "C:\\override\\home");
+    // The dedicated override is only honored when ABSOLUTE (round-6 inside-cwd guard),
+    // so use a path that is absolute on the CURRENT platform: a Windows "C:\\.." path is
+    // NOT absolute on POSIX (path.isAbsolute is false) and would be correctly ignored.
+    const abs = process.platform === "win32" ? "C:\\override\\home" : "/override/home";
+    const home = resolveHomeDir({ Adversarial_Review_Home: abs });
+    assert.equal(home, abs);
   });
 });
 
