@@ -118,7 +118,7 @@ async function hasEditEvidence({ cwd, baseline, baselineError, transcript }) {
   // (1) Transcript edit keys are POSITIVE evidence regardless of the diff state.
   if (transcript) {
     try {
-      const { lastEditKey, editedPaths } = scanKeys(parseJsonl(transcript));
+      const { lastEditKey, editedPaths } = scanKeys(parseJsonl(transcript), cwd);
       if (lastEditKey > 0 || editedPaths.size > 0) {
         return { evidence: true, detectionFailed: false };
       }

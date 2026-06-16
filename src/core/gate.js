@@ -733,7 +733,7 @@ export async function evaluateGate(input) {
   const entries = parseJsonl(transcript || "");
   // scanKeys reports only edit evidence; acceptance of a prior review is
   // verdict-based (collectReviewOutputs + parseVerdict), handled below.
-  const { lastEditKey, editedPaths } = scanKeys(entries);
+  const { lastEditKey, editedPaths } = scanKeys(entries, cwd);
 
   // (3) Build review scope from the authoritative filesystem/git diff.
   let diff;

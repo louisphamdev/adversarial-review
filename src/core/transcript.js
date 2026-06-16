@@ -8,7 +8,50 @@
 //   - last_user_text -> lastUserText
 //   - wants_skip     -> wantsSkip
 
+import path from "node:path";
+import { realpathSync } from "node:fs";
+
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Whether an edit tool's file_path is WITHIN the workspace root `cwd`. Edits to files
+ * OUTSIDE cwd — e.g. a temporary scratch script the agent wrote to /tmp or a sibling
+ * directory — are NOT changes to THIS workspace, so they must not count as "edit
+ * evidence". Otherwise the gate sees an edit in the transcript but an empty cwd-scoped
+ * diff and FAIL-CLOSED blocks (the "it blocks on files outside the repo" complaint),
+ * even though nothing reviewable in the workspace changed. Absolute paths are compared
+ * directly; a relative path is resolved against cwd. When cwd is not provided the check
+ * is a no-op (count every edit, preserving the prior behavior).
+ *
+ * @param {string|undefined} cwd
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function editPathInCwd(cwd, filePath) {
+  if (!cwd) return true;
+  try {
+    const abs = path.resolve(cwd, filePath);
+    // Containment is checked against BOTH the literal cwd AND its realpath. When cwd is a
+    // symlink/junction to the real workspace and the host records the edit via the REAL
+    // absolute path (or vice versa), a single-root check would mis-classify a genuine
+    // in-workspace edit as OUTSIDE and DROP it — a fail-open if the diff also missed it.
+    // (audit / GPT-5.5: symlinked workspace root.)
+    const roots = new Set([path.resolve(cwd)]);
+    try {
+      roots.add(realpathSync(path.resolve(cwd)));
+    } catch {
+      /* cwd may be unresolvable (race/permission): the literal root still applies */
+    }
+    for (const root of roots) {
+      if (abs === root) return true;
+      const rel = path.relative(root, abs);
+      if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+    }
+    return false;
+  } catch {
+    return true; // on a path-resolution error, be permissive (fail toward review)
+  }
+}
 const REVIEW_TOOLS = new Set(["Task", "Agent"]);
 
 // ---- Escape-hatch detection (ported from guard.py) --------------------------
@@ -116,7 +159,7 @@ export function tsKey(s) {
  * @param {object[]} entries  Parsed transcript entries
  * @returns {{ lastEditKey: number, editedPaths: Set<string> }}
  */
-export function scanKeys(entries) {
+export function scanKeys(entries, cwd) {
   let lastEditKey = 0;
   const editedPaths = new Set();
 
@@ -132,12 +175,16 @@ export function scanKeys(entries) {
       const name = blk.name || "";
       const inp = blk.input || {};
 
-      if (EDIT_TOOLS.has(name)) {
-        if (key > lastEditKey) lastEditKey = key;
-        if (inp && typeof inp === "object") {
-          for (const k of ["file_path", "notebook_path"]) {
-            const p = inp[k];
-            if (typeof p === "string" && p) editedPaths.add(p);
+      if (EDIT_TOOLS.has(name) && inp && typeof inp === "object") {
+        for (const k of ["file_path", "notebook_path"]) {
+          const p = inp[k];
+          // Only count an edit whose target is WITHIN the workspace: an edit to a file
+          // OUTSIDE cwd (a temp scratch script) is not a change to this workspace and
+          // must not become "edit evidence" that fail-closed-blocks against an empty
+          // cwd-scoped diff. lastEditKey is bumped only for in-scope edits too.
+          if (typeof p === "string" && p && editPathInCwd(cwd, p)) {
+            editedPaths.add(p);
+            if (key > lastEditKey) lastEditKey = key;
           }
         }
       }

@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.8] - 2026-06-16
+
+Stops the gate from blocking on files that are not part of the workspace — a usability
+complaint after a day of real use ("it catches temp files outside the repo").
+
+### Fixed
+- **An edit to a file OUTSIDE the workspace blocked every Stop.** Edit-evidence detection
+  (`scanKeys`) counted EVERY file the agent touched via Edit/Write — including a temp
+  scratch script written to `/tmp` or a sibling directory. That out-of-scope edit made the
+  gate see "edit evidence" while the workspace-scoped diff was empty, so in enforced mode
+  it fail-closed BLOCKED ("edit evidence but no reviewable diff"). `scanKeys` is now
+  cwd-scoped: only an edit whose target is WITHIN the workspace counts. An edit outside
+  cwd is correctly ignored — the gate reviews the workspace, not arbitrary system files.
+
+### Added
+- **`runtime.extraSkipDirs` (trusted config):** a user/global config can now list extra
+  workspace directory names to exclude from review (in addition to the built-in
+  `node_modules`/`.venv`/`.spec-workflow`/… set) — useful for a tool's scratch dir or an
+  IDE dir that a NON-git workspace cannot otherwise ignore. It lives in the `runtime`
+  block, which load-config pins entirely to the trusted baseline, so a cloned/untrusted
+  PROJECT config can NEVER add a skip dir to hide code from review (a fail-open); only the
+  user/global config can set it. Each entry is validated to a single safe path segment,
+  and the set is recorded in the baseline so the SessionStart snapshot and the Stop diff
+  always use the same exclusions.
+
 ## [2.2.7] - 2026-06-15
 
 Makes CI actually green for the first time (a latent test bug only surfaced once the

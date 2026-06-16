@@ -28,6 +28,13 @@ export const DEFAULT_CONFIG = Object.freeze({
     stateTtlDays: 14,
     timeoutSec: 180,
     baselineRef: "auto",
+    // Extra workspace directory NAMES to exclude from review (in addition to the
+    // built-in node_modules/.venv/.spec-workflow/... set) — e.g. a tool's scratch dir
+    // or an IDE dir a non-git workspace cannot otherwise ignore. Part of `runtime`,
+    // which load-config pins entirely to the TRUSTED baseline, so a cloned/untrusted
+    // PROJECT config can never add a skip dir to HIDE code from review (a fail-open):
+    // only the user/global config can set it.
+    extraSkipDirs: [],
   },
   privacy: {
     externalReview: "allow",

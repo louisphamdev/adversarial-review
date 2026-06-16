@@ -63,7 +63,11 @@ export async function hookCommand(argv, io) {
 
 async function sessionStart({ cwd, stateKey, stateDir, io }) {
   try {
-    const baseline = await captureBaseline(cwd);
+    // Load config so the baseline snapshot honors the trusted runtime.extraSkipDirs — the
+    // baseline MUST use the same skip set as the later Stop diff, else excluded dirs would
+    // show as spuriously deleted/added. (captureBaseline records the set in the baseline.)
+    const config = await loadEffectiveConfig(cwd, io);
+    const baseline = await captureBaseline(cwd, config.runtime?.extraSkipDirs);
     const prev = await readSessionState(stateDir, stateKey);
     await writeSessionState(stateDir, stateKey, {
       ...prev,
@@ -134,7 +138,7 @@ async function stopEvent({ host, env, payload, cwd, sessionId, stateKey, stateDi
   let baseline = workspaceMatches ? state.baseline || null : null;
 
   // Detect edit evidence so we can fail closed on a missing baseline.
-  const { lastEditKey, editedPaths } = scanKeys(parseJsonl(transcript));
+  const { lastEditKey, editedPaths } = scanKeys(parseJsonl(transcript), cwd);
   const transcriptEditEvidence = lastEditKey > 0 || editedPaths.size > 0;
 
   if (!baseline) {
@@ -151,7 +155,7 @@ async function stopEvent({ host, env, payload, cwd, sessionId, stateKey, stateDi
     }
     // Soft (or no edit evidence): fall back to a current-git/filesystem baseline.
     // This is a disclosed limitation — only changes since NOW are visible.
-    baseline = await captureBaseline(cwd).catch(() => null);
+    baseline = await captureBaseline(cwd, config.runtime?.extraSkipDirs).catch(() => null);
   }
 
   const { hostDescriptor, reviewerRunner } = buildHostRouting(host, config, env);

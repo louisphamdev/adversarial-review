@@ -44,9 +44,31 @@ const SKIP_DIRS = new Set([
 // Does NOT match "venvironment", ".venvironment", "env", "myvenv".
 const VENV_DIR_RE = /^(?:\.venv(?:\d+|[-_.].*)?|venv\d*|\.?virtualenv)$/;
 
+/**
+ * Build the effective skip-dir set: the built-in SKIP_DIRS plus any TRUSTED extra dir
+ * names (from runtime.extraSkipDirs — user/global config only; load-config pins the whole
+ * runtime block to the trusted baseline, so a cloned/untrusted PROJECT cannot add a skip
+ * dir to hide code, a fail-open). Each extra is validated to a single safe path SEGMENT
+ * (non-empty, no separators, not "."/".."), so it can only ever match a directory name.
+ *
+ * @param {string[]} [extraSkipDirs]
+ * @returns {Set<string>}
+ */
+function resolveSkipSet(extraSkipDirs) {
+  if (!Array.isArray(extraSkipDirs) || extraSkipDirs.length === 0) return SKIP_DIRS;
+  const set = new Set(SKIP_DIRS);
+  for (const raw of extraSkipDirs) {
+    if (typeof raw !== "string") continue;
+    const seg = raw.trim();
+    if (!seg || seg === "." || seg === ".." || seg.includes("/") || seg.includes("\\")) continue;
+    set.add(seg);
+  }
+  return set;
+}
+
 /** Whether a single path SEGMENT (a directory name) should be skipped from review. */
-function isSkipSegment(name) {
-  return SKIP_DIRS.has(name) || VENV_DIR_RE.test(name);
+function isSkipSegment(name, skipSet = SKIP_DIRS) {
+  return skipSet.has(name) || VENV_DIR_RE.test(name);
 }
 
 // Hard ceiling on the TOTAL bytes of synthesized/joined diff text. Set well under V8's
@@ -66,7 +88,11 @@ const MAX_TOTAL_DIFF_BYTES = 128 * 1024 * 1024; // 128 MiB
 // compute what changed. Git repos record HEAD; non-git workspaces record a full
 // content snapshot (see snapshotWorkspace) so the gate cannot be bypassed by
 // simply not using git.
-export async function captureBaseline(cwd) {
+export async function captureBaseline(cwd, extraSkipDirs = []) {
+  // RECORD the trusted extra-skip-dir list IN the baseline so buildReviewDiff later uses
+  // the SAME skip set for the current snapshot/untracked walk — keeping the baseline and
+  // the diff consistent even if config is re-read between SessionStart and Stop.
+  const extra = Array.isArray(extraSkipDirs) ? extraSkipDirs : [];
   if (await isGitRepo(cwd)) {
     const head = await git(["rev-parse", "HEAD"], cwd);
     const headSha = head.stdout.trim();
@@ -75,13 +101,13 @@ export async function captureBaseline(cwd) {
     // literal "HEAD" to stdout (with an error on stderr + nonzero exit), so we
     // must require a real 40-char object id — not just any non-empty stdout —
     // before trusting the git path.
-    if (/^[0-9a-f]{40}$/i.test(headSha)) return { type: "git", head: headSha, cwd };
+    if (/^[0-9a-f]{40}$/i.test(headSha)) return { type: "git", head: headSha, cwd, extraSkipDirs: extra };
     // A git repo with NO commits (no HEAD) has no committed tree to diff against.
     // Fall through to the FILESYSTEM snapshot so every working-tree file is still
     // captured and reviewed — otherwise a zero-commit repo would make ALL files
     // invisible to the gate (a full bypass).
   }
-  const { files, truncated } = await snapshotWorkspace(cwd);
+  const { files, truncated } = await snapshotWorkspace(cwd, { extraSkipDirs: extra });
   return {
     type: "filesystem",
     cwd,
@@ -90,6 +116,7 @@ export async function captureBaseline(cwd) {
     // by later tasks (the wrapper writes baselines to disk between turns).
     snapshot: Object.fromEntries(files),
     truncated,
+    extraSkipDirs: extra,
   };
 }
 
@@ -116,6 +143,7 @@ export async function captureBaseline(cwd) {
 export async function snapshotWorkspace(cwd, options = {}) {
   const maxFileBytes = options.maxFileBytes || 1_000_000;
   const maxFiles = options.maxFiles || 20_000;
+  const skipSet = resolveSkipSet(options.extraSkipDirs);
   const files = new Map();
   let truncated = false;
 
@@ -159,7 +187,7 @@ export async function snapshotWorkspace(cwd, options = {}) {
     for (const entry of entries) {
       const absolute = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (isSkipSegment(entry.name)) continue;
+        if (isSkipSegment(entry.name, skipSet)) continue;
         // Workspace-escape guard. A directory entry may be a Windows NTFS
         // junction (mklink /J reports isDirectory()=true, isSymbolicLink()=false)
         // or any symlinked/reparse-point directory that slips past the symlink
@@ -313,6 +341,10 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     Number.isFinite(options.maxTotalDiffBytes) && options.maxTotalDiffBytes > 0
       ? options.maxTotalDiffBytes
       : MAX_TOTAL_DIFF_BYTES;
+  // Use the SAME skip set the baseline was captured with (recorded in the baseline) so
+  // the current snapshot/untracked walk excludes the same dirs — baseline and diff stay
+  // consistent (a dir excluded at capture is excluded now, so it never shows as deleted).
+  const skipSet = resolveSkipSet(baseline?.extraSkipDirs);
   if (baseline?.type === "git" && baseline.head) {
     // --no-textconv / --no-ext-diff: a committed .gitattributes can bind files to
     // a `textconv`/external diff driver that REPLACES the real content shown to
@@ -347,7 +379,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     // already exceed the budget (and there are no untracked files to trip the loop), the
     // sentinel must still fire. (audit: budget only checked inside the untracked loop.)
     let budgetTruncated = totalBytes > maxTotalDiffBytes;
-    for (const rel of await gitUntrackedFiles(cwd)) {
+    for (const rel of await gitUntrackedFiles(cwd, skipSet)) {
       if (totalBytes > maxTotalDiffBytes) {
         budgetTruncated = true;
         break;
@@ -395,10 +427,12 @@ const TRUNCATION_SENTINEL_PATH = ".adversarial-review-snapshot-truncated";
 // Compute a real diff for non-git workspaces by comparing the current snapshot
 // against the baseline snapshot.
 async function buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes = MAX_TOTAL_DIFF_BYTES) {
-  const { files: current, truncated: currentTruncated } = await snapshotWorkspace(
-    cwd,
-    baseline.options || {}
-  );
+  // Snapshot the CURRENT tree with the SAME extra-skip-dir set the baseline was captured
+  // with, so an excluded dir is excluded in both and never shows as spuriously deleted.
+  const { files: current, truncated: currentTruncated } = await snapshotWorkspace(cwd, {
+    ...(baseline.options || {}),
+    extraSkipDirs: baseline.extraSkipDirs,
+  });
   const baselineSnapshot = baseline.snapshot || {};
   const blocks = [];
   const changed = [];
@@ -668,6 +702,7 @@ function deletionBlock(rel) {
 // (status R) contribute both the old and new path entries.
 export async function changedFiles(cwd, baseline) {
   const map = new Map(); // path -> status (first writer wins ordering, last status wins)
+  const skipSet = resolveSkipSet(baseline?.extraSkipDirs);
 
   // `-z`: NUL-delimit the output so a path containing a newline/tab is parsed intact.
   // Without it, splitting on newlines breaks a file like `src/evil\n.js` into fake
@@ -685,7 +720,7 @@ export async function changedFiles(cwd, baseline) {
 
   // Gather untracked files WITHOUT --exclude-standard (then SKIP_DIRS-filter) so
   // gitignored-but-present files are still surfaced as additions.
-  for (const rel of await gitUntrackedFiles(cwd)) {
+  for (const rel of await gitUntrackedFiles(cwd, skipSet)) {
     map.set(toPosixSlashes(rel), "A");
   }
 
@@ -695,7 +730,7 @@ export async function changedFiles(cwd, baseline) {
 // List untracked files via git, INCLUDING ignored-but-present ones (no
 // --exclude-standard), then drop any path that lives under a SKIP_DIRS segment
 // (e.g. node_modules) so the review still ignores dependency/cache trees.
-async function gitUntrackedFiles(cwd) {
+async function gitUntrackedFiles(cwd, skipSet = SKIP_DIRS) {
   // `-z`: NUL-delimit so a filename containing a newline stays one path (splitting on
   // newlines would break it into fake paths whose real content is then never reviewed —
   // a fail-OPEN). (audit / GPT-5.5-xhigh)
@@ -705,18 +740,18 @@ async function gitUntrackedFiles(cwd) {
     .split("\0")
     .filter(Boolean)
     .map(toPosixSlashes)
-    .filter((rel) => !isUnderSkipDir(rel));
+    .filter((rel) => !isUnderSkipDir(rel, skipSet));
 }
 
-// True if any path segment of `rel` is in SKIP_DIRS.
-function isUnderSkipDir(rel) {
+// True if any PARENT path segment of `rel` is a skip dir.
+function isUnderSkipDir(rel, skipSet = SKIP_DIRS) {
   // Only PARENT segments (directories) gate skipping: a FILE whose basename merely
   // matches a skip name (e.g. a real source file literally named "venv.py" or
   // "node_modules") must still be REVIEWED — skipping it on a basename match would be a
   // fail-OPEN. So check every segment EXCEPT the last (the file's basename).
   const segments = rel.split("/");
   for (let i = 0; i < segments.length - 1; i++) {
-    if (isSkipSegment(segments[i])) return true;
+    if (isSkipSegment(segments[i], skipSet)) return true;
   }
   return false;
 }
