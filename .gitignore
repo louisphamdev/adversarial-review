@@ -8,3 +8,4 @@ coverage/
 .adversarial-review/state/
 .adversarial-review/config.json
 .audit-opencode/
+.worktrees/
