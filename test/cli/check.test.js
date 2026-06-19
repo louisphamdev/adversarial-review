@@ -83,6 +83,38 @@ describe("check command", () => {
     }
   });
 
+  it("emits the skipped-gitignored diagnostic once", async () => {
+    const cwd = await tmpDir("ar-check-gitignore-");
+    const iso = await makeIsolatedEnv();
+    try {
+      const runGit = async (...args) => {
+        const r = await git(args, cwd);
+        assert.equal(r.code, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+      };
+      if ((await git(["--version"], cwd)).code !== 0) return;
+      await runGit("init", "-q");
+      await runGit("config", "user.email", "t@t.t");
+      await runGit("config", "user.name", "t");
+      await writeFile(join(cwd, ".gitignore"), "ignored/\n");
+      await writeFile(join(cwd, "base.txt"), "base\n");
+      await runGit("add", "-A");
+      await runGit("commit", "-q", "-m", "base");
+      await mkdir(join(cwd, "ignored"), { recursive: true });
+      await writeFile(join(cwd, "ignored", "cache.bin"), "noise\n");
+
+      const { io, err } = makeIo(cwd, iso.env);
+      await checkCommand(["--json"], io);
+
+      const stderr = err.join("");
+      assert.match(stderr, /adversarial-review: skipped 1 gitignored untracked file\(s\)/);
+      assert.equal(stderr.match(/adversarial-review: skipped/g)?.length, 1);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await iso.cleanup();
+    }
+  });
+
   it("fail-closed: when evaluateGate throws with a live edit, block (not fail_open) in enforced (finding 1)", async () => {
     // Repro for the check.js:50 finding: `baseline` was declared INSIDE the try,
     // so the catch could not forward it to failClosedDecision. With an empty

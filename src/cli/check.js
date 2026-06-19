@@ -82,6 +82,7 @@ export async function checkCommand(argv, io) {
       // hook's composite keying (distinct workspaces never share state).
       sessionId: sessionStateKey(`check-${host}`, cwd),
       stateDir,
+      onScopeDiagnostic: (message) => io.stderr.write(`${message}\n`),
     });
   } catch (err) {
     // HARDENING #2: fail closed. `check` has no transcript, so edit evidence is

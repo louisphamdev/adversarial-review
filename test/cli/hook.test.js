@@ -886,6 +886,43 @@ describe("hook command (workspace casing, win32)", () => {
 // ---------------------------------------------------------------------------
 
 describe("hook command (git)", () => {
+  it("emits the skipped-gitignored diagnostic once on Stop", async (t) => {
+    const cwd = await tmpDir("ar-hook-gitignore-");
+    const stateDir = await tmpDir("ar-state-gitignore-");
+    try {
+      const init = await git(["init"], cwd);
+      if (init.code !== 0) {
+        t.skip("git not available; skipping git-dependent hook test");
+        return;
+      }
+      await git(["config", "user.email", "t@example.com"], cwd);
+      await git(["config", "user.name", "Test"], cwd);
+      await writeFile(join(cwd, ".gitignore"), "ignored/\n");
+      await writeFile(join(cwd, "README.md"), "# repo\n");
+      await git(["add", "-A"], cwd);
+      await git(["commit", "-m", "init"], cwd);
+      await recordBaseline(cwd, stateDir, "ignoreSess");
+
+      await mkdir(join(cwd, "ignored"), { recursive: true });
+      await writeFile(join(cwd, "ignored", "cache.bin"), "noise\n");
+      const { io, out, err } = makeIo(
+        cwd,
+        stdinFrom({ session_id: "ignoreSess", cwd }),
+        { ADVERSARIAL_REVIEW_STATE_DIR: stateDir }
+      );
+
+      await hookCommand(["--event", "stop", "--host", "claude-code"], io);
+
+      assert.equal(parseHookJson(out), null);
+      const stderr = err.join("");
+      assert.match(stderr, /adversarial-review: skipped 1 gitignored untracked file\(s\)/);
+      assert.equal(stderr.match(/adversarial-review: skipped/g)?.length, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("reviews a change committed during the session from the recorded baseline", async (t) => {
     const cwd = await tmpDir("ar-hook-git-");
     const stateDir = await tmpDir("ar-state-git-");

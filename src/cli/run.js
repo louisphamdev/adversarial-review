@@ -132,6 +132,7 @@ export async function runCommand(argv, io) {
       // hook's composite keying (distinct workspaces never share state).
       sessionId: sessionStateKey(`run-${host}`, cwd),
       stateDir,
+      onScopeDiagnostic: (message) => io.stderr.write(`${message}\n`),
     });
   } catch (err) {
     decision = await failClosedDecision({ config, cwd, baseline, err, io });

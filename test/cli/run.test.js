@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 
 import { runCommand, stillChangingScope } from "../../src/cli/run.js";
 import { resolveExecutable } from "../../src/core/process.js";
+import { git } from "../../src/core/git.js";
 import { makeIsolatedEnv } from "../helpers/isolated-env.js";
 
 // Build an io object around an isolated env so `loadEffectiveConfig` never reads
@@ -84,6 +85,42 @@ describe("run command", () => {
       );
       assert.equal(decision.action, "allow");
       assert.equal(process.exitCode, 0);
+    } finally {
+      resetExit();
+      await rm(cwd, { recursive: true, force: true });
+      await iso.cleanup();
+    }
+  });
+
+  it("emits the skipped-gitignored diagnostic once, not once per quiescence sample", async () => {
+    const cwd = await tmpDir("ar-run-gitignore-");
+    const iso = await makeIsolatedEnv();
+    try {
+      const runGit = async (...args) => {
+        const r = await git(args, cwd);
+        assert.equal(r.code, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+      };
+      if ((await git(["--version"], cwd)).code !== 0) return;
+      await runGit("init", "-q");
+      await runGit("config", "user.email", "t@t.t");
+      await runGit("config", "user.name", "t");
+      await writeFile(join(cwd, ".gitignore"), "ignored/\n");
+      await writeFile(join(cwd, "base.txt"), "base\n");
+      await runGit("add", "-A");
+      await runGit("commit", "-q", "-m", "base");
+      await mkdir(join(cwd, "ignored"), { recursive: true });
+      await writeFile(join(cwd, "ignored", "cache.bin"), "noise\n");
+
+      const { io, err } = makeIo(cwd, iso.env);
+      const decision = await runCommand(
+        ["--host", "claude-code", "--", "node", "-e", "process.exit(0)"],
+        io
+      );
+
+      assert.equal(decision.action, "allow");
+      const stderr = err.join("");
+      assert.match(stderr, /adversarial-review: skipped 1 gitignored untracked file\(s\)/);
+      assert.equal(stderr.match(/adversarial-review: skipped/g)?.length, 1);
     } finally {
       resetExit();
       await rm(cwd, { recursive: true, force: true });

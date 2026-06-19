@@ -184,6 +184,7 @@ async function stopEvent({ host, env, payload, cwd, sessionId, stateKey, stateDi
       sessionId: stateKey,
       stateDir,
       stopHookActive,
+      onScopeDiagnostic: (message) => io.stderr.write(`${message}\n`),
     });
   } catch (err) {
     decision = await failClosedDecision({ config, cwd, baseline, transcript, err, io });
