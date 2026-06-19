@@ -63,7 +63,10 @@ export async function runCommand(argv, io) {
 
   // Capture baseline BEFORE running so post-run diff reflects only the wrapped
   // command's changes.
-  const baseline = await captureBaseline(cwd, config.runtime?.extraSkipDirs);
+  const baseline = await captureBaseline(cwd, {
+    extraSkipDirs: config.runtime?.extraSkipDirs,
+    respectGitignore: config.runtime?.respectGitignore,
+  });
 
   // Run the wrapped command with inherited stdio.
   const exitCode = await runWrapped(command, { cwd, env, io });

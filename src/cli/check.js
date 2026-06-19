@@ -47,7 +47,10 @@ export async function checkCommand(argv, io) {
   let baselineError;
   try {
     try {
-      baseline = await captureBaseline(cwd, config.runtime?.extraSkipDirs);
+      baseline = await captureBaseline(cwd, {
+        extraSkipDirs: config.runtime?.extraSkipDirs,
+        respectGitignore: config.runtime?.respectGitignore,
+      });
       // captureBaseline returns a GIT baseline (HEAD) when the workspace is a git repo
       // with commits — `check` then reviews uncommitted changes (correct). But for a
       // NON-GIT workspace (or a zero-commit repo) it snapshots the CURRENT tree, so

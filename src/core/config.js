@@ -28,6 +28,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     stateTtlDays: 14,
     timeoutSec: 180,
     baselineRef: "auto",
+    // Honor Git's standard ignore sources for untracked files by default. This
+    // lives in the trusted runtime block, so a project config cannot narrow the
+    // review scope by enabling it.
+    respectGitignore: true,
     // Extra workspace directory NAMES to exclude from review (in addition to the
     // built-in node_modules/.venv/.spec-workflow/... set) — e.g. a tool's scratch dir
     // or an IDE dir a non-git workspace cannot otherwise ignore. Part of `runtime`,

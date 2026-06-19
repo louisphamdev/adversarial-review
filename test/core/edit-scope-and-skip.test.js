@@ -102,9 +102,13 @@ describe("runtime.extraSkipDirs excludes extra dirs from review", () => {
     assert.ok([...files.keys()].some((p) => p.startsWith("scratch/")), "unsafe entries ignored => not skipped");
   });
 
-  it("captureBaseline records extraSkipDirs and buildReviewDiff applies them consistently", async () => {
-    const baseline = await captureBaseline(dir, ["scratch"]);
+  it("captureBaseline records modern runtime scope and buildReviewDiff applies it consistently", async () => {
+    const baseline = await captureBaseline(dir, {
+      extraSkipDirs: ["scratch"],
+      respectGitignore: true,
+    });
     assert.deepEqual(baseline.extraSkipDirs, ["scratch"]);
+    assert.equal(baseline.respectGitignore, true);
     // Add a new file in BOTH the skipped dir and real source AFTER the baseline.
     await writeFile(join(dir, "scratch", "new.txt"), "more noise\n", "utf8");
     await writeFile(join(dir, "src", "new.js"), "export const y = 2;\n", "utf8");
@@ -112,6 +116,12 @@ describe("runtime.extraSkipDirs excludes extra dirs from review", () => {
     const paths = diff.changedFiles.map((c) => c.path);
     assert.ok(paths.includes("src/new.js"), "real new source is reviewed");
     assert.ok(!paths.some((p) => p.startsWith("scratch/")), "extra-skip dir excluded from the diff");
+  });
+
+  it("legacy positional extraSkipDirs preserves exhaustive gitignore behavior", async () => {
+    const baseline = await captureBaseline(dir, ["scratch"]);
+    assert.deepEqual(baseline.extraSkipDirs, ["scratch"]);
+    assert.equal(baseline.respectGitignore, false);
   });
 });
 

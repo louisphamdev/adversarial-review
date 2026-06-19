@@ -84,15 +84,35 @@ const MAX_TOTAL_DIFF_BYTES = 128 * 1024 * 1024; // 128 MiB
 // Baseline capture
 // ---------------------------------------------------------------------------
 
+function normalizeBaselineScope(scope) {
+  // Backward compatibility: the original API accepted extraSkipDirs directly.
+  if (Array.isArray(scope)) {
+    return { extraSkipDirs: scope, respectGitignore: false };
+  }
+  const input = scope && typeof scope === "object" ? scope : {};
+  return {
+    extraSkipDirs: Array.isArray(input.extraSkipDirs) ? input.extraSkipDirs : [],
+    // New captures use the product default. Explicit malformed values fall back
+    // to exhaustive review rather than silently narrowing coverage.
+    respectGitignore:
+      input.respectGitignore === undefined ? true : input.respectGitignore === true,
+  };
+}
+
+function baselineRespectsGitignore(baseline) {
+  // Persisted baselines from before this option existed remain exhaustive.
+  return baseline?.respectGitignore === true;
+}
+
 // Capture the "before" state of the workspace so a later buildReviewDiff() can
 // compute what changed. Git repos record HEAD; non-git workspaces record a full
 // content snapshot (see snapshotWorkspace) so the gate cannot be bypassed by
 // simply not using git.
-export async function captureBaseline(cwd, extraSkipDirs = []) {
+export async function captureBaseline(cwd, scope) {
   // RECORD the trusted extra-skip-dir list IN the baseline so buildReviewDiff later uses
   // the SAME skip set for the current snapshot/untracked walk — keeping the baseline and
   // the diff consistent even if config is re-read between SessionStart and Stop.
-  const extra = Array.isArray(extraSkipDirs) ? extraSkipDirs : [];
+  const { extraSkipDirs: extra, respectGitignore } = normalizeBaselineScope(scope);
   if (await isGitRepo(cwd)) {
     const head = await git(["rev-parse", "HEAD"], cwd);
     const headSha = head.stdout.trim();
@@ -101,7 +121,9 @@ export async function captureBaseline(cwd, extraSkipDirs = []) {
     // literal "HEAD" to stdout (with an error on stderr + nonzero exit), so we
     // must require a real 40-char object id — not just any non-empty stdout —
     // before trusting the git path.
-    if (/^[0-9a-f]{40}$/i.test(headSha)) return { type: "git", head: headSha, cwd, extraSkipDirs: extra };
+    if (/^[0-9a-f]{40}$/i.test(headSha)) {
+      return { type: "git", head: headSha, cwd, extraSkipDirs: extra, respectGitignore };
+    }
     // A git repo with NO commits (no HEAD) has no committed tree to diff against.
     // Fall through to the FILESYSTEM snapshot so every working-tree file is still
     // captured and reviewed — otherwise a zero-commit repo would make ALL files
@@ -117,6 +139,7 @@ export async function captureBaseline(cwd, extraSkipDirs = []) {
     snapshot: Object.fromEntries(files),
     truncated,
     extraSkipDirs: extra,
+    respectGitignore,
   };
 }
 

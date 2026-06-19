@@ -14,6 +14,7 @@ test("default mode is enforced all-code", () => {
   assert.equal(cfg.policy.mode, "enforced");
   assert.equal(cfg.policy.reviewScope, "all-code");
   assert.equal(cfg.policy.onReviewerError, "block");
+  assert.equal(cfg.runtime.respectGitignore, true);
 });
 
 // ── Policy floor: project cannot loosen ──────────────────────────────────────

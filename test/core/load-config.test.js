@@ -176,6 +176,13 @@ describe("loadEffectiveConfig with user-level config", () => {
     assert.equal(cfg.runtime.timeoutSec, 180, "runtime.timeoutSec pinned to baseline");
   });
 
+  it("project cannot override trusted runtime.respectGitignore", async () => {
+    await writeJson(join(home, CONFIG_REL), { runtime: { respectGitignore: false } });
+    await writeJson(join(cwd, CONFIG_REL), { runtime: { respectGitignore: true } });
+    const cfg = await loadEffectiveConfig(cwd, io());
+    assert.equal(cfg.runtime.respectGitignore, false, "trusted user runtime value is pinned");
+  });
+
   it("R2: project cannot relax privacy.tempFileMode", async () => {
     await writeJson(join(cwd, CONFIG_REL), { privacy: { tempFileMode: "0666" } });
     const cfg = await loadEffectiveConfig(cwd, io());
