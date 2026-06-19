@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.9] - 2026-06-19
 
 ### Fixed
 - **Ignored working-tree artifacts no longer make the gate unusable.** Git
@@ -458,6 +458,7 @@ Public-release perfection pass: hardening, machine-wide install, and docs.
   (default < user < project) with a tighten-only user policy floor.
 - `install`, `check`, `run`, `doctor`, and `hook` commands.
 
+[2.2.9]: https://github.com/louisphamdev/adversarial-review/releases/tag/v2.2.9
 [2.1.0]: https://github.com/louisphamdev/adversarial-review/releases/tag/v2.1.0
 [2.0.3]: https://github.com/louisphamdev/adversarial-review/releases/tag/v2.0.3
 [2.0.2]: https://github.com/louisphamdev/adversarial-review/releases/tag/v2.0.2
