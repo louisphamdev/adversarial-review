@@ -1,4 +1,4 @@
-import { readFile, readdir, stat, readlink, open } from "node:fs/promises";
+import { readFile, readdir, stat, lstat, readlink, open } from "node:fs/promises";
 import { createReadStream, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -113,7 +113,8 @@ export async function captureBaseline(cwd, scope) {
   // the SAME skip set for the current snapshot/untracked walk — keeping the baseline and
   // the diff consistent even if config is re-read between SessionStart and Stop.
   const { extraSkipDirs: extra, respectGitignore } = normalizeBaselineScope(scope);
-  if (await isGitRepo(cwd)) {
+  const gitRepo = await isGitRepo(cwd);
+  if (gitRepo) {
     const head = await git(["rev-parse", "HEAD"], cwd);
     const headSha = head.stdout.trim();
     // A git repo with at least one commit: diff against the committed HEAD tree.
@@ -129,7 +130,11 @@ export async function captureBaseline(cwd, scope) {
     // captured and reviewed — otherwise a zero-commit repo would make ALL files
     // invisible to the gate (a full bypass).
   }
-  const { files, truncated } = await snapshotWorkspace(cwd, { extraSkipDirs: extra });
+  const snapshotSource = gitRepo && respectGitignore ? "git-files" : "filesystem-walk";
+  const { files, truncated } =
+    snapshotSource === "git-files"
+      ? await snapshotGitFiles(cwd, { extraSkipDirs: extra })
+      : await snapshotWorkspace(cwd, { extraSkipDirs: extra });
   return {
     type: "filesystem",
     cwd,
@@ -140,6 +145,7 @@ export async function captureBaseline(cwd, scope) {
     truncated,
     extraSkipDirs: extra,
     respectGitignore,
+    snapshotSource,
   };
 }
 
@@ -243,6 +249,51 @@ export async function snapshotWorkspace(cwd, options = {}) {
         break;
       }
       const rel = toPosixRel(cwd, absolute);
+      files.set(rel, await snapshotFile(absolute, rel, maxFileBytes));
+    }
+  }
+
+  return { files, truncated };
+}
+
+// Snapshot the file set Git considers tracked or non-ignored untracked. This is
+// used for unborn/zero-commit repositories so ignored trees are never walked.
+async function snapshotGitFiles(cwd, options = {}) {
+  const maxFileBytes = options.maxFileBytes || 1_000_000;
+  const maxFiles = options.maxFiles || 20_000;
+  const skipSet = resolveSkipSet(options.extraSkipDirs);
+  const result = await git(
+    ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    cwd
+  );
+  if (result.code !== 0 || result.truncated) {
+    throw new Error(`git_snapshot_listing_failed:${result.code ?? "truncated"}`);
+  }
+
+  const paths = [...new Set(
+    result.stdout
+      .split("\0")
+      .filter(Boolean)
+      .map(toPosixSlashes)
+      .filter((rel) => !path.isAbsolute(rel) && !rel.startsWith("../"))
+      .filter((rel) => !isUnderSkipDir(rel, skipSet))
+  )].sort();
+  const files = new Map();
+  let truncated = paths.length > maxFiles;
+
+  for (const rel of paths.slice(0, maxFiles)) {
+    const absolute = path.resolve(cwd, rel);
+    let info;
+    try {
+      info = await lstat(absolute);
+    } catch {
+      // A tracked path may currently be deleted; omitting it lets the normal
+      // baseline comparison report deletion when it existed previously.
+      continue;
+    }
+    if (info.isSymbolicLink()) {
+      files.set(rel, await snapshotSymlink(absolute, rel));
+    } else if (info.isFile()) {
       files.set(rel, await snapshotFile(absolute, rel, maxFileBytes));
     }
   }
@@ -456,10 +507,14 @@ const TRUNCATION_SENTINEL_PATH = ".adversarial-review-snapshot-truncated";
 async function buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes = MAX_TOTAL_DIFF_BYTES) {
   // Snapshot the CURRENT tree with the SAME extra-skip-dir set the baseline was captured
   // with, so an excluded dir is excluded in both and never shows as spuriously deleted.
-  const { files: current, truncated: currentTruncated } = await snapshotWorkspace(cwd, {
+  const snapshotOptions = {
     ...(baseline.options || {}),
     extraSkipDirs: baseline.extraSkipDirs,
-  });
+  };
+  const { files: current, truncated: currentTruncated } =
+    baseline.snapshotSource === "git-files"
+      ? await snapshotGitFiles(cwd, snapshotOptions)
+      : await snapshotWorkspace(cwd, snapshotOptions);
   const baselineSnapshot = baseline.snapshot || {};
   const blocks = [];
   const changed = [];

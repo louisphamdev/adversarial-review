@@ -96,6 +96,30 @@ describe("buildReviewDiff (git)", () => {
     assert.ok(diff.text.includes("evil.js"), "a new file in a zero-commit repo must be visible to the gate");
   });
 
+  it("zero-commit git repos snapshot non-ignored files without walking ignored trees", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "zero-commit-ignore");
+    await mkdir(join(repo, "ignored"), { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, ".gitignore"), "ignored/\n");
+    await writeFile(join(repo, "ignored", "cache.bin"), "noise\n");
+    await writeFile(join(repo, "visible.js"), "export const visible = 1;\n");
+
+    const baseline = await captureBaseline(repo);
+    assert.equal(baseline.type, "filesystem");
+    assert.equal(baseline.snapshotSource, "git-files");
+    assert.equal("ignored/cache.bin" in baseline.snapshot, false);
+    assert.equal("visible.js" in baseline.snapshot, true);
+
+    await writeFile(join(repo, "ignored", "new-cache.bin"), "more noise\n");
+    await writeFile(join(repo, "visible-2.js"), "export const visible2 = 2;\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    const paths = diff.changedFiles.map((f) => f.path);
+    assert.equal(paths.includes("ignored/new-cache.bin"), false);
+    assert.equal(paths.includes("visible-2.js"), true);
+  });
+
   it("R6: buildReviewDiff THROWS when a git diff command errors (corrupted index), not empty", async (t) => {
     if (!GIT_AVAILABLE) return t.skip("git not on PATH");
     const repo = join(dir, "corrupt-index");
@@ -322,6 +346,20 @@ describe("buildReviewDiff (filesystem, non-git)", () => {
     const diff = await buildReviewDiff(ws, baseline);
     assert.deepEqual(diff.changedFiles, [], "no changes -> empty changedFiles");
     assert.equal(diff.text, "", "no changes -> empty text");
+  });
+
+  it("a genuine non-git workspace does not assign Git semantics to .gitignore", async () => {
+    const ws = join(dir, "nongit-gitignore");
+    await mkdir(join(ws, "ignored"), { recursive: true });
+    await writeFile(join(ws, ".gitignore"), "ignored/\n");
+    await writeFile(join(ws, "ignored", "runtime.js"), "v1\n");
+    const baseline = await captureBaseline(ws);
+    assert.equal(baseline.snapshotSource, "filesystem-walk");
+    assert.equal("ignored/runtime.js" in baseline.snapshot, true);
+
+    await writeFile(join(ws, "ignored", "runtime.js"), "v2\n");
+    const diff = await buildReviewDiff(ws, baseline);
+    assert.ok(diff.changedFiles.some((f) => f.path === "ignored/runtime.js" && f.status === "M"));
   });
 });
 
