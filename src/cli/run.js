@@ -235,7 +235,7 @@ export async function stillChangingScope(cwd, baseline, quiescenceMs) {
   let prevHash;
   let anyBuilt = false;
   try {
-    prevHash = (await buildReviewDiff(cwd, baseline)).diffHash;
+    prevHash = (await buildReviewDiff(cwd, baseline, { includeScopeDiagnostics: false })).diffHash;
     anyBuilt = true;
   } catch {
     prevHash = undefined;
@@ -246,7 +246,7 @@ export async function stillChangingScope(cwd, baseline, quiescenceMs) {
     await sleep(quiescenceMs);
     let nextHash;
     try {
-      nextHash = (await buildReviewDiff(cwd, baseline)).diffHash;
+      nextHash = (await buildReviewDiff(cwd, baseline, { includeScopeDiagnostics: false })).diffHash;
     } catch {
       // Transient build failure on this sample: skip it (do not wedge), but keep
       // looking — a later sample may build and reveal movement.

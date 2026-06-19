@@ -146,7 +146,7 @@ async function hasEditEvidence({ cwd, baseline, baselineError, transcript }) {
   // (4) Baseline present: build the diff. A THROW is a detection failure.
   let diff;
   try {
-    diff = await buildReviewDiff(cwd, baseline);
+    diff = await buildReviewDiff(cwd, baseline, { includeScopeDiagnostics: false });
   } catch {
     return { evidence: false, detectionFailed: true };
   }

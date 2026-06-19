@@ -308,15 +308,20 @@ async function snapshotGitFiles(cwd, options = {}) {
     let info;
     try {
       info = await lstat(absolute);
-    } catch {
+    } catch (err) {
       // A tracked path may currently be deleted; omitting it lets the normal
       // baseline comparison report deletion when it existed previously.
+      if (err?.code !== "ENOENT") truncated = true;
       continue;
     }
     if (info.isSymbolicLink()) {
       files.set(rel, await snapshotSymlink(absolute, rel));
     } else if (info.isFile()) {
       files.set(rel, await snapshotFile(absolute, rel, maxFileBytes));
+    } else {
+      // Git tracks file-like paths, not directory/device contents. If the
+      // working-tree entry changed type, the snapshot cannot represent it.
+      truncated = true;
     }
   }
 
@@ -437,6 +442,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     Number.isFinite(options.maxTotalDiffBytes) && options.maxTotalDiffBytes > 0
       ? options.maxTotalDiffBytes
       : MAX_TOTAL_DIFF_BYTES;
+  const includeScopeDiagnostics = options.includeScopeDiagnostics !== false;
   // Use the SAME skip set the baseline was captured with (recorded in the baseline) so
   // the current snapshot/untracked walk excludes the same dirs — baseline and diff stay
   // consistent (a dir excluded at capture is excluded now, so it never shows as deleted).
@@ -500,7 +506,9 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
       text,
       diffHash: sha256(text),
       changedFiles: changed,
-      ignoredUntrackedSkipped: await ignoredUntrackedCount(cwd, baseline),
+      ignoredUntrackedSkipped: includeScopeDiagnostics
+        ? await ignoredUntrackedCount(cwd, baseline)
+        : 0,
     };
   }
 
@@ -509,7 +517,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     return {
       ...diff,
       ignoredUntrackedSkipped:
-        baseline.snapshotSource === "git-files"
+        includeScopeDiagnostics && baseline.snapshotSource === "git-files"
           ? await ignoredUntrackedCount(cwd, baseline)
           : 0,
     };

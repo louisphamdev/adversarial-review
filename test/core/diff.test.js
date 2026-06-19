@@ -141,6 +141,24 @@ describe("buildReviewDiff (git)", () => {
     );
   });
 
+  it("zero-commit snapshots fail closed when a tracked path becomes non-regular", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "zero-commit-nonregular");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "tracked.js"), "export const v = 1;\n");
+    gitSync(repo, ["add", "tracked.js"]);
+    await rm(join(repo, "tracked.js"), { force: true });
+    await mkdir(join(repo, "tracked.js"));
+
+    const baseline = await captureBaseline(repo);
+    assert.equal(
+      baseline.truncated,
+      true,
+      "an indexed path that cannot be snapshotted must surface a coverage limitation"
+    );
+  });
+
   it("R6: buildReviewDiff THROWS when a git diff command errors (corrupted index), not empty", async (t) => {
     if (!GIT_AVAILABLE) return t.skip("git not on PATH");
     const repo = join(dir, "corrupt-index");
@@ -712,6 +730,9 @@ describe("git mode honors trusted gitignore scope", () => {
     assert.equal(paths.includes("visible.js"), true);
     assert.equal(diff.text.includes("visible.js"), true);
     assert.equal(diff.ignoredUntrackedSkipped, 1);
+
+    const probe = await buildReviewDiff(repo, baseline, { includeScopeDiagnostics: false });
+    assert.equal(probe.ignoredUntrackedSkipped, 0, "quiescence probes skip diagnostic counting");
   });
 
   it("keeps tracked files reviewable even when a gitignore rule matches them", async (t) => {
