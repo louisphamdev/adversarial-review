@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 import {
   evaluateGate,
@@ -18,6 +19,24 @@ import { captureBaseline, buildReviewDiff } from "../../src/core/diff.js";
 import { mergeConfig } from "../../src/core/config.js";
 import { readSessionState, writeSessionState } from "../../src/core/state.js";
 import { sha256, stableJson } from "../../src/core/hash.js";
+
+let GIT_AVAILABLE = true;
+try {
+  execFileSync("git", ["--version"], { stdio: "ignore" });
+} catch {
+  GIT_AVAILABLE = false;
+}
+
+function gitSync(cwd, args) {
+  execFileSync("git", args, { cwd, stdio: "ignore" });
+}
+
+function initRepo(cwd) {
+  gitSync(cwd, ["init", "-q"]);
+  gitSync(cwd, ["config", "user.email", "test@example.com"]);
+  gitSync(cwd, ["config", "user.name", "Test User"]);
+  gitSync(cwd, ["checkout", "-q", "-b", "main"]);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers: build a real filesystem baseline + workspace so buildReviewDiff
@@ -296,6 +315,35 @@ describe("classifyLevel", () => {
 // ---------------------------------------------------------------------------
 
 describe("evaluateGate basic policy", () => {
+  it("reports one scope diagnostic when ignored untracked files are skipped", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const cwd = await mkdtemp(join(tmpdir(), "ar-gate-ignore-"));
+    track(cwd);
+    initRepo(cwd);
+    await writeFile(join(cwd, ".gitignore"), "ignored/\n");
+    await writeFile(join(cwd, "base.txt"), "base\n");
+    gitSync(cwd, ["add", "-A"]);
+    gitSync(cwd, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(cwd);
+    await mkdir(join(cwd, "ignored"), { recursive: true });
+    await writeFile(join(cwd, "ignored", "cache.bin"), "noise\n");
+
+    const messages = [];
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: "",
+      stateDir: await tmpStateDir(),
+      onScopeDiagnostic: (message) => messages.push(message),
+    });
+
+    assert.equal(decision.action, "allow");
+    assert.deepEqual(messages, [
+      "adversarial-review: skipped 1 gitignored untracked file(s) (respectGitignore=true)",
+    ]);
+  });
+
   it("allows when there are no edits", async () => {
     const { cwd, baseline } = await makeWorkspace({ "a.txt": "x" }, {});
     track(cwd);

@@ -92,6 +92,50 @@ export async function git(args, cwd, options = {}) {
   });
 }
 
+// Run a Git command whose stdout is a NUL-delimited record stream and count
+// records without retaining path names in memory. Used only for diagnostics.
+export async function gitCountNulRecords(args, cwd) {
+  return new Promise((resolve) => {
+    const child = spawn("git", [...GIT_GLOBAL_ARGS, ...args], {
+      cwd,
+      shell: false,
+      windowsHide: true,
+    });
+    const stderrChunks = [];
+    let stderrBytes = 0;
+    let count = 0;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const stderrString = () => Buffer.concat(stderrChunks).toString("utf8");
+
+    child.stdout.on("data", (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      for (const byte of buf) {
+        if (byte === 0) count += 1;
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderrBytes >= MAX_STDERR_BYTES) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = MAX_STDERR_BYTES - stderrBytes;
+      const slice = buf.length > remaining ? buf.subarray(0, remaining) : buf;
+      stderrChunks.push(slice);
+      stderrBytes += slice.length;
+    });
+    child.on("error", (error) =>
+      finish({ code: 127, count, stderr: String(error) })
+    );
+    child.on("close", (code) =>
+      finish({ code, count, stderr: stderrString() })
+    );
+  });
+}
+
 // Return true if `cwd` is inside a git working tree.
 export async function isGitRepo(cwd) {
   const result = await git(["rev-parse", "--git-dir"], cwd);

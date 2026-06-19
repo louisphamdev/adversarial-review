@@ -690,6 +690,7 @@ describe("git mode honors trusted gitignore scope", () => {
     assert.equal(diff.text.includes("ignored/runtime.js"), false);
     assert.equal(paths.includes("visible.js"), true);
     assert.equal(diff.text.includes("visible.js"), true);
+    assert.equal(diff.ignoredUntrackedSkipped, 1);
   });
 
   it("keeps tracked files reviewable even when a gitignore rule matches them", async (t) => {
@@ -731,6 +732,7 @@ describe("git mode honors trusted gitignore scope", () => {
     const diff = await buildReviewDiff(repo, baseline);
     assert.ok(diff.changedFiles.some((f) => f.path === "ignored/runtime.js" && f.status === "A"));
     assert.ok(diff.text.includes("ignored/runtime.js"));
+    assert.equal(diff.ignoredUntrackedSkipped, 0);
   });
 
   it("persisted baselines without respectGitignore remain exhaustive", async (t) => {

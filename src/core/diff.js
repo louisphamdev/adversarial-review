@@ -3,7 +3,7 @@ import { createReadStream, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { sha256 } from "./hash.js";
-import { git, isGitRepo } from "./git.js";
+import { git, gitCountNulRecords, isGitRepo } from "./git.js";
 
 // Directories never walked by the filesystem snapshot: VCS internals, caches,
 // and dependency trees. Walking these would be slow and would pollute the diff
@@ -102,6 +102,20 @@ function normalizeBaselineScope(scope) {
 function baselineRespectsGitignore(baseline) {
   // Persisted baselines from before this option existed remain exhaustive.
   return baseline?.respectGitignore === true;
+}
+
+async function ignoredUntrackedCount(cwd, baseline) {
+  if (!baselineRespectsGitignore(baseline)) return 0;
+  try {
+    const result = await gitCountNulRecords(
+      ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+      cwd
+    );
+    return result.code === 0 ? result.count : 0;
+  } catch {
+    // Observability must never become the authoritative source of correctness.
+    return 0;
+  }
 }
 
 // Capture the "before" state of the workspace so a later buildReviewDiff() can
@@ -474,11 +488,23 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     if (budgetTruncated && !changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
       changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
     }
-    return { text, diffHash: sha256(text), changedFiles: changed };
+    return {
+      text,
+      diffHash: sha256(text),
+      changedFiles: changed,
+      ignoredUntrackedSkipped: await ignoredUntrackedCount(cwd, baseline),
+    };
   }
 
   if (baseline?.type === "filesystem") {
-    return buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes);
+    const diff = await buildFilesystemReviewDiff(cwd, baseline, maxTotalDiffBytes);
+    return {
+      ...diff,
+      ignoredUntrackedSkipped:
+        baseline.snapshotSource === "git-files"
+          ? await ignoredUntrackedCount(cwd, baseline)
+          : 0,
+    };
   }
 
   // A NON-NULL baseline with an UNRECOGNIZED shape (e.g. `{type:"bogus"}`, or a git
@@ -492,7 +518,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
   if (baseline != null) {
     throw new Error("unrecognized_baseline_shape");
   }
-  return { text: "", diffHash: sha256(""), changedFiles: [] };
+  return { text: "", diffHash: sha256(""), changedFiles: [], ignoredUntrackedSkipped: 0 };
 }
 
 // Synthetic path used to surface a truncated-snapshot coverage limitation as a

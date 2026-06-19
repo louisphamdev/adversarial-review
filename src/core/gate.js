@@ -701,6 +701,7 @@ function reviewerErrorDecision(config, level, detail) {
  * @param {boolean} [input.stopHookActive] - host recursion guard.
  * @param {string} [input.hookEventName]   - authoritative host event name
  *        (e.g. "Stop"/"SubagentStop"); only "SubagentStop" skips the gate.
+ * @param {Function} [input.onScopeDiagnostic] - optional best-effort message sink.
  * @returns {Promise<object>} decision
  */
 export async function evaluateGate(input) {
@@ -715,6 +716,7 @@ export async function evaluateGate(input) {
     stateDir,
     transcriptPath = "",
     hookEventName = "",
+    onScopeDiagnostic,
   } = input;
 
   // (1) Subagent transcripts never trigger the gate (avoid serializing pipelines).
@@ -741,6 +743,16 @@ export async function evaluateGate(input) {
     diff = await buildReviewDiff(cwd, baseline);
   } catch {
     diff = null;
+  }
+  if (diff?.ignoredUntrackedSkipped > 0 && typeof onScopeDiagnostic === "function") {
+    try {
+      onScopeDiagnostic(
+        `adversarial-review: skipped ${diff.ignoredUntrackedSkipped} gitignored untracked ` +
+          `file(s) (respectGitignore=true)`
+      );
+    } catch {
+      // Diagnostics are best-effort and must not alter gate behavior.
+    }
   }
 
   const changedFiles = diff?.changedFiles || [];
