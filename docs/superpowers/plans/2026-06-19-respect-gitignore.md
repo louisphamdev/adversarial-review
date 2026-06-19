@@ -248,14 +248,16 @@ zero-commit repository.
 
 - [ ] **Step 3: Implement `snapshotGitFiles()`**
 
-Use:
+Use separate tracked and untracked listings:
 
 ```text
-git ls-files -z --cached --others --exclude-standard
+git ls-files -z --cached
+git ls-files -z --others --exclude-standard
 ```
 
-Reject nonzero or truncated output. Sort and deduplicate paths. Apply existing
-skip-directory rules. For each present path, use `lstat()`:
+Reject nonzero or truncated output. Apply existing skip-directory rules only to
+the untracked list, then sort and deduplicate the union. This preserves staged
+files even under a built-in skip directory. For each present path, use `lstat()`:
 
 - symbolic link: `snapshotSymlink()`;
 - regular file: `snapshotFile()`;

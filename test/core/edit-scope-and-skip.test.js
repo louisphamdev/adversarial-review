@@ -123,6 +123,11 @@ describe("runtime.extraSkipDirs excludes extra dirs from review", () => {
     assert.deepEqual(baseline.extraSkipDirs, ["scratch"]);
     assert.equal(baseline.respectGitignore, false);
   });
+
+  it("malformed respectGitignore values fall back to exhaustive behavior", async () => {
+    const baseline = await captureBaseline(dir, { respectGitignore: "true" });
+    assert.equal(baseline.respectGitignore, false);
+  });
 });
 
 describe("extraSkipDirs is TRUSTED-only (project config cannot set it)", () => {

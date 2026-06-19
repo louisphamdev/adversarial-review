@@ -120,6 +120,27 @@ describe("buildReviewDiff (git)", () => {
     assert.equal(paths.includes("visible-2.js"), true);
   });
 
+  it("zero-commit git repos keep staged files even under ignored skip directories", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "zero-commit-tracked-ignore");
+    await mkdir(join(repo, "node_modules"), { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, ".gitignore"), "node_modules/\n");
+    await writeFile(join(repo, "node_modules", "tracked.js"), "export const v = 1;\n");
+    gitSync(repo, ["add", ".gitignore"]);
+    gitSync(repo, ["add", "-f", "node_modules/tracked.js"]);
+
+    const baseline = await captureBaseline(repo);
+    assert.equal("node_modules/tracked.js" in baseline.snapshot, true);
+
+    await writeFile(join(repo, "node_modules", "tracked.js"), "export const v = 2;\n");
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(
+      diff.changedFiles.some((f) => f.path === "node_modules/tracked.js" && f.status === "M"),
+      "staged/tracked files remain reviewable even under a built-in untracked skip dir"
+    );
+  });
+
   it("R6: buildReviewDiff THROWS when a git diff command errors (corrupted index), not empty", async (t) => {
     if (!GIT_AVAILABLE) return t.skip("git not on PATH");
     const repo = join(dir, "corrupt-index");

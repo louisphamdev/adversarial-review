@@ -128,18 +128,22 @@ For a genuine non-Git workspace, `.gitignore` has no authoritative Git meaning,
 so the existing filesystem walk remains unchanged.
 
 For a Git repository without `HEAD` and `respectGitignore=true`, baseline and
-current snapshots omit ignored paths while retaining tracked and non-ignored
-paths. Git provides the authoritative file set:
+current snapshots omit ignored untracked paths while retaining every tracked
+path and every non-ignored untracked path. Git provides the authoritative sets:
 
 ```text
-git ls-files -z --cached --others --exclude-standard
+git ls-files -z --cached
+git ls-files -z --others --exclude-standard
 ```
 
-The snapshot hashes the present files from this list directly instead of first
-walking the entire workspace. This avoids traversing large ignored directory
-trees and keeps Git, rather than JavaScript, responsible for ignore semantics.
-Listed tracked files that are currently absent are omitted from the current
-snapshot so normal baseline comparison reports their deletion.
+The lists stay separate until the existing untracked-only skip-directory rules
+have been applied. This ensures a staged/tracked file under `node_modules` or
+another skip directory remains reviewable. The snapshot hashes the resulting
+present files directly instead of first walking the entire workspace. This
+avoids traversing large ignored directory trees and keeps Git, rather than
+JavaScript, responsible for ignore semantics. Listed tracked files that are
+currently absent are omitted from the current snapshot so normal baseline
+comparison reports their deletion.
 
 Ignored filtering must be applied consistently during both baseline and current
 snapshot capture. A filtering failure is a detection failure and must not

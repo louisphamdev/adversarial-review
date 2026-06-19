@@ -276,22 +276,30 @@ async function snapshotGitFiles(cwd, options = {}) {
   const maxFileBytes = options.maxFileBytes || 1_000_000;
   const maxFiles = options.maxFiles || 20_000;
   const skipSet = resolveSkipSet(options.extraSkipDirs);
-  const result = await git(
-    ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+  // Keep tracked and untracked listings separate: built-in skip directories
+  // apply only to untracked noise. A staged/tracked file must remain reviewable
+  // even when it lives under node_modules or another skipped directory.
+  const trackedResult = await git(["ls-files", "-z", "--cached"], cwd);
+  const untrackedResult = await git(
+    ["ls-files", "-z", "--others", "--exclude-standard"],
     cwd
   );
-  if (result.code !== 0 || result.truncated) {
-    throw new Error(`git_snapshot_listing_failed:${result.code ?? "truncated"}`);
+  for (const result of [trackedResult, untrackedResult]) {
+    if (result.code !== 0 || result.truncated) {
+      throw new Error(`git_snapshot_listing_failed:${result.code ?? "truncated"}`);
+    }
   }
 
-  const paths = [...new Set(
-    result.stdout
+  const normalizePaths = (stdout) =>
+    stdout
       .split("\0")
       .filter(Boolean)
       .map(toPosixSlashes)
-      .filter((rel) => !path.isAbsolute(rel) && !rel.startsWith("../"))
-      .filter((rel) => !isUnderSkipDir(rel, skipSet))
-  )].sort();
+      .filter((rel) => !path.isAbsolute(rel) && !rel.startsWith("../"));
+  const trackedPaths = normalizePaths(trackedResult.stdout);
+  const untrackedPaths = normalizePaths(untrackedResult.stdout)
+    .filter((rel) => !isUnderSkipDir(rel, skipSet));
+  const paths = [...new Set([...trackedPaths, ...untrackedPaths])].sort();
   const files = new Map();
   let truncated = paths.length > maxFiles;
 
