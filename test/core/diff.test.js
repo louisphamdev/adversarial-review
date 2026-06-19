@@ -620,7 +620,7 @@ describe("committed build artifacts are reviewable (FIX 3)", () => {
 // FIX 4 — git mode does not let .gitignore hide untracked runtime files
 // ---------------------------------------------------------------------------
 
-describe("git mode surfaces gitignored-but-present files (FIX 4)", () => {
+describe("git mode honors trusted gitignore scope", () => {
   let dir;
 
   before(async () => {
@@ -631,38 +631,87 @@ describe("git mode surfaces gitignored-but-present files (FIX 4)", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("includes a gitignored new file, still excludes node_modules", async (t) => {
+  it("excludes ignored untracked files by default but keeps visible untracked files", async (t) => {
     if (!GIT_AVAILABLE) return t.skip("git not on PATH");
-    const repo = join(dir, "ignored");
+    const repo = join(dir, "default");
     await mkdir(repo, { recursive: true });
     initRepo(repo);
-    await writeFile(join(repo, ".gitignore"), "secret-runtime/\n");
+    await writeFile(join(repo, ".gitignore"), "ignored/\n");
     await writeFile(join(repo, "base.txt"), "base\n");
     gitSync(repo, ["add", "-A"]);
     gitSync(repo, ["commit", "-q", "-m", "base"]);
     const baseline = await captureBaseline(repo);
 
-    // A gitignored-but-present runtime file (the bypass we are closing).
-    await mkdir(join(repo, "secret-runtime"), { recursive: true });
-    await writeFile(join(repo, "secret-runtime", "loader.js"), "globalThis.pwn = 1;\n");
-    // A dependency file that MUST stay excluded.
-    await mkdir(join(repo, "node_modules", "evil"), { recursive: true });
-    await writeFile(join(repo, "node_modules", "evil", "index.js"), "noise\n");
+    await mkdir(join(repo, "ignored"), { recursive: true });
+    await writeFile(join(repo, "ignored", "runtime.js"), "generated\n");
+    await writeFile(join(repo, "visible.js"), "export const visible = true;\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    const paths = diff.changedFiles.map((f) => f.path);
+    assert.equal(paths.includes("ignored/runtime.js"), false);
+    assert.equal(diff.text.includes("ignored/runtime.js"), false);
+    assert.equal(paths.includes("visible.js"), true);
+    assert.equal(diff.text.includes("visible.js"), true);
+  });
+
+  it("keeps tracked files reviewable even when a gitignore rule matches them", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "tracked");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, "tracked.log"), "v1\n");
+    await writeFile(join(repo, ".gitignore"), "*.log\n");
+    gitSync(repo, ["add", "-f", "tracked.log"]);
+    gitSync(repo, ["add", ".gitignore"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+
+    await writeFile(join(repo, "tracked.log"), "v2\n");
 
     const diff = await buildReviewDiff(repo, baseline);
     assert.ok(
-      diff.changedFiles.some((f) => f.path === "secret-runtime/loader.js" && f.status === "A"),
-      "gitignored-but-present file must appear as A"
+      diff.changedFiles.some((f) => f.path === "tracked.log" && f.status === "M"),
+      "tracked files remain covered regardless of ignore rules"
     );
-    assert.ok(
-      diff.text.includes("secret-runtime/loader.js"),
-      "diff text must include the gitignored file"
-    );
-    assert.equal(
-      diff.changedFiles.some((f) => f.path.includes("node_modules")),
-      false,
-      "node_modules must remain excluded"
-    );
+    assert.ok(diff.text.includes("tracked.log"));
+  });
+
+  it("trusted respectGitignore=false restores ignored-untracked coverage", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "exhaustive");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, ".gitignore"), "ignored/\n");
+    await writeFile(join(repo, "base.txt"), "base\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo, { respectGitignore: false });
+
+    await mkdir(join(repo, "ignored"), { recursive: true });
+    await writeFile(join(repo, "ignored", "runtime.js"), "runtime\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(diff.changedFiles.some((f) => f.path === "ignored/runtime.js" && f.status === "A"));
+    assert.ok(diff.text.includes("ignored/runtime.js"));
+  });
+
+  it("persisted baselines without respectGitignore remain exhaustive", async (t) => {
+    if (!GIT_AVAILABLE) return t.skip("git not on PATH");
+    const repo = join(dir, "legacy");
+    await mkdir(repo, { recursive: true });
+    initRepo(repo);
+    await writeFile(join(repo, ".gitignore"), "ignored/\n");
+    await writeFile(join(repo, "base.txt"), "base\n");
+    gitSync(repo, ["add", "-A"]);
+    gitSync(repo, ["commit", "-q", "-m", "base"]);
+    const baseline = await captureBaseline(repo);
+    delete baseline.respectGitignore;
+
+    await mkdir(join(repo, "ignored"), { recursive: true });
+    await writeFile(join(repo, "ignored", "legacy.js"), "legacy\n");
+
+    const diff = await buildReviewDiff(repo, baseline);
+    assert.ok(diff.changedFiles.some((f) => f.path === "ignored/legacy.js"));
   });
 });
 

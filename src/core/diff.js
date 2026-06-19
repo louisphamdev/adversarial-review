@@ -390,9 +390,13 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
       withTruncationMarker(working),
       withTruncationMarker(staged),
     ];
-    // Gather untracked files WITHOUT --exclude-standard so gitignored-but-present
-    // runtime files cannot hide from review; SKIP_DIRS / virtualenv filtering keeps
-    // node_modules / .venv* etc. out. This matches the filesystem walk's coverage.
+    // Enumerate once and reuse this exact list for both synthesized diff blocks
+    // and changedFiles coverage so the two views can never diverge.
+    const untrackedFiles = await gitUntrackedFiles(
+      cwd,
+      skipSet,
+      baselineRespectsGitignore(baseline)
+    );
     // Accumulate under a TOTAL byte budget so a pathological untracked tree (e.g. a huge
     // virtualenv that slipped the skip list, or a model cache) can never overflow V8's
     // max string length on join() — over budget we STOP synthesizing (bounding memory
@@ -402,7 +406,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     // already exceed the budget (and there are no untracked files to trip the loop), the
     // sentinel must still fire. (audit: budget only checked inside the untracked loop.)
     let budgetTruncated = totalBytes > maxTotalDiffBytes;
-    for (const rel of await gitUntrackedFiles(cwd, skipSet)) {
+    for (const rel of untrackedFiles) {
       if (totalBytes > maxTotalDiffBytes) {
         budgetTruncated = true;
         break;
@@ -415,7 +419,7 @@ export async function buildReviewDiff(cwd, baseline, options = {}) {
     }
     if (budgetTruncated) chunks.push(totalDiffTruncationBlock("untracked files", maxTotalDiffBytes));
     const text = chunks.filter(Boolean).join("\n");
-    const changed = await changedFiles(cwd, baseline);
+    const changed = await changedFiles(cwd, baseline, { untrackedFiles });
     if (budgetTruncated && !changed.some((c) => c.path === TRUNCATION_SENTINEL_PATH)) {
       changed.push({ path: TRUNCATION_SENTINEL_PATH, status: "M" });
     }
@@ -723,7 +727,7 @@ function deletionBlock(rel) {
 // Build the list of changed files for a git baseline by unioning name-status
 // across committed / working / staged ranges plus untracked files. Renames
 // (status R) contribute both the old and new path entries.
-export async function changedFiles(cwd, baseline) {
+export async function changedFiles(cwd, baseline, options = {}) {
   const map = new Map(); // path -> status (first writer wins ordering, last status wins)
   const skipSet = resolveSkipSet(baseline?.extraSkipDirs);
 
@@ -741,24 +745,28 @@ export async function changedFiles(cwd, baseline) {
     parseNameStatusZ(result.stdout, map);
   }
 
-  // Gather untracked files WITHOUT --exclude-standard (then SKIP_DIRS-filter) so
-  // gitignored-but-present files are still surfaced as additions.
-  for (const rel of await gitUntrackedFiles(cwd, skipSet)) {
+  const untrackedFiles = Array.isArray(options.untrackedFiles)
+    ? options.untrackedFiles
+    : await gitUntrackedFiles(cwd, skipSet, baselineRespectsGitignore(baseline));
+  for (const rel of untrackedFiles) {
     map.set(toPosixSlashes(rel), "A");
   }
 
   return [...map.entries()].map(([p, status]) => ({ path: p, status }));
 }
 
-// List untracked files via git, INCLUDING ignored-but-present ones (no
-// --exclude-standard), then drop any path that lives under a SKIP_DIRS segment
-// (e.g. node_modules) so the review still ignores dependency/cache trees.
-async function gitUntrackedFiles(cwd, skipSet = SKIP_DIRS) {
+// List untracked files via Git, optionally honoring standard ignore sources,
+// then apply the gate's built-in/trusted directory exclusions.
+async function gitUntrackedFiles(cwd, skipSet = SKIP_DIRS, respectGitignore = false) {
   // `-z`: NUL-delimit so a filename containing a newline stays one path (splitting on
   // newlines would break it into fake paths whose real content is then never reviewed —
   // a fail-OPEN). (audit / GPT-5.5-xhigh)
-  const result = await git(["ls-files", "-z", "--others"], cwd);
-  if (result.code !== 0) return [];
+  const args = ["ls-files", "-z", "--others"];
+  if (respectGitignore) args.push("--exclude-standard");
+  const result = await git(args, cwd);
+  if (result.code !== 0 || result.truncated) {
+    throw new Error(`git_untracked_listing_failed:${result.code ?? "truncated"}`);
+  }
   return result.stdout
     .split("\0")
     .filter(Boolean)
