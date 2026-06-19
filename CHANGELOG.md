@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Ignored working-tree artifacts no longer make the gate unusable.** Git
+  repositories now honor `.gitignore` for untracked files by default, preventing
+  caches, build output, virtual environments, logs, and scratch files from
+  permanently overflowing the synthesized diff and fail-closed blocking every
+  Stop. Tracked files remain covered even when their paths match an ignore rule,
+  and all non-ignored untracked files remain covered.
+
+### Added
+- **Trusted `runtime.respectGitignore` control.** The default is `true`; users
+  performing exhaustive audits of untrusted repositories can set it to `false`
+  in `~/.adversarial-review/config.json` to restore the previous
+  review-everything-present posture. The runtime block is user/global-only, so a
+  cloned project cannot enable ignored-file exclusion. The gate reports how many
+  ignored untracked files were skipped.
+
 ## [2.2.8] - 2026-06-16
 
 Stops the gate from blocking on files that are not part of the workspace — a usability

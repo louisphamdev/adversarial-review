@@ -135,6 +135,9 @@ config is attacker-controlled). It may freely override non-security tuning
   or `block → allow`.
 - The `hosts.<host>.reviewer` mapping is **pinned** to the trusted baseline — a
   project can never redirect or downgrade which reviewer runs.
+- The complete `runtime` block is **pinned** to the trusted baseline. In
+  particular, a project cannot enable ignored-file exclusion to hide files from
+  review.
 - A reviewer's `models`, `requiredDimensions`, and `timeoutSec` come from the
   **user** config only — a project can never pin a weak model, shrink the
   required review dimensions, or set a 0-second timeout.
@@ -150,6 +153,10 @@ Example `~/.adversarial-review/config.json`:
   "policy": {
     "mode": "enforced"
   },
+  "runtime": {
+    "respectGitignore": true,
+    "extraSkipDirs": []
+  },
   "hosts": {
     "claude-code": { "reviewer": "opencode" },
     "codex": { "reviewer": "opencode" }
@@ -162,6 +169,24 @@ Example `~/.adversarial-review/config.json`:
   }
 }
 ```
+
+`runtime.respectGitignore` defaults to `true`. In Git repositories, the gate
+reviews tracked changes plus non-ignored untracked files, matching
+`git ls-files --others --exclude-standard`. A tracked file remains reviewable
+even if its path later matches `.gitignore`; only untracked ignored files are
+omitted.
+
+When ignored files are present, the gate reports the narrowed scope on stderr:
+
+```text
+adversarial-review: skipped 70818 gitignored untracked file(s) (respectGitignore=true)
+```
+
+For an exhaustive audit of an untrusted repository, set
+`runtime.respectGitignore` to `false` in the trusted user-level config shown
+above. Project config cannot change this value. `runtime.extraSkipDirs` is also
+trusted-user-only and remains available for directory-name exclusions that are
+not represented by Git ignore rules.
 
 With this in place, a new project inherits the host/reviewer mapping and the
 `enforced` mode without re-running install per project. A project may still ship
