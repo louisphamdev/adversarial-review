@@ -543,7 +543,7 @@ describe("evaluateGate basic policy", () => {
     assert.equal(decision.selfReview, true);
   });
 
-  it("blocks empty diff with edit evidence in enforced (internal error fail-closed)", async () => {
+  it("advisory-allows empty diff with edit evidence (operational limitation, all modes)", async () => {
     const { cwd, baseline } = await makeWorkspace({}, {}); // no actual file change
     track(cwd);
     const decision = await evaluateGate({
@@ -554,7 +554,10 @@ describe("evaluateGate basic policy", () => {
       host: { reviewerMapping: "none" },
       stateDir: await tmpStateDir(),
     });
-    assert.equal(decision.action, "block");
+    // Advisory model: an unbuildable/empty diff is a disclosed limitation, not a
+    // hard block — surface it but allow in all modes.
+    assert.equal(decision.action, "allow");
+    assert.match(decision.systemMessage || "", /no reviewable diff could be built/i);
   });
 
   it("self-review none emits orchestrator instruction (not a pass)", async () => {
@@ -1648,7 +1651,7 @@ describe("evaluateGate guards", () => {
 
   // #22: a reviewable file whose diff text is truncated at the per-file size cap
   // hides the post-cap payload from the reviewer. The gate must NOT accept it.
-  it("BLOCKS in enforced when a reviewable file's diff is truncated at the size cap", async () => {
+  it("advisory-allows (all modes) when a reviewable file's diff is truncated at the size cap", async () => {
     const { cwd, baseline } = await makeWorkspace({}, {});
     track(cwd);
     // Shrink the per-file diff cap so a modest reviewable file is truncated.
@@ -1658,17 +1661,18 @@ describe("evaluateGate guards", () => {
     await writeFile(join(cwd, "src/big.js"), "// " + "a".repeat(400) + "\nconst evil = require('child_process');\n");
     let reviewerCalled = false;
     const decision = await evaluateGate({
-      config: mergeConfig(), // enforced
+      config: mergeConfig(), // enforced — advisory model no longer hard-blocks here
       cwd,
       baseline,
       transcript: editTranscript("src/big.js"),
       stateDir: await tmpStateDir(),
       reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
     });
-    assert.equal(decision.action, "block", "truncated reviewable content must block in enforced");
+    // Advisory model: a coverage limitation is surfaced but allowed in all modes.
+    assert.equal(decision.action, "allow", "truncated reviewable content is advisory, not a hard block");
     assert.equal(decision.truncated, true);
     assert.ok(decision.truncatedPaths.includes("src/big.js"));
-    assert.equal(reviewerCalled, false, "must block before even running the reviewer");
+    assert.equal(reviewerCalled, false, "advisory short-circuits before the reviewer runs");
   });
 
   it("downgrades to advisory in soft mode when a reviewable file's diff is truncated", async () => {
@@ -1708,7 +1712,10 @@ describe("evaluateGate guards", () => {
       stateDir: await tmpStateDir(),
       reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
     });
-    assert.equal(decision.action, "block", "truncation of a ' b/' path must still block");
+    // The truncation must still be DETECTED and ATTRIBUTED to the ' b/' path; in
+    // the advisory model it surfaces as an advisory allow rather than a hard block.
+    assert.equal(decision.action, "allow", "truncation of a ' b/' path surfaces as advisory");
+    assert.equal(decision.truncated, true);
     assert.ok((decision.truncatedPaths || []).includes(rel), `expected ${rel} in truncatedPaths`);
     assert.equal(reviewerCalled, false);
   });
@@ -1752,7 +1759,7 @@ describe("evaluateGate guards", () => {
   // must never run). POSIX-only: NTFS forbids newlines in filenames, so creating the
   // fixture throws on Windows; the unit cases above cover detection on every platform.
   const itPosix = process.platform === "win32" ? it.skip : it;
-  itPosix("R6: BLOCKS in enforced when a reviewable file with a newline path is truncated", async () => {
+  itPosix("R6: advisory-allows (all modes) when a reviewable file with a newline path is truncated", async () => {
     const { cwd, baseline } = await makeWorkspace({}, {});
     track(cwd);
     baseline.options = { ...(baseline.options || {}), maxFileBytes: 64 };
@@ -1761,7 +1768,7 @@ describe("evaluateGate guards", () => {
     await writeFile(join(cwd, rel), "// " + "a".repeat(400) + "\nconst payload = require('child_process');\n");
     let reviewerCalled = false;
     const decision = await evaluateGate({
-      config: mergeConfig(), // enforced
+      config: mergeConfig(), // enforced — advisory model no longer hard-blocks here
       cwd,
       baseline,
       transcript: editTranscript(rel),
@@ -1769,9 +1776,10 @@ describe("evaluateGate guards", () => {
       host: { reviewerMapping: "codex" },
       reviewerRunner: async () => { reviewerCalled = true; return { ok: true, verdict: { verdict: "pass" } }; },
     });
-    assert.equal(decision.action, "block", "unmappable truncated reviewable content must block in enforced");
+    // Advisory model: an unmappable coverage limitation is surfaced but allowed.
+    assert.equal(decision.action, "allow", "unmappable truncation surfaces as advisory");
     assert.equal(decision.unmappableTruncation, true);
-    assert.equal(reviewerCalled, false, "must block before running the reviewer / accepting any pass");
+    assert.equal(reviewerCalled, false, "advisory short-circuits before the reviewer runs");
   });
 
   itPosix("R6: downgrades to advisory in soft mode for an unmappable (newline-path) truncation", async () => {
@@ -1801,7 +1809,7 @@ describe("evaluateGate guards", () => {
   const GIT_OUTPUT_TRUNCATION_LINE =
     "... [git output truncated: exceeded buffer cap; diff is incomplete] ...";
 
-  it("BLOCKS in enforced when the whole git diff output was truncated (>64 MiB)", async () => {
+  it("advisory-allows (all modes) when the whole git diff output was truncated (>64 MiB)", async () => {
     // A reviewable change whose diff text carries the git-output truncation marker
     // (the diff tail is missing). gitOutputTruncated scans the full diff text for
     // the marker substring, so a file containing the marker line reproduces the
@@ -1813,7 +1821,7 @@ describe("evaluateGate guards", () => {
     track(cwd);
     let reviewerCalled = false;
     const decision = await evaluateGate({
-      config: mergeConfig(), // enforced
+      config: mergeConfig(), // enforced — advisory model no longer hard-blocks here
       cwd,
       baseline,
       transcript: editTranscript("src/big.js"),
@@ -1823,9 +1831,10 @@ describe("evaluateGate guards", () => {
         return { ok: true, verdict: { verdict: "pass" } };
       },
     });
-    assert.equal(decision.action, "block", "git-output-truncated diff must block in enforced");
+    // Advisory model: a global coverage limitation is surfaced but allowed.
+    assert.equal(decision.action, "allow", "git-output-truncated diff surfaces as advisory");
     assert.equal(decision.gitOutputTruncated, true);
-    assert.equal(reviewerCalled, false, "must block before running the reviewer / accepting any pass");
+    assert.equal(reviewerCalled, false, "advisory short-circuits before the reviewer runs");
   });
 
   it("downgrades to advisory in soft mode when the whole git diff output was truncated", async () => {
@@ -1872,5 +1881,168 @@ describe("decision constructors", () => {
     const adv = advisory("hi");
     assert.equal(adv.action, "allow");
     assert.equal(adv.systemMessage, "hi");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Advisory model (v2.3.0): the native self-review gate SUGGESTS files to review
+// (with reasons) and lets the coding agent decide to review or skip; detected
+// secrets remain a hard block in every mode.
+// ---------------------------------------------------------------------------
+
+// An assistant text turn (the coding agent's own reply), used to test the
+// agent-discretion skip marker.
+function assistantText(text, ts) {
+  return JSON.stringify({
+    timestamp: ts,
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+}
+
+describe("advisory gate model", () => {
+  it("review suggestion lists each reviewable file with its reason", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/x.js": "const a = 1;\n", "src/auth/token.js": "const t = 1;\n" }
+    );
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    // Still a (soft) block so Claude gives the agent a turn to act — but the
+    // reason is an advisory suggestion that names every reviewable file + reason.
+    assert.equal(decision.action, "block");
+    assert.equal(decision.selfReview, true);
+    assert.ok(Array.isArray(decision.fileReasons), "decision carries a fileReasons list");
+    assert.match(decision.reason, /advisory/i);
+    assert.match(decision.reason, /src\/x\.js/);
+    assert.match(decision.reason, /src\/auth\/token\.js/);
+    assert.match(decision.reason, /\[adversarial-review:skip\]/, "tells the agent how to skip");
+    const authEntry = decision.fileReasons.find((f) => f.path.includes("auth/token.js"));
+    assert.ok(authEntry && authEntry.reasons.includes("sensitive"), "the auth file is flagged sensitive");
+  });
+
+  it("honors an agent skip marker emitted AFTER the last edit (agent_skipped)", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      { "src/x.js": "const a = 1;\n" },
+      { "src/x.js": "const a = 2;\nconst b = 3;\n" }
+    );
+    track(cwd);
+    const transcript = [
+      editTranscript("src/x.js", "2026-06-13T10:00:00Z"),
+      assistantText("Trivial constant tweak.\n[adversarial-review:skip] only a constant changed", "2026-06-13T10:01:00Z"),
+    ].join("\n");
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript,
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.reason, "agent_skipped");
+  });
+
+  it("ignores a STALE agent skip marker emitted BEFORE the last edit", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      { "src/x.js": "const a = 1;\n" },
+      { "src/x.js": "const a = 2;\nconst b = 3;\n" }
+    );
+    track(cwd);
+    const transcript = [
+      assistantText("[adversarial-review:skip] stale", "2026-06-13T09:00:00Z"),
+      editTranscript("src/x.js", "2026-06-13T10:00:00Z"),
+    ].join("\n");
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript,
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    // The skip predates the most recent edit, so it does not carry over.
+    assert.equal(decision.action, "block");
+    assert.equal(decision.selfReview, true);
+  });
+
+  it("hard-blocks a detected secret in the native path, in soft mode", async () => {
+    const PK = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASB\n-----END PRIVATE KEY-----\n";
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": `const k = ${JSON.stringify(PK)};\n` });
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft" } }),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block", "a secret hard-blocks even in soft / advisory mode");
+    assert.equal(decision.secretBlocked, true);
+  });
+
+  it("a secret hard-block is NOT bypassable by an agent skip marker", async () => {
+    const PK = "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASB\n-----END PRIVATE KEY-----\n";
+    const { cwd, baseline } = await makeWorkspace({}, { "src/x.js": `const k = ${JSON.stringify(PK)};\n` });
+    track(cwd);
+    const transcript = [
+      editTranscript("src/x.js", "2026-06-13T10:00:00Z"),
+      assistantText("[adversarial-review:skip] trivial", "2026-06-13T10:01:00Z"),
+    ].join("\n");
+    const decision = await evaluateGate({
+      config: mergeConfig({ policy: { mode: "soft" } }),
+      cwd,
+      baseline,
+      transcript,
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block");
+    assert.equal(decision.secretBlocked, true);
+  });
+
+  it("a change ONLY inside a coding-agent dir (.claude) does not trigger review", async () => {
+    const { cwd, baseline } = await makeWorkspace({}, { ".claude/settings.json": '{"x":1}\n' });
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript(".claude/settings.json"),
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "allow", "agent-dir-only change is not a reviewable project change");
+    assert.notEqual(decision.selfReview, true);
+  });
+
+  it("a real project change is still reviewed, with agent-dir churn excluded from the suggestion", async () => {
+    const { cwd, baseline } = await makeWorkspace(
+      {},
+      { "src/x.js": "const a = 1;\n", ".claude/settings.json": '{"x":1}\n', ".opencode/agent/a.md": "hi\n" }
+    );
+    track(cwd);
+    const decision = await evaluateGate({
+      config: mergeConfig(),
+      cwd,
+      baseline,
+      transcript: editTranscript("src/x.js"),
+      host: { reviewerMapping: "none" },
+      stateDir: await tmpStateDir(),
+    });
+    assert.equal(decision.action, "block");
+    assert.equal(decision.selfReview, true);
+    const paths = (decision.fileReasons || []).map((f) => f.path);
+    assert.ok(paths.includes("src/x.js"), "the real project file is suggested");
+    assert.ok(!paths.some((p) => p.includes(".claude/")), "agent-dir paths are excluded");
+    assert.ok(!paths.some((p) => p.includes(".opencode/")), "agent-dir paths are excluded");
   });
 });

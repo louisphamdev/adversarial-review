@@ -7,14 +7,23 @@
 
 A NodeJS multi-tool adversarial review gate for coding agents.
 
-The gate stops a coding agent from finishing a turn when a significant code
-change has not passed an adversarial review — a scoped reviewer whose job is to
-**break** the diff (correctness, edge cases, security, invariants, tests,
-performance), not to praise it.
+When a coding agent makes a significant code change, the native gate is
+**advisory** (since v2.3.0): on the agent's Stop it surfaces a review
+**suggestion** — every reviewable changed file with its reason (code / sensitive)
+and a suggested level — and lets the agent decide whether to run a scoped reviewer
+whose job is to **break** the diff (correctness, edge cases, security, invariants,
+tests, performance), or to skip a change it judges trivial. To skip, the agent
+ends its reply with `[adversarial-review:skip] <reason>`.
+
+The one **hard block**, in every mode, is a detected secret (an API key, private
+key, or a sensitive file path): committing secret material is a real harm
+independent of review.
 
 Designed to be low-friction: docs-only edits and unchanged working trees pass
-freely. The gate never wedges a session. Policy modes let teams choose between
-a developer-friendly soft gate and a strict CI gate.
+freely. The gate never wedges a session. An explicitly configured **external
+reviewer** (e.g. opencode/codex) still enforces its verdict — opting into one is
+opting into its gate — and the policy mode governs that path. (Need a hard,
+fail-closed self-review gate for CI? See *Residual Risks*.)
 
 ---
 
@@ -188,6 +197,15 @@ above. Project config cannot change this value. `runtime.extraSkipDirs` is also
 trusted-user-only and remains available for directory-name exclusions that are
 not represented by Git ignore rules.
 
+**Coding-agent directories are always excluded** (since v2.4.0), tracked or
+untracked, at any depth: `.claude`, `.opencode`, `.codex`, `.cursor`, `.serena`,
+`.windsurf`, `.gemini`, `.continue`, `.cline`, `.roo`, `.kilocode`, `.augment`,
+`.github-copilot`, and `.aider*`. These hold an agent's own config, session
+transcripts, todos, caches, and persistent memory — not the project being coded —
+so edits inside them are never treated as a reviewable project change. This sits
+alongside the built-in dependency/cache skips (`node_modules`, `.venv`, `.cache`,
+`__pycache__`, `coverage`, `.git`). Add more dirs via `runtime.extraSkipDirs`.
+
 With this in place, a new project inherits the host/reviewer mapping and the
 `enforced` mode without re-running install per project. A project may still ship
 its own `.adversarial-review/config.json` to override **non-security** defaults,
@@ -229,11 +247,16 @@ them):
 Set `policy.mode` in `.adversarial-review/config.json`. Default for new
 installs is **`enforced`**.
 
+Since v2.3.0 the **native self-review gate is advisory in all modes** (it
+suggests review and lets the agent self-review or skip; only secrets hard-block).
+The mode below primarily governs the **external-reviewer** path and the policy
+floor:
+
 | Mode | Description |
 |---|---|
-| `soft` | Developer-friendly. Reviewer operational failures may fall back to self-review. Skip requests are allowed. Small low-risk code changes may pass with an advisory. |
-| `enforced` | Default. Reviewer operational failure blocks unless `onReviewerError` is explicitly `self-review`. Skip requests require explicit config permission. Every code/runtime-affecting change requires review. |
-| `strict-ci` | Fail-closed. Reviewer operational failures block. Advisory hosts are rejected. Skip requests are ignored. All code/runtime-affecting changes require review. Custom reviewers require user-level trust. Secret findings prevent external review. |
+| `soft` | Developer-friendly. External reviewer operational failures may fall back to self-review. User skip requests are allowed. |
+| `enforced` | Default. External reviewer operational failure blocks unless `onReviewerError` is explicitly `self-review`; a configured external reviewer's FAIL verdict blocks. User skip requests require explicit config permission. |
+| `strict-ci` | External reviewer operational failures block. Advisory hosts are rejected. User skip requests are ignored. Custom reviewers require user-level trust. Secret findings prevent external review. |
 
 Project config may make policy **stricter** than the user-level floor, but
 cannot make it looser. If user policy is `strict-ci`, a project cannot
@@ -654,6 +677,14 @@ Do not rely on it as a compliance control. Use `externalReview: "deny"` or
 This tool is a review gate and quality guard, not a security sandbox or
 compliance control. The following residual risks apply:
 
+- **The native self-review gate is advisory by design (v2.3.0+).** It SUGGESTS
+  review and lets the coding agent self-review or skip a change it judges trivial
+  (via `[adversarial-review:skip] <reason>`). This is a deliberate usability
+  trade-off: a malicious or careless agent can simply emit the skip marker, so
+  the native path does not GUARANTEE that non-secret code is reviewed. For a
+  fail-closed gate, map the host to an explicitly configured **external reviewer**
+  (opencode/codex/custom) — that path still enforces its verdict and is governed
+  by the policy mode. Detected secrets hard-block regardless.
 - **Native enforcement depends on the host honoring its hook contract.** If the
   host tool ignores or bypasses its own Stop hook, the gate cannot block.
 - **Wrapper enforcement cannot force an already-finished interactive agent to

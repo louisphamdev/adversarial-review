@@ -24,7 +24,36 @@ const SKIP_DIRS = new Set([
   // so they read as permanently-"added" in every diff and the gate blocks EVERY Stop
   // (even no-op turns). They are tool-generated noise, not the agent's reviewable code.
   ".spec-workflow",
+  // CODING-AGENT working / state / memory directories. These hold an agent tool's
+  // own config, session transcripts, todos, caches, and persistent memory — NOT the
+  // project source being coded. Changes inside them are agent housekeeping, not a
+  // reviewable project change, so they must never trigger (or pollute) review. A user
+  // who genuinely wants one reviewed can stop listing it here; more can be added via
+  // the trusted `runtime.extraSkipDirs`. (Aider's versioned cache dirs are matched by
+  // AGENT_DIR_RE below.)
+  ".claude",
+  ".opencode",
+  ".codex",
+  ".cursor",
+  ".serena",
+  ".windsurf",
+  ".gemini",
+  ".continue",
+  ".cline",
+  ".roo",
+  ".kilocode",
+  ".augment",
+  ".github-copilot",
+  ".aider",
 ]);
+
+// A coding-agent directory whose name is VERSIONED/SUFFIXED so a literal SKIP_DIRS
+// entry cannot match every variant. Currently: Aider's caches/state — ".aider",
+// ".aider.tags.cache.v3", ".aider.chat.history" (as a dir), etc. The leading
+// ".aider" must be followed by end-of-name or a ".-_" separator so a plausible
+// SOURCE dir like ".aiderules-src" is matched (still agent-owned) while an
+// unrelated ".aiderx" is not — same dotted-convention precision as VENV_DIR_RE.
+const AGENT_DIR_RE = /^\.aider(?:[.\-_].*)?$/;
 
 // A directory whose name is a Python VIRTUALENV. These hold installed third-party
 // packages (like node_modules) — not the user's reviewable code — and can be ENORMOUS
@@ -68,7 +97,7 @@ function resolveSkipSet(extraSkipDirs) {
 
 /** Whether a single path SEGMENT (a directory name) should be skipped from review. */
 function isSkipSegment(name, skipSet = SKIP_DIRS) {
-  return skipSet.has(name) || VENV_DIR_RE.test(name);
+  return skipSet.has(name) || VENV_DIR_RE.test(name) || AGENT_DIR_RE.test(name);
 }
 
 // Hard ceiling on the TOTAL bytes of synthesized/joined diff text. Set well under V8's
@@ -849,7 +878,15 @@ export async function changedFiles(cwd, baseline, options = {}) {
     map.set(toPosixSlashes(rel), "A");
   }
 
-  return [...map.entries()].map(([p, status]) => ({ path: p, status }));
+  // Exclude skip-dir paths from the changed-file set. gitUntrackedFiles already
+  // filtered UNTRACKED skip-dir files, but the `--name-status` ranges above also
+  // surface TRACKED changes inside a skip dir (e.g. a committed `.claude/settings.json`
+  // or coding-agent state). Those are agent housekeeping, not a reviewable project
+  // change, so drop them here too — keeping the decision (level/reviewability)
+  // consistent with the untracked/filesystem-walk views.
+  return [...map.entries()]
+    .filter(([p]) => !isUnderSkipDir(p, skipSet))
+    .map(([p, status]) => ({ path: p, status }));
 }
 
 // List untracked files via Git, optionally honoring standard ignore sources,
@@ -872,7 +909,7 @@ async function gitUntrackedFiles(cwd, skipSet = SKIP_DIRS, respectGitignore = fa
 }
 
 // True if any PARENT path segment of `rel` is a skip dir.
-function isUnderSkipDir(rel, skipSet = SKIP_DIRS) {
+export function isUnderSkipDir(rel, skipSet = SKIP_DIRS) {
   // Only PARENT segments (directories) gate skipping: a FILE whose basename merely
   // matches a skip name (e.g. a real source file literally named "venv.py" or
   // "node_modules") must still be REVIEWED — skipping it on a basename match would be a

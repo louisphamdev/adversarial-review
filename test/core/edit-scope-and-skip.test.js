@@ -54,6 +54,26 @@ describe("scanKeys cwd-scope (edits outside the workspace are not edit evidence)
     assert.ok(r.lastEditKey > 0);
   });
 
+  it("an edit inside a coding-agent dir (.claude) is NOT edit evidence", () => {
+    const agentEdit = join(cwd, ".claude", "settings.json");
+    const r = scanKeys([editEntry(agentEdit)], cwd);
+    assert.equal(r.editedPaths.size, 0, "agent-dir edit must not count as a project change");
+    assert.equal(r.lastEditKey, 0);
+  });
+
+  it("an edit inside another agent dir (.opencode) is NOT edit evidence", () => {
+    const agentEdit = join(cwd, ".opencode", "agent", "x.md");
+    const r = scanKeys([editEntry(agentEdit)], cwd);
+    assert.equal(r.editedPaths.size, 0);
+  });
+
+  it("a project edit still counts even when an agent-dir edit is also present", () => {
+    const agentEdit = join(cwd, ".claude", "memory", "note.md");
+    const r = scanKeys([editEntry(agentEdit), editEntry(insidePath)], cwd);
+    assert.equal(r.editedPaths.size, 1, "only the real project edit is evidence");
+    assert.ok([...r.editedPaths][0].includes("app.js"));
+  });
+
   it("counts an in-workspace edit when cwd is a SYMLINK to the real root", { skip: process.platform === "win32" }, async () => {
     const real = await mkdtemp(join(tmpdir(), "ar-symws-"));
     const link = `${real}-link`;

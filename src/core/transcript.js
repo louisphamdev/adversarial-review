@@ -10,8 +10,28 @@
 
 import path from "node:path";
 import { realpathSync } from "node:fs";
+import { isUnderSkipDir } from "./diff.js";
 
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Whether an edit target sits inside a skip dir (a dependency/cache tree or a
+ * coding-agent working/state/memory directory such as `.claude` / `.opencode`).
+ * Such an edit is NOT a change to the reviewable project, so it must not count as
+ * edit evidence (otherwise constant agent-memory churn would surface as a change
+ * the gate reacts to every Stop). Mirrors the diff scope, which excludes the same
+ * dirs from `changedFiles`. The path is made workspace-relative + POSIX-normalized
+ * so `isUnderSkipDir`'s segment check sees the real parent directories.
+ */
+function editUnderSkipDir(cwd, filePath) {
+  let rel;
+  try {
+    rel = cwd ? path.relative(cwd, path.resolve(cwd, filePath)) : filePath;
+  } catch {
+    rel = filePath;
+  }
+  return isUnderSkipDir(String(rel).replace(/\\/g, "/"));
+}
 
 /**
  * Whether an edit tool's file_path is WITHIN the workspace root `cwd`. Edits to files
@@ -182,7 +202,11 @@ export function scanKeys(entries, cwd) {
           // OUTSIDE cwd (a temp scratch script) is not a change to this workspace and
           // must not become "edit evidence" that fail-closed-blocks against an empty
           // cwd-scoped diff. lastEditKey is bumped only for in-scope edits too.
-          if (typeof p === "string" && p && editPathInCwd(cwd, p)) {
+          // ALSO exclude edits inside a skip dir (dependency/cache trees and
+          // coding-agent working/state/memory dirs like `.claude`/`.opencode`): they
+          // are not reviewable project changes, so they must not become edit evidence —
+          // consistent with the diff scope, which drops the same paths.
+          if (typeof p === "string" && p && editPathInCwd(cwd, p) && !editUnderSkipDir(cwd, p)) {
             editedPaths.add(p);
             if (key > lastEditKey) lastEditKey = key;
           }
@@ -411,6 +435,62 @@ export function wantsSkip(text) {
     const words = [...pre.toLowerCase().matchAll(WORD_RE)].map((m) => m[0]);
     const window = words.slice(-NEG_WINDOW_WORDS).join(" ");
     if (!NEG_RE.test(window)) return true;
+  }
+  return false;
+}
+
+// ---- agentWantsSkip ---------------------------------------------------------
+
+// The explicit, deliberate marker a coding agent emits in its OWN reply to
+// decline adversarial review for a trivial change (the advisory gate's
+// agent-discretion escape). A bracketed token — never a bare word — so it can
+// not be matched by accident, and the gate's advisory reason instructs the agent
+// to write it. Only an ASSISTANT turn counts: the gate's own reason (which
+// CONTAINS this token as an instruction) arrives as hook feedback on a non-
+// assistant turn, so the gate can never read its own echo as an agent skip.
+//
+// LINE-ANCHORED (multiline): the marker must START a line (the gate tells the
+// agent to "end your reply with a line [adversarial-review:skip] <reason>"). This
+// avoids a false skip when the agent merely MENTIONS the marker inline while
+// explaining its reasoning (e.g. "I could write [adversarial-review:skip] but
+// I'll review instead").
+const SKIP_MARKER_RE = /^\s*\[adversarial-review:skip\]/im;
+
+/**
+ * Return true when the coding AGENT itself declared a skip — by emitting
+ * SKIP_MARKER_RE in an assistant turn strictly AFTER `afterKey` (typically
+ * lastEditKey). This is the advisory gate's agent-discretion escape: the agent
+ * may decline review for a change it judges trivial. The `afterKey` freshness
+ * bound means a skip declared BEFORE the most recent edit does not carry over —
+ * editing again after a skip re-opens the review suggestion.
+ *
+ * Unlike `wantsSkip` (which reads the USER's prompt), this reads only ASSISTANT
+ * turns, so it is immune to the gate echoing the skip instruction back as hook
+ * feedback. When `afterKey` is 0 (no transcript edit evidence) any assistant
+ * marker counts, which is correct: an explicit agent skip is honored.
+ *
+ * @param {object[]} entries
+ * @param {number} [afterKey=0]
+ * @returns {boolean}
+ */
+export function agentWantsSkip(entries, afterKey = 0) {
+  for (const e of entries) {
+    if (e?.type !== "assistant") continue;
+    const key = tsKey(e?.timestamp);
+    if (key <= afterKey) continue;
+    const msg = e?.message;
+    if (!msg || typeof msg !== "object") continue;
+    const content = msg.content;
+    let text = "";
+    if (typeof content === "string") {
+      text = content;
+    } else if (Array.isArray(content)) {
+      text = content
+        .filter((b) => b && typeof b === "object" && b.type === "text")
+        .map((b) => b.text || "")
+        .join("\n");
+    }
+    if (text && SKIP_MARKER_RE.test(text)) return true;
   }
   return false;
 }

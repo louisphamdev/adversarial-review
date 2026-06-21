@@ -12,6 +12,7 @@ import {
   isSubagentTranscript,
   lastUserText,
   wantsSkip,
+  agentWantsSkip,
 } from "../../src/core/transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -704,5 +705,56 @@ describe("wantsSkip - edge cases", () => {
   it("'skip the debate' directly → true (level-2 vocabulary)", () => {
     // Mirrors test_skip_debate_vocab_stands_down
     assert.equal(wantsSkip("skip the debate"), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// agentWantsSkip — the advisory gate's agent-discretion escape marker.
+// ---------------------------------------------------------------------------
+
+describe("agentWantsSkip", () => {
+  const assistant = (text, ts) => ({
+    timestamp: ts,
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+  const user = (text, ts) => ({
+    timestamp: ts,
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text }] },
+  });
+
+  it("detects the marker in an assistant turn after afterKey", () => {
+    const entries = [assistant("done.\n[adversarial-review:skip] trivial", "2026-06-13T10:01:00Z")];
+    assert.equal(agentWantsSkip(entries, tsKey("2026-06-13T10:00:00Z")), true);
+  });
+
+  it("is case-insensitive on the marker", () => {
+    const entries = [assistant("[ADVERSARIAL-REVIEW:SKIP] x", "2026-06-13T10:01:00Z")];
+    assert.equal(agentWantsSkip(entries, 0), true);
+  });
+
+  it("ignores a marker at or before afterKey (freshness)", () => {
+    const entries = [assistant("[adversarial-review:skip] stale", "2026-06-13T09:00:00Z")];
+    assert.equal(agentWantsSkip(entries, tsKey("2026-06-13T10:00:00Z")), false);
+  });
+
+  it("ignores the marker in a NON-assistant (user / hook feedback) turn", () => {
+    // The gate's own advisory reason (which contains the marker as an instruction)
+    // arrives as hook feedback on a user turn — it must never read as an agent skip.
+    const entries = [user("end your reply with [adversarial-review:skip] <reason>", "2026-06-13T10:01:00Z")];
+    assert.equal(agentWantsSkip(entries, 0), false);
+  });
+
+  it("returns false when no marker is present", () => {
+    const entries = [assistant("I will run the review now.", "2026-06-13T10:01:00Z")];
+    assert.equal(agentWantsSkip(entries, 0), false);
+  });
+
+  it("ignores an inline MENTION of the marker (must start a line)", () => {
+    const entries = [
+      assistant("I could write [adversarial-review:skip] but I'll review instead.", "2026-06-13T10:01:00Z"),
+    ];
+    assert.equal(agentWantsSkip(entries, 0), false);
   });
 });

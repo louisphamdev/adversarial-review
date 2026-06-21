@@ -5,6 +5,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-06-21
+
+### Changed
+- **Coding-agent working directories are excluded from review scope.** Changes
+  inside an agent's own config / session / cache / memory directories are agent
+  housekeeping, not a reviewable project change, so they no longer count as edit
+  evidence, appear in `changedFiles`, or trigger a review suggestion. Excluded
+  dirs (at any depth, tracked or untracked): `.claude`, `.opencode`, `.codex`,
+  `.cursor`, `.serena`, `.windsurf`, `.gemini`, `.continue`, `.cline`, `.roo`,
+  `.kilocode`, `.augment`, `.github-copilot`, and `.aider*` (versioned caches).
+  This complements the existing dependency/cache skips (`node_modules`, `.venv`,
+  `.cache`, …). Add more via the trusted `runtime.extraSkipDirs`. A real project
+  change alongside agent-dir churn is still reviewed — only the agent paths are
+  dropped from the suggestion.
+
+## [2.3.0] - 2026-06-21
+
+### Changed
+- **The native self-review gate is now ADVISORY in every mode.** Instead of
+  hard-blocking until a change passes review, the Stop gate emits a review
+  *suggestion*: it lists every reviewable changed file with its reason (code /
+  sensitive) and the suggested level, then lets the coding agent decide whether
+  to run the bundled self-review orchestrator or skip. This applies in `soft`,
+  `enforced`, and `strict-ci` alike. (External reviewers, when explicitly
+  configured per host, keep enforcing their verdict — opting into one is opting
+  into its gate.)
+- **Operational coverage limitations no longer hard-block.** An unbuildable /
+  corrupted-repo diff, a git-output truncation (>64 MiB), and per-file or
+  unmappable diff truncation are surfaced as advisory warnings in all modes
+  rather than blocking in `enforced`/`strict-ci`.
+
+### Added
+- **Agent-discretion skip marker.** The coding agent may decline review for a
+  change it judges trivial by ending its reply with a line
+  `[adversarial-review:skip] <brief reason>`. The gate honors it only when it
+  appears in an assistant turn AFTER the most recent edit (freshness), so a stale
+  skip never carries over and the gate can never read its own echoed instruction
+  as a skip.
+
+### Security
+- **Detected secrets remain a hard block in every mode**, including the native
+  self-review path (newly secret-scanned) and a docs-only change that touches a
+  sensitive path. A secret cannot be bypassed by the agent skip marker.
+
 ## [2.2.9] - 2026-06-19
 
 ### Fixed

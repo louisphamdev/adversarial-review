@@ -5,12 +5,14 @@ description: Use when the user wants to set up, install, activate, configure, or
 
 # Setting up the adversarial-review gate (NodeJS)
 
-This package is a multi-tool **adversarial review gate**: when a coding agent makes
-a significant code change, the gate forces it through a fresh-context reviewer
-that tries to **break** the diff (correctness, edge cases, security, broken
-invariants) before the agent may finish. It supports multiple host tools and lets
-one tool outsource review to another (e.g. Claude Code reviewed by opencode) or
-self-review.
+This package is a multi-tool **adversarial review gate**. When a coding agent makes
+a significant code change, the native gate is **advisory**: it suggests which
+changed files to review (with reasons) and lets the agent decide whether to run a
+fresh-context reviewer that tries to **break** the diff (correctness, edge cases,
+security, broken invariants) — or skip a change it judges trivial. Detected
+secrets are the one **hard block** that always stands, in every mode. It supports
+multiple host tools and lets one tool outsource review to another (e.g. Claude
+Code reviewed by opencode) or self-review.
 
 Work through these steps with the user. Keep it concrete.
 
@@ -44,11 +46,15 @@ to map a host to itself and refuses an unavailable reviewer (unless `none`). Use
 `~/.adversarial-review/config.json` and merges hooks into `~/.claude/settings.json`).
 
 ## 3. Pick a policy mode
-- `soft` — developer-friendly, fail-open. Reviewer errors don't block; small
-  changes pass with an advisory. Good for a first trial.
-- `enforced` (default) — fail-closed. Significant code changes block until review
-  passes; reviewer/operational failures block.
-- `strict-ci` — fail-closed + advisory hosts rejected, skip requests ignored.
+Since v2.3.0 the **native self-review gate is advisory in all modes** — it
+suggests review (listing files + reasons) and lets the agent self-review or skip;
+operational limitations are surfaced, not blocked; only detected secrets hard-block.
+The mode now primarily governs the **external-reviewer** path (when a host is
+mapped to opencode/codex/a custom reviewer) and the user policy floor:
+- `soft` — developer-friendly. External reviewer errors don't block.
+- `enforced` (default) — external reviewer errors/operational failures block, and
+  a configured external reviewer's FAIL verdict blocks.
+- `strict-ci` — enforced + advisory hosts rejected, user skip requests ignored.
 
 Set per project in `.adversarial-review/config.json`, or machine-wide in
 `~/.adversarial-review/config.json` (merged DEFAULT < user < project, then the

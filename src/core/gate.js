@@ -19,7 +19,6 @@ import {
   isStrict,
   requiresReviewForCode,
   reviewerErrorAction,
-  internalErrorAction,
   blockCapAction,
   skipAllowed,
 } from "./policy.js";
@@ -30,6 +29,7 @@ import {
   isSubagentTranscript,
   lastUserText,
   wantsSkip,
+  agentWantsSkip,
 } from "./transcript.js";
 import { parseVerdict, validateVerdict } from "./verdict.js";
 import { sha256, stableJson, reviewCacheKey } from "./hash.js";
@@ -298,32 +298,87 @@ function summarizeSecretFindings(findings) {
 // whose `job_id`, `diff_hash`, `payload_hash`, `reviewer`, `level`, and
 // dimension coverage match this job. A timestamp or a forgeable sentinel is no
 // longer sufficient — only a valid, current-diff verdict is accepted.
-function selfReviewBlockReason(level, job) {
-  const base =
+function selfReviewBlockReason(level, job, fileReasons, why) {
+  const tier =
     level === "debate"
-      ? "Stop hook feedback: this change has NOT passed an adversarial review. " +
-        "Run the bundled self-review orchestrator at DEBATE tier (panel + " +
-        "cross-examination + adjudicator) before completing. Critical and " +
-        "Important findings must block completion."
-      : "Stop hook feedback: this change has NOT passed an adversarial review. " +
-        "Run the bundled self-review orchestrator (single adversarial reviewer) " +
-        "before completing. Critical and Important findings must block completion.";
+      ? "the bundled self-review orchestrator at DEBATE tier (panel + " +
+        "cross-examination + adjudicator)"
+      : "the bundled self-review orchestrator (single adversarial reviewer)";
 
-  if (!job) return base;
+  const lines = [];
+  lines.push("[adversarial-review] Review suggestion — advisory; YOU decide whether to act.");
 
-  // Embed the verdict contract so the host orchestrator can emit a matching
-  // final-output verdict block. Acceptance is verdict-based, not timestamp- or
-  // sentinel-based.
-  const dims = (job.requiredDimensions || []).join(", ");
-  const files = (job.changedFiles || []).join(", ");
-  return (
-    base +
-    " The orchestrator's FINAL OUTPUT must be a verdict block with " +
-    `job_id="${job.jobId}", diff_hash="${job.diffHash}", ` +
-    `payload_hash="${job.payloadHash}", reviewer="self", level="${level}", ` +
-    `required dimensions [${dims}], and coverage.files_examined covering every ` +
-    `reviewable changed file [${files}]. A stale or non-matching verdict is rejected.`
+  // Per-file suggestion list (the gate SUGGESTS what to look at; the agent
+  // chooses). Capped so a huge diff does not flood the message.
+  if (Array.isArray(fileReasons) && fileReasons.length > 0) {
+    const whyText = why ? ` — ${why}` : "";
+    lines.push(
+      `${fileReasons.length} changed file(s) may warrant review (suggested level: ${level}${whyText}):`
+    );
+    for (const fr of fileReasons.slice(0, 20)) {
+      lines.push(`  • ${fr.path} — ${fr.reasons.join(", ")}`);
+    }
+    if (fileReasons.length > 20) {
+      lines.push(`  • … and ${fileReasons.length - 20} more`);
+    }
+  } else {
+    lines.push(`This change may warrant review (suggested level: ${level}).`);
+  }
+
+  lines.push(
+    `Run ${tier} if you judge this change warrants it. Critical and Important ` +
+      "findings should block completion."
   );
+  lines.push(
+    "If the change is trivial and not worth reviewing, end your reply with a line " +
+      "[adversarial-review:skip] <brief reason> and you may stop."
+  );
+
+  if (job) {
+    // Embed the verdict contract so an honest orchestrator run can emit a
+    // matching final-output verdict block. Acceptance stays verdict-based — a
+    // stale or non-matching verdict is rejected — so a real review still gates
+    // even though the suggestion is advisory.
+    const dims = (job.requiredDimensions || []).join(", ");
+    const files = (job.changedFiles || []).join(", ");
+    lines.push(
+      "If you DO review, the orchestrator's FINAL OUTPUT must be a verdict block with " +
+        `job_id="${job.jobId}", diff_hash="${job.diffHash}", ` +
+        `payload_hash="${job.payloadHash}", reviewer="self", level="${level}", ` +
+        `required dimensions [${dims}], and coverage.files_examined covering every ` +
+        `reviewable changed file [${files}].`
+    );
+  }
+  return lines.join("\n");
+}
+
+// Build the per-file reason list the advisory suggestion shows: for every
+// reviewable changed file, WHY it is reviewable (sensitive / code). Renames and
+// deletes are still listed. Non-reviewable (docs-only) files are omitted.
+function describeReviewableFiles(changedFiles, config) {
+  const out = [];
+  for (const f of changedFiles || []) {
+    const cls = classifyPath(f.path, config);
+    if (!cls.reviewable) continue;
+    const reasons = [];
+    if (cls.sensitive) reasons.push("sensitive");
+    reasons.push("code");
+    out.push({ path: String(f.path).replace(/\\/g, "/"), reasons });
+  }
+  return out;
+}
+
+// A short, human-readable explanation of WHY the suggested level is what it is
+// (size thresholds and/or a sensitive change), used in the advisory message.
+function reviewWhyText(diffStats, sensitive) {
+  const parts = [];
+  const lines = diffStats?.lines || 0;
+  const fileCount = diffStats?.fileCount || 0;
+  if (lines > 0 || fileCount > 0) {
+    parts.push(`${lines} line(s) across ${fileCount} file(s)`);
+  }
+  if (sensitive) parts.push("sensitive file(s) changed");
+  return parts.join("; ");
 }
 
 // Compute the review cache key for an external pass. Uses available config
@@ -766,16 +821,11 @@ export async function evaluateGate(input) {
   // genuinely-clean workspace returns an empty-but-NON-null diff, so this never
   // over-blocks a clean check. (round 6 / GPT-5.5 + Gemini)
   if (diff === null) {
-    const enforcedBuild = config.policy.mode === "enforced" || isStrict(config);
-    if (enforcedBuild) {
-      return block(
-        "Adversarial review could not complete: the diff could not be built (the repository may be " +
-          "corrupted), so a clean workspace cannot be confirmed (fail-closed).",
-        { detectionFailed: true }
-      );
-    }
+    // Advisory model: an operational limitation (here, an unbuildable diff) is a
+    // disclosed limitation in ALL modes — surface it but allow. Only detected
+    // secrets hard-block. The agent decides whether to act on the warning.
     return advisory(
-      "The diff could not be built (the repository may be corrupted); allowed per soft policy.",
+      "The diff could not be built (the repository may be corrupted); review could not be scoped, so this is advisory only.",
       { detectionFailed: true }
     );
   }
@@ -789,12 +839,9 @@ export async function evaluateGate(input) {
   // vacuous external pass. Follow onInternalError (allow soft, block enforced).
   const diffUnbuildable = !diff || (changedFiles.length === 0 && !diff.text);
   if (hasEditEvidence && diffUnbuildable) {
-    const action = internalErrorAction(config, true);
-    if (action === "allow") {
-      return advisory("Edit evidence present but no reviewable diff could be built; allowed per soft policy.");
-    }
-    return block(
-      "Adversarial review could not complete: edit evidence exists but no reviewable diff could be built (fail-closed)."
+    // Advisory model: an unbuildable diff is a disclosed limitation in all modes.
+    return advisory(
+      "Edit evidence present but no reviewable diff could be built; review could not be scoped, so this is advisory only."
     );
   }
 
@@ -844,6 +891,9 @@ export async function evaluateGate(input) {
   // so the self-review verdict is verified against the CURRENT diff.
   const reviewablePaths = reviewableChangedPaths(changedFiles, config);
   const payloadHash = sha256(stableJson({ diff: diff.text, level, changedFiles }));
+  // Per-file suggestion list + a short "why" for the advisory review message.
+  const fileReasons = describeReviewableFiles(changedFiles, config);
+  const reviewWhy = reviewWhyText(diffStats, sensitive);
 
   // Load session state for block-cap accounting, the pass cache, and the
   // persisted self-review jobId.
@@ -865,14 +915,9 @@ export async function evaluateGate(input) {
     const msg =
       "git diff output exceeded the buffer cap, so the diff is incomplete and the " +
       "reviewer could not see the full change (the tail past the cap is missing)";
-    if (enforced) {
-      return block(
-        `Adversarial review could not complete: ${msg} (fail-closed). Reduce the change size ` +
-          "or review the omitted tail manually before completing.",
-        { gitOutputTruncated: true }
-      );
-    }
-    return advisory(`${msg}; the review is based on incomplete diff content.`, {
+    // Advisory model: a coverage limitation is surfaced but never hard-blocks
+    // (secrets are the only hard block). The agent decides whether to act.
+    return advisory(`${msg}; any review is based on incomplete diff content.`, {
       gitOutputTruncated: true,
     });
   }
@@ -886,15 +931,9 @@ export async function evaluateGate(input) {
   const truncated = truncatedReviewablePaths(diff.text, reviewablePaths);
   if (truncated.length > 0) {
     const list = truncated.slice(0, 5).join(", ") + (truncated.length > 5 ? ", …" : "");
-    if (enforced) {
-      return block(
-        `Adversarial review could not complete: ${truncated.length} reviewable file(s) had their diff ` +
-          `truncated at the size cap, so the reviewer could not see the full change (fail-closed): ${list}.`,
-        { truncated: true, truncatedPaths: truncated }
-      );
-    }
+    // Advisory model: surface the truncation but allow (only secrets hard-block).
     return advisory(
-      `Reviewable file(s) were truncated at the size cap; the reviewer saw incomplete content: ${list}.`,
+      `Reviewable file(s) were truncated at the size cap; any review saw incomplete content: ${list}.`,
       { truncated: true, truncatedPaths: truncated }
     );
   }
@@ -916,14 +955,8 @@ export async function evaluateGate(input) {
       "the diff text was truncated at the per-file size cap but the truncated section's " +
       "path could not be parsed (an unparseable/ambiguous file path), so the reviewer " +
       "could not see the full change and it cannot be attributed to a specific file";
-    if (enforced) {
-      return block(
-        `Adversarial review could not complete: ${msg} (fail-closed). Rename the offending file ` +
-          "(remove unusual characters such as newlines from its path) or review the truncated content manually before completing.",
-        { truncated: true, unmappableTruncation: true }
-      );
-    }
-    return advisory(`${msg}; the review is based on incomplete diff content.`, {
+    // Advisory model: surface the limitation but allow (only secrets hard-block).
+    return advisory(`${msg}; any review is based on incomplete diff content.`, {
       truncated: true,
       unmappableTruncation: true,
     });
@@ -990,13 +1023,14 @@ export async function evaluateGate(input) {
       sessionId,
       state,
       config,
-      block(selfReviewBlockReason(level, selfJob), {
+      block(selfReviewBlockReason(level, selfJob, fileReasons, reviewWhy), {
         selfReview: true,
         level,
         jobId: selfJob.jobId,
         diffHash: selfJob.diffHash,
         payloadHash: selfJob.payloadHash,
         requiredDimensions: selfJob.requiredDimensions,
+        fileReasons,
         ...extra,
       })
     );
@@ -1007,8 +1041,38 @@ export async function evaluateGate(input) {
   const externalReview = reviewerMapping !== "none" && typeof reviewerRunner === "function";
 
   if (!externalReview) {
-    // Self-review required: emit the orchestrator instruction with the verdict
-    // contract. Counts as a BLOCK, not a pass.
+    // Native self-review path (no code leaves the box). In the advisory model the
+    // review SUGGESTION is a soft block the agent can satisfy (run the review) or
+    // decline (emit the skip marker) — BUT a detected secret is the one hard block
+    // that survives, in every mode: committing secret material is a real harm
+    // independent of review. The path-based scan also catches a sensitive path the
+    // classifier dropped. The message names only the finding type/path/count —
+    // never the secret value.
+    const secretFindings = scanSecrets(diff.text, allChangedPaths);
+    if (secretFindings.length > 0) {
+      return await blockWithCap(
+        stateDir,
+        sessionId,
+        state,
+        config,
+        block(
+          "Secret material detected in the change; remove the secret(s) before completing " +
+            `(${summarizeSecretFindings(secretFindings)}).`,
+          { secretBlocked: true, secretScan: "block-all", level }
+        )
+      );
+    }
+
+    // Agent-discretion escape: the coding agent declared the change trivial by
+    // emitting the skip marker AFTER its last edit. Honor it (only reached when no
+    // secret was found above). This is what makes the gate advisory — the agent,
+    // not the gate, decides whether a non-secret change warrants review.
+    if (agentWantsSkip(entries, lastEditKey)) {
+      return allow({ reason: "agent_skipped", level });
+    }
+
+    // Otherwise emit the advisory review SUGGESTION (a soft block carrying the
+    // file/reason list + the verdict contract). It is NOT a pass.
     return await emitSelfReviewBlock();
   }
 
