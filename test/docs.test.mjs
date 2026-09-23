@@ -78,7 +78,7 @@ test('docs and plugin tests', async (t) => {
     assert.match(content, /doneWhen|Done when/);
     assert.match(content, /severity|Severity/);
     assert.match(content, /evidence|Evidence/);
-    assert.match(content, /<state>\/memory\/|\${state}\/memory\//);
+    assert.match(content, /~\/\.adversarial-review\/memory\//);
   });
 
   await t.test('table-rules.md ports rules and replaces host mechanics', () => {

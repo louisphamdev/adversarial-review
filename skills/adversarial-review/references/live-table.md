@@ -90,6 +90,6 @@ The judge issues the final PASS or BLOCK verdict.
 
 Keep all seats active until stage VERIFY returns PASS.
 After the user accepts the review result, record method mistakes.
-Seats record method mistakes to `<state>/memory/rt-<seat>.md`.
+Seats record method mistakes to `~/.adversarial-review/memory/rt-<seat>.md`.
 Do not record project details or file paths in memory.
 Shut down all seats after recording completes.

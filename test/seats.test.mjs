@@ -187,7 +187,10 @@ test('seats module', async (t) => {
     assert.match(rendered, /\btools:\s*Read, Grep, Glob\b/);
     assert.ok(rendered.includes('## Before you work'));
     assert.ok(rendered.includes('table-rules.md'));
-    assert.ok(rendered.includes('<state>/memory/rt-breaker.md'));
+    // An agent cannot resolve a placeholder: every path in the rendered agent must be concrete.
+    assert.ok(rendered.includes('~/.adversarial-review/memory/rt-breaker.md'));
+    assert.ok(rendered.includes('references/table-rules.md'));
+    assert.ok(!rendered.includes('<state>'));
     assert.ok(rendered.includes('SendMessage'));
   });
 

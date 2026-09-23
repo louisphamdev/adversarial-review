@@ -54,8 +54,8 @@ An edge case that no caller can produce is noise. Say how the input arrives.
 
 ## Before you work
 
-1. Read `table-rules.md` next to `SKILL.md`. Those rules govern this seat.
-2. Read `<state>/memory/rt-edge.md` if it exists. Do not repeat your past method mistakes.
+1. Read `references/table-rules.md` in the `adversarial-review` skill directory. Those rules govern this seat.
+2. Read `~/.adversarial-review/memory/rt-edge.md` if it exists. Do not repeat your past method mistakes.
 
 Three rules matter most, so they are here as well:
 

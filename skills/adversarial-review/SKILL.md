@@ -47,7 +47,7 @@ You can also pass:
 
 ## Reading result.json
 
-The run outputs state and results into `<state>/runs/<run-id>/result.json`.
+The run writes its state and result to `~/.adversarial-review/runs/<repo-key>/<run-id>/result.json`. The command prints this directory.
 Inspect these fields in `result.json`:
 
 - `gateVerdict`: contains `PASS` or `BLOCK`.
