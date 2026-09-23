@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { makeIsolatedEnv } from './helpers/isolated-env.mjs';
+import { makeIsolatedEnv, makeFakeBins } from './helpers/isolated-env.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
 
 function sink() {
@@ -12,6 +12,8 @@ function sink() {
 
 test('doctor reads host installs from the manifest, not from guessed paths', async () => {
   const { env, home, cleanup } = await makeIsolatedEnv();
+  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)', opencode: 'opencode v2.0.9' });
+  env[bins.pathKey] = bins.pathEnv;
   try {
     const state = path.join(home, '.adversarial-review');
     await mkdir(state, { recursive: true });
@@ -30,6 +32,7 @@ test('doctor reads host installs from the manifest, not from guessed paths', asy
     assert.match(stdout.text, /gemini: installed \(project/);
     assert.match(stdout.text, /claude-code: not installed/);
   } finally {
+    await bins.cleanup();
     await cleanup();
   }
 });

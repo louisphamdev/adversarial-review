@@ -635,7 +635,7 @@ describe('Tracking and Signal Handlers', () => {
     assert.ok(code !== 0 || child.signalCode != null);
   });
 
-  it('installSignalHandlers cleans up tracked children on SIGINT and exits 130', async () => {
+  it('installSignalHandlers cleans up tracked children on SIGINT and exits 130', { skip: process.platform === 'win32' && 'Windows cannot deliver SIGINT through process.kill' }, async () => {
     const script = `
       import { installSignalHandlers, spawnResolved, trackedChildren } from './skills/adversarial-review/scripts/lib/proc.mjs';
       let exitCalled = false;

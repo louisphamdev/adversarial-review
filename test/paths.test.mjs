@@ -55,8 +55,11 @@ test('paths module', async (t) => {
       assert.match(key2, /^[0-9a-f]{12}-/);
 
       // Root directory handling
-      const posixRootKey = repoKey('/', 'linux');
-      assert.match(posixRootKey, /^[0-9a-f]{12}-root$/);
+      // realpath of '/' on a Windows host is a drive root, so the POSIX case runs on POSIX only.
+      if (process.platform !== 'win32') {
+        const posixRootKey = repoKey('/', 'linux');
+        assert.match(posixRootKey, /^[0-9a-f]{12}-root$/);
+      }
 
       const winRootKey = repoKey('C:\\', 'win32');
       assert.match(winRootKey, /^[0-9a-f]{12}-root$/);

@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import { parseArgs } from '../skills/adversarial-review/scripts/lib/cli/args.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
 import { modelsCommand } from '../skills/adversarial-review/scripts/lib/cli/models.mjs';
-import { makeIsolatedEnv, makeTempRepo } from './helpers/isolated-env.mjs';
+import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 import { ENGINE_VERSION } from '../skills/adversarial-review/scripts/lib/version.mjs';
 
 function createMockIO({ stdinData = '' } = {}) {
@@ -95,6 +95,8 @@ describe('cli unit and command tests', () => {
     it('prints recommendation JSON with route, reason, signals, and question', async () => {
       const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
       const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+      const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+      iso.env[bins.pathKey] = bins.pathEnv;
       const io = createMockIO();
       try {
         const code = await main(['recommend', '--target', 'a.js', '--json'], {
@@ -109,6 +111,7 @@ describe('cli unit and command tests', () => {
         assert.ok(parsed.signals);
         assert.ok(typeof parsed.question === 'string');
       } finally {
+        await bins.cleanup();
         await iso.cleanup();
         await repo.cleanup();
       }
@@ -117,6 +120,8 @@ describe('cli unit and command tests', () => {
     it('recommend command sets swarm.model to null when no swarm model picked, not default (C1)', async () => {
       const iso = await makeIsolatedEnv();
       const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+      const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+      iso.env[bins.pathKey] = bins.pathEnv;
       const io = createMockIO();
       try {
         const code = await main(['recommend', '--target', 'a.js', '--json'], {
@@ -128,6 +133,7 @@ describe('cli unit and command tests', () => {
         const parsed = JSON.parse(io.stdout.text);
         assert.equal(parsed.signals.swarmModel, null);
       } finally {
+        await bins.cleanup();
         await iso.cleanup();
         await repo.cleanup();
       }

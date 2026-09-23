@@ -41,3 +41,30 @@ export async function makeTempRepo({ git: useGit = true, files = {} } = {}) {
   }
   return { root, git: (args) => git(root, args), cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+// A hermetic PATH: fake vendor CLIs plus the directory of git, nothing else. Tests that pass
+// on the developer machine only because a real `claude` or `opencode` is installed break in CI.
+export async function makeFakeBins(names = { claude: '2.1.280 (Claude Code)' }) {
+  const { chmod } = await import('node:fs/promises');
+  const dir = await mkdtemp(path.join(tmpdir(), 'ar-bin-'));
+  for (const [name, version] of Object.entries(names)) {
+    const body =
+      `const a = process.argv.slice(2);\n` +
+      `if (a.includes('--version')) { console.log(${JSON.stringify(version)}); process.exit(0); }\n` +
+      `console.log('\`\`\`json\\n{"ok":true}\\n\`\`\`');\n`;
+    if (process.platform === 'win32') {
+      await writeFile(path.join(dir, `${name}.mjs`), body);
+      await writeFile(path.join(dir, `${name}.cmd`), `@"${process.execPath}" "%~dp0\\${name}.mjs" %*\r\n`);
+    } else {
+      const file = path.join(dir, name);
+      await writeFile(file, `#!${process.execPath}\n${body}`);
+      await chmod(file, 0o755);
+    }
+  }
+  const pathKey = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+  const gitExe = process.platform === 'win32' ? 'git.exe' : 'git';
+  const { existsSync } = await import('node:fs');
+  const gitDir = (process.env[pathKey] || '').split(path.delimiter).find((d) => d && existsSync(path.join(d, gitExe)));
+  const pathEnv = [dir, gitDir].filter(Boolean).join(path.delimiter);
+  return { dir, pathKey, pathEnv, cleanup: () => rm(dir, { recursive: true, force: true }) };
+}

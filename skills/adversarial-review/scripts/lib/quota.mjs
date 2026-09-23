@@ -265,22 +265,29 @@ export async function readQuota({
             const creds = JSON.parse(credText);
             const token = creds?.claudeAiOauth?.accessToken || creds?.accessToken;
             if (token && typeof token === 'string') {
-              const signal = AbortSignal.timeout(oauthTimeoutMs);
-              const res = await fetchImpl('https://api.anthropic.com/api/oauth/usage', {
-                method: 'GET',
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  'anthropic-beta': 'oauth-2025-04-20',
-                },
-                signal,
-              });
-              if (res && (res.ok || res.status === 200)) {
-                const data = await res.json();
-                const parsed = parsePercent(data?.seven_day?.utilization);
-                if (parsed !== null) {
-                  fetchedPercent = parsed;
-                  fetchOk = true;
+              // A ref'd timer, not AbortSignal.timeout: that timer is unref'd and never fires
+              // when a stalled request holds no socket, so the await would hang forever.
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), oauthTimeoutMs);
+              try {
+                const res = await fetchImpl('https://api.anthropic.com/api/oauth/usage', {
+                  method: 'GET',
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                    'anthropic-beta': 'oauth-2025-04-20',
+                  },
+                  signal: controller.signal,
+                });
+                if (res && (res.ok || res.status === 200)) {
+                  const data = await res.json();
+                  const parsed = parsePercent(data?.seven_day?.utilization);
+                  if (parsed !== null) {
+                    fetchedPercent = parsed;
+                    fetchOk = true;
+                  }
                 }
+              } finally {
+                clearTimeout(timer);
               }
             }
           }

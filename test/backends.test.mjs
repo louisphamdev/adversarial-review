@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -650,8 +651,8 @@ test('runSeatCall: child process.cwd() equals call.cwd', async () => {
     assert.equal(res.ok, true);
 
     const recorded = (await readFile(sideFile, 'utf8')).trim();
-    assert.equal(recorded, cwd);
-    assert.equal(res.value.cwd, cwd);
+    assert.equal(realpathSync(recorded), realpathSync(cwd));
+    assert.equal(realpathSync(res.value.cwd), realpathSync(cwd));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

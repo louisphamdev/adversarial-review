@@ -104,7 +104,10 @@ export async function siftFindings({
     }
 
     const timeoutMs = typeof siftCfg.timeoutMs === 'number' ? siftCfg.timeoutMs : DEFAULT_TIMEOUT_MS;
-    const signal = AbortSignal.timeout(timeoutMs);
+    // A ref'd timer, not AbortSignal.timeout (unref'd): it must fire even when nothing else holds the loop.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const signal = controller.signal;
     const url = siftCfg.url || DEFAULT_URL;
     const model = siftCfg.model || DEFAULT_MODEL;
     const questions = buildQuestions(findings);
@@ -121,6 +124,7 @@ export async function siftFindings({
         signal,
       });
     } catch (err) {
+      clearTimeout(timer);
       if (err?.name === 'AbortError' || err?.name === 'TimeoutError' || signal.aborted) {
         return { status: 'skipped', reason: 'timeout', rows: [], readingOrder: [] };
       }
@@ -128,6 +132,7 @@ export async function siftFindings({
     }
 
     if (!res.ok) {
+      clearTimeout(timer);
       await res.text().catch(() => {});
       return { status: 'skipped', reason: `http-${res.status}`, rows: [], readingOrder: [] };
     }
@@ -136,12 +141,14 @@ export async function siftFindings({
     try {
       text = await res.text();
     } catch (err) {
+      clearTimeout(timer);
       if (err?.name === 'AbortError' || err?.name === 'TimeoutError' || signal.aborted) {
         return { status: 'skipped', reason: 'timeout', rows: [], readingOrder: [] };
       }
       return { status: 'skipped', reason: 'network', rows: [], readingOrder: [] };
     }
 
+    clearTimeout(timer);
     let data;
     try {
       data = JSON.parse(text);
