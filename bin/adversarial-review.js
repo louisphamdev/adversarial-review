@@ -1,14 +1,9 @@
 #!/usr/bin/env node
-import { main } from "../src/cli/main.js";
+import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
 
-main(process.argv.slice(2), {
-  stdin: process.stdin,
-  stdout: process.stdout,
-  stderr: process.stderr,
+process.exitCode = await main(process.argv.slice(2), {
   env: process.env,
   cwd: process.cwd(),
-}).catch((error) => {
-  const message = error && error.stack ? error.stack : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  stdout: process.stdout,
+  stderr: process.stderr,
 });

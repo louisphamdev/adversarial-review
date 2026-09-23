@@ -1,50 +1,47 @@
 # Contributing
 
-Thanks for helping improve adversarial-review-gate.
+Thank you for contributing to adversarial-review.
 
 ## Requirements
 
-- **Node.js >= 20.** No Python is required (the previous Python implementation
-  has been fully replaced).
-- The package has **zero runtime dependencies** and is pure ESM. Keep it that
-  way: no new runtime deps without a strong reason.
-- Tests use the built-in `node:test` runner. Comments are in English.
+- Node.js version 20 or newer.
+- The package uses pure ECMAScript Modules (ESM).
+- Tests use the built-in `node:test` test runner.
+- Write code comments and documentation in English.
 
-## Development workflow
+## Development Workflow
+
+Run tests with Node.js:
 
 ```bash
-npm test                 # run the full test suite (node --test)
-npm run doctor           # print the gate's effective state (dry-run)
-npm run pack:dry-run     # preview the published tarball contents
+npm test
 ```
 
-Keep all existing tests green. Behavior changes must come with a test that
-covers the new behavior.
+Run the doctor command to inspect your environment:
 
-## Dev-mode soft note
-
-When you work **on this repo**, the gate you are building would otherwise gate
-your own commits. Put a project-level `.adversarial-review/config.json`
-containing:
-
-```json
-{ "policy": { "mode": "soft" } }
+```bash
+npm run doctor
 ```
 
-so you do not hard-gate your own development. This file is **gitignored** in this
-repo, so it stays local and is never committed. Use `enforced` everywhere else.
+Preview package contents before publication:
 
-## Design and threat model
+```bash
+npm run pack:dry-run
+```
 
-The gate's design intent, threat model, and enforcement semantics are documented
-inline in the source (see `src/core/gate.js`, `src/core/verdict.js`, and the
-hardening comments throughout) and summarized in the README's
-**Residual Risks** and **Policy Modes** sections. Read those before making
-non-trivial changes to the gate's behavior or enforcement.
+All existing tests must pass.
+When you change behavior, you must add a test for the new behavior.
 
-## Before opening a PR
+## Threat Model and Safety
 
-1. `npm test` is green.
-2. `npm run pack:dry-run` lists only the intended files.
-3. Docs (`README.md`, `SKILL.md`, `CHANGELOG.md`) updated for any user-facing
-   change.
+The roundtable treats all material as untrusted data.
+Never permit reviewer seats to write to repository files or run arbitrary shell commands.
+Keep tool permissions restricted.
+
+## Pull Request Checklist
+
+Make sure that you complete these steps before opening a pull request:
+
+1. All tests pass with `npm test`.
+2. The package preview lists only intended files with `npm run pack:dry-run`.
+3. Documentation files describe your changes.

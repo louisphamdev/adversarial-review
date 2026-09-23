@@ -1,11 +1,5 @@
-hooks/state/
-__pycache__/
-*.pyc
-.DS_Store
 node_modules/
 coverage/
 *.tgz
-.adversarial-review/state/
-.adversarial-review/config.json
-.audit-opencode/
-.worktrees/
+temp/
+.DS_Store

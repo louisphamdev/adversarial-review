@@ -4,13 +4,13 @@
     "name": "louisphamdev"
   },
   "metadata": {
-    "description": "Internal marketplace hosting the adversarial-review code-quality gate."
+    "description": "Marketplace hosting the adversarial-review code quality roundtable."
   },
   "plugins": [
     {
       "name": "adversarial-review",
       "source": "./",
-      "description": "Stop-hook gate (default: enforced) that forces an adversarial review of significant code changes before an agent finishes."
+      "description": "Adversarial code review roundtable for coding agents. Specialist seats find defects alone, attack findings, and a clean-context judge rules."
     }
   ]
 }

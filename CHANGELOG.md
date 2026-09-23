@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-23
+
+CAUTION: The Stop hook and the SessionStart hook are removed in version 3.0.0.
+Run `adversarial-review uninstall --v2-hooks` to remove hooks from project settings files.
+Run `adversarial-review uninstall --v2-hooks --global` to remove hooks from user settings files.
+
+### Added
+
+- Multi-agent adversarial review roundtable architecture.
+- Specialist review seats with independent lenses.
+- Seven review stages: FIND, TABLE, DISPUTE, LAST CALL, RULING, PATCH REVIEW, and VERIFY.
+- Clean-context judge that delivers the final gate ruling.
+- Sift gateway support to identify important claims before the ruling.
+- Two execution routes: spawn on the local host CLI and swarm across headless coding agents.
+- Automatic route recommendation based on quota and change size.
+- Multi-host installer supporting Claude Code, OpenCode, Codex, and Gemini CLI.
+- New CLI commands: `run`, `recommend`, `install`, `uninstall`, `doctor`, `models`, and `quota`.
+
+### Changed
+
+- Replaced v2 background stop hooks with explicit skill and CLI workflows.
+- Material under review is now strictly treated as untrusted data.
+- Reviewer seats run with read-only permissions and cannot run shell commands.
+
+### Removed
+
+- Removed v2 Stop and SessionStart background hooks.
+- Removed legacy python scripts and v2 orchestrators.
+
 ## [2.4.0] - 2026-06-21
 
 ### Changed

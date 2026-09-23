@@ -1,0 +1,32 @@
+[
+  {
+    "id": "unawaited-promise",
+    "lines": [7, 8],
+    "keywords": ["await", "promise", "async", "un-awaited", "unawaited", "getExchangeRates"]
+  },
+  {
+    "id": "off-by-one-loop",
+    "lines": [14, 17],
+    "keywords": ["off-by-one", "loop", "bound", "<=", "length", "undefined", "items"]
+  },
+  {
+    "id": "inverted-discount",
+    "lines": [21, 23],
+    "keywords": ["inverted", "discount", "condition", "vip", "!=", "tier"]
+  },
+  {
+    "id": "or-default-eats-zero",
+    "lines": [28, 28],
+    "keywords": ["||", "zero", "0", "shippingFee", "falsy", "default", "nullish", "??"]
+  },
+  {
+    "id": "missing-currency-math",
+    "lines": [31, 33],
+    "keywords": ["currency", "undefined", "exchangeRate", "rates", "NaN", "missing"]
+  },
+  {
+    "id": "wrong-rounding-operator",
+    "lines": [36, 36],
+    "keywords": ["rounding", "floor", "Math.floor", "Math.round", "operator", "round"]
+  }
+]

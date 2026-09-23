@@ -1,24 +1,22 @@
 {
   "name": "adversarial-review-gate",
-  "version": "2.4.0",
-  "description": "NodeJS multi-tool adversarial review gate for coding agents.",
+  "version": "3.0.0",
+  "description": "The roundtable: an adversarial review where specialist seats find defects alone, attack each other's findings, and a clean-context judge rules. Runs on any coding agent (Claude Code, Codex, Gemini CLI, opencode) on Linux, Windows, and macOS.",
   "type": "module",
   "bin": {
-    "adversarial-review-gate": "./bin/adversarial-review.js",
-    "adversarial-review": "./bin/adversarial-review.js"
+    "adversarial-review": "./bin/adversarial-review.js",
+    "adversarial-review-gate": "./bin/adversarial-review.js"
   },
   "scripts": {
-    "test": "node --test",
-    "doctor": "node ./bin/adversarial-review.js doctor --dry-run",
-    "pack:dry-run": "npm pack --dry-run",
-    "prepublishOnly": "npm test && npm run pack:dry-run"
-  },
-  "publishConfig": {
-    "access": "public"
+    "test": "node scripts/run-tests.mjs",
+    "build": "node scripts/build.mjs",
+    "build:check": "node scripts/build.mjs --check",
+    "pack:dry-run": "npm pack --dry-run"
   },
   "files": [
     "bin/",
-    "src/",
+    "skills/",
+    "agents/",
     ".claude-plugin/",
     "README.md",
     "CHANGELOG.md",
@@ -29,14 +27,14 @@
   },
   "keywords": [
     "code-review",
+    "adversarial-review",
+    "roundtable",
     "coding-agent",
     "claude-code",
     "codex",
+    "gemini-cli",
     "opencode",
-    "adversarial",
-    "code-quality",
-    "ai-agents",
-    "hook"
+    "agent-skills"
   ],
   "license": "Apache-2.0",
   "author": "louisphamdev",
@@ -45,5 +43,8 @@
     "url": "git+https://github.com/louisphamdev/adversarial-review.git"
   },
   "homepage": "https://github.com/louisphamdev/adversarial-review#readme",
-  "bugs": "https://github.com/louisphamdev/adversarial-review/issues"
+  "bugs": "https://github.com/louisphamdev/adversarial-review/issues",
+  "publishConfig": {
+    "access": "public"
+  }
 }

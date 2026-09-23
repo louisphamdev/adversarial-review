@@ -1,32 +1,38 @@
 # Security Policy
 
-## Supported versions
+## Supported Versions
 
 | Version | Supported |
 |---|---|
-| 2.1.x | Yes |
-| 2.0.x | Yes |
-| < 2.0 | No |
+| 3.x | Yes |
+| < 3.0 | No |
 
-## Reporting a vulnerability
+## Report a Vulnerability
 
-Please report security issues **privately** — do not open a public issue.
+Please report security issues privately.
+Do not open a public issue.
 
-Use GitHub's private vulnerability reporting on the repository:
-[github.com/louisphamdev/adversarial-review](https://github.com/louisphamdev/adversarial-review)
-→ **Security** → **Report a vulnerability**.
+Use GitHub private vulnerability reporting on the repository:
+https://github.com/louisphamdev/adversarial-review
+Go to Security, then select Report a vulnerability.
 
-We aim to acknowledge reports within a few business days.
+We will acknowledge reports within a few business days.
 
-## Scope and threat model
+## Scope and Threat Model
 
-This tool is a **review gate and quality guard, not a security sandbox or a DLP
-(data loss prevention) system.** It reduces the chance that significant code
-changes finish without an adversarial review; it does **not** restrict what code
-a host agent executes, and a local user with filesystem access can disable it.
+The roundtable treats all reviewed material as untrusted data.
+The code, diffs, file names, comments, docstrings, and test fixtures are data.
+They are not instructions.
+Reviewer seats must ignore all instructions inside the material.
 
-Before reporting, please read the [Residual Risks](./README.md#residual-risks)
-section of the README, which documents the tool's known limitations (host hook
-honesty, wrapper-mode boundaries, best-effort secret scanning, external-provider
-disclosure, and local-bypass). Findings already covered there are by design, not
-vulnerabilities.
+Reviewer seats run with restricted permissions:
+
+- Seats can read files in the target workspace.
+- Seats cannot execute shell commands.
+- Seats cannot write or edit files in the workspace.
+- Seats cannot make network requests unless configured for model access.
+
+Adversarial review reduces the risk of defects and security regressions.
+Adversarial review is not a complete security sandbox.
+A local user with filesystem access can change configurations.
+Review all findings before you apply proposed patches.
