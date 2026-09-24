@@ -36,7 +36,7 @@ export async function recommendCommand(
   let pickedSwarm = null;
   if (swarmExe) {
     try {
-      const candidates = await discover(swarmBackendName, { config, env });
+      const { candidates } = await discover(swarmBackendName, { config, env });
       const store = await readStore(stateDir(env));
       const prior = await loadPrior({ stateDir: stateDir(env) });
       pickedSwarm = await pick({

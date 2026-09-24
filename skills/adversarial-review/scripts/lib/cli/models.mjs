@@ -1,3 +1,5 @@
+import { loadSeats } from '../seats.mjs';
+import { buildPrompt } from '../prompts.mjs';
 // CLI models command (§20, §18.1).
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -54,34 +56,7 @@ export async function modelsCommand(
     }
   };
 
-  const defaultBenchCall = async ({ backend, model }) => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ar-bench-'));
-    try {
-      await fs.mkdir(path.join(tmp, 'calls'), { recursive: true });
-      await fs.mkdir(path.join(tmp, 'cwd'), { recursive: true });
-      const fixtureCode = await fs
-        .readFile(
-          path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../bench/defects.js'),
-          'utf8'
-        )
-        .catch(() => '');
-      return await runSeatCall(
-        {
-          callId: `bench-${String(model).replace(/[^A-Za-z0-9._-]/g, '_')}`,
-          prompt: `Analyze the following code and report all defects as JSON conforming to schema:\n\`\`\`javascript\n${fixtureCode}\n\`\`\``,
-          schema: FINDINGS,
-          root: tmp,
-          runDir: tmp,
-          cwd: path.join(tmp, 'cwd'),
-          model,
-          timeoutMs: 60000,
-        },
-        { backend, config, env, runChild }
-      );
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
-    }
-  };
+  const defaultBenchCall = makeBenchCall({ config, env, runSeatCall: (call) => runSeatCall(call, { backend: call.backend, config, env, runChild }) });
 
   const probeCall = customProbeCall || defaultProbeCall;
   const benchCall = customBenchCall || defaultBenchCall;
@@ -153,4 +128,39 @@ export async function modelsCommand(
   }
 
   return 0;
+}
+
+const BENCH_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../bench');
+
+// Spec §20.4: the bench is the breaker seat's real FIND on the fixture. A shortened prompt or a
+// short timeout scores every model 0 and marks it unusable, which hides the whole swarm.
+export function makeBenchCall({ config, runSeatCall: callSeat }) {
+  return async ({ backend, model }) => {
+    const seat = loadSeats().get('breaker');
+    const runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ar-bench-'));
+    try {
+      await fs.mkdir(path.join(runDir, 'calls'), { recursive: true });
+      await fs.mkdir(path.join(runDir, 'cwd'), { recursive: true });
+      const prompt = buildPrompt('FIND', {
+        seat,
+        materialPath: path.join(BENCH_DIR, 'defects.js'),
+        repoRoot: BENCH_DIR,
+        budget: 20,
+        reviewStage: 'code',
+      });
+      return await callSeat({
+        backend,
+        callId: `bench-${String(model).replace(/[^A-Za-z0-9._-]/g, '_')}`,
+        prompt,
+        schema: FINDINGS,
+        root: BENCH_DIR,
+        runDir,
+        cwd: path.join(runDir, 'cwd'),
+        model,
+        timeoutMs: config.timeouts?.find || 1200000,
+      });
+    } finally {
+      await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+    }
+  };
 }

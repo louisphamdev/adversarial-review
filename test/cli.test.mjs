@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -278,5 +280,36 @@ describe('cli unit and command tests', () => {
         await iso.cleanup();
       }
     });
+  });
+});
+
+describe('recommend picks a measured swarm model', () => {
+  it('quota at 85% with a measured top model on the swarm backend routes to swarm', async () => {
+    const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
+    const bins = await makeFakeBins({
+      claude: '2.1.280 (Claude Code)',
+      opencode: { version: 'opencode v2.0.9', models: ['p/good-model', 'p/other'] },
+    });
+    iso.env[bins.pathKey] = bins.pathEnv;
+    const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+    const io = createMockIO();
+    try {
+      const state = join(iso.home, '.adversarial-review');
+      await mkdir(state, { recursive: true });
+      await writeFile(join(state, 'config.json'), JSON.stringify({ version: 3, hostBackend: 'claude', swarm: { backend: 'opencode', allowFree: true } }));
+      await writeFile(join(state, 'models.json'), JSON.stringify({
+        version: 3,
+        'opencode:p/good-model': { backend: 'opencode', model: 'p/good-model', callable: true, contract: true, score: 6, invented: 0, tier: 'top', latencyMs: 100, measuredAt: Date.now() },
+      }));
+      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      assert.equal(code, 0, io.stderr.text);
+      const parsed = JSON.parse(io.stdout.text);
+      assert.equal(parsed.signals.swarmModel, 'p/good-model');
+      assert.equal(parsed.route, 'swarm');
+    } finally {
+      await bins.cleanup();
+      await iso.cleanup();
+      await repo.cleanup();
+    }
   });
 });

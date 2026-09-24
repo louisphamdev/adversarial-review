@@ -44,13 +44,17 @@ export async function makeTempRepo({ git: useGit = true, files = {} } = {}) {
 
 // A hermetic PATH: fake vendor CLIs plus the directory of git, nothing else. Tests that pass
 // on the developer machine only because a real `claude` or `opencode` is installed break in CI.
+// A value is a version string, or { version, models: [ids] } for a CLI that lists models.
 export async function makeFakeBins(names = { claude: '2.1.280 (Claude Code)' }) {
   const { chmod } = await import('node:fs/promises');
   const dir = await mkdtemp(path.join(tmpdir(), 'ar-bin-'));
-  for (const [name, version] of Object.entries(names)) {
+  for (const [name, spec] of Object.entries(names)) {
+    const version = typeof spec === 'string' ? spec : spec.version;
+    const models = typeof spec === 'string' ? [] : spec.models || [];
     const body =
       `const a = process.argv.slice(2);\n` +
       `if (a.includes('--version')) { console.log(${JSON.stringify(version)}); process.exit(0); }\n` +
+      `if (a[0] === 'models') { console.log(${JSON.stringify(models.join('\n'))}); process.exit(0); }\n` +
       `console.log('\`\`\`json\\n{"ok":true}\\n\`\`\`');\n`;
     if (process.platform === 'win32') {
       await writeFile(path.join(dir, `${name}.mjs`), body);

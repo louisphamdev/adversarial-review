@@ -226,7 +226,7 @@ export async function runCommand(
 
     if (swarmBackendObj) {
       try {
-        const candidates = await discover(swarmBackend, { config, env });
+        const { candidates } = await discover(swarmBackend, { config, env });
         const store = await readStore(stateDir(env));
         const prior = await loadPrior({ stateDir: stateDir(env) });
         pickedSwarm = await pick({

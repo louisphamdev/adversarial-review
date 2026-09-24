@@ -1,3 +1,4 @@
+import { runChild as defaultRunChild } from './proc.mjs';
 // Model discovery, models.dev prior registry caching, bench scoring, and model selection.
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -11,13 +12,13 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_ANSWER_KEY_PATH = path.resolve(__dirname, '../../bench/answer-key.json');
 
 // Discovers models for a given backend, trimming lines and validating model syntax.
-export async function discover(backendName, { config = {}, runChild, stderr } = {}) {
+export async function discover(backendName, { config = {}, runChild = defaultRunChild, env, stderr } = {}) {
   if (backendName === 'opencode') {
     if (typeof runChild !== 'function') {
       return { candidates: [], authoritative: true, error: 'runChild required' };
     }
     try {
-      const res = await runChild({ cmd: 'opencode', args: ['models'] });
+      const res = await runChild({ cmd: 'opencode', args: ['models'], env });
       if (res.code !== 0 || res.spawnError || res.timedOut) {
         return {
           candidates: [],
@@ -61,7 +62,7 @@ export async function discover(backendName, { config = {}, runChild, stderr } = 
     }
     if (typeof runChild === 'function') {
       try {
-        const res = await runChild({ cmd: 'codex', args: ['debug', 'models'] });
+        const res = await runChild({ cmd: 'codex', args: ['debug', 'models'], env });
         if (res && res.code === 0 && res.stdout) {
           const parsed = String(res.stdout)
             .split(/\r?\n/)
