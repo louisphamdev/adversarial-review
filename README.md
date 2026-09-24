@@ -37,7 +37,7 @@ The installer configures adversarial-review for these agent hosts:
 The npm package is [`adversarial-review-gate`](https://www.npmjs.com/package/adversarial-review-gate).
 The package gives one command: `adversarial-review`.
 
-CAUTION: Do not run `adversarial-review`. The npm name `adversarial-review` belongs to a different package.
+CAUTION: With `npx`, always type the full package name `adversarial-review-gate`. The npm name `adversarial-review` alone belongs to a different package.
 
 Install the command globally:
 

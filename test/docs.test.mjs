@@ -331,5 +331,7 @@ test('docs name the published npm package, never the bare name of another owner'
   }
   const readme = readFileSync('README.md', 'utf8');
   assert.match(readme, /npm install -g adversarial-review-gate/);
+  // The warning must name the npx form, not forbid the installed command itself.
+  assert.equal(/Do not run `adversarial-review`/.test(readme), false);
   assert.match(readme, /npmjs\.com\/package\/adversarial-review-gate/);
 });

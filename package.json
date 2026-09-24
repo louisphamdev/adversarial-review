@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review-gate",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "description": "The roundtable: an adversarial review where specialist seats find defects alone, attack each other's findings, and a clean-context judge rules. Runs on any coding agent (Claude Code, Codex, Gemini CLI, opencode) on Linux, Windows, and macOS.",
   "type": "module",
   "bin": {
