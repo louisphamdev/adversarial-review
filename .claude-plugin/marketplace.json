@@ -10,7 +10,7 @@
     {
       "name": "adversarial-review",
       "source": "./",
-      "description": "Adversarial code review roundtable for coding agents. Specialist seats find defects alone, attack findings, and a clean-context judge rules."
+      "description": "The roundtable: an adversarial review where specialist seats find defects alone, attack each other's findings, and a clean-context judge rules. Runs on any coding agent (Claude Code, Codex, Gemini CLI, opencode) on Linux, Windows, and macOS."
     }
   ]
 }

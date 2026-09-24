@@ -11,7 +11,8 @@
     "test": "node scripts/run-tests.mjs",
     "build": "node scripts/build.mjs",
     "build:check": "node scripts/build.mjs --check",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "doctor": "node bin/adversarial-review.js doctor"
   },
   "files": [
     "bin/",

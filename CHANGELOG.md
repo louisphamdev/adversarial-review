@@ -8,8 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.0.2] - 2026-09-24
 
 ### Fixed
+- `adversarial-review --version` and `result.json` reported `3.0.0` in 3.0.1. The engine
+  version, the Claude Code plugin version, and the package version are now one value.
 - The README warning said not to run the `adversarial-review` command. It now says to type the
-  full package name `adversarial-review-gate` with `npx`. A test keeps it that way.
+  full package name `adversarial-review-gate` with `npx`.
+- CONTRIBUTING named `npm run doctor`, which did not exist. The script is now defined.
+- The Claude Code plugin and the marketplace now use the package description.
+
+### Added
+- A consistency test binds the version, the description, the npm scripts named in the docs,
+  both registry names, and the repository links across every file.
 
 ## [3.0.1] - 2026-09-24
 

@@ -120,7 +120,7 @@ test('docs and plugin tests', async (t) => {
     assert.ok(fs.existsSync(pluginPath), 'plugin.json must exist');
     const plugin = JSON.parse(fs.readFileSync(pluginPath, 'utf8'));
     assert.equal(plugin.name, 'adversarial-review');
-    assert.equal(plugin.version, '3.0.0');
+    assert.equal(plugin.version, JSON.parse(fs.readFileSync('package.json', 'utf8')).version);
     assert.equal(plugin.hooks, undefined, 'plugin.json must have no hooks');
 
     assert.ok(fs.existsSync(marketplacePath), 'marketplace.json must exist');
