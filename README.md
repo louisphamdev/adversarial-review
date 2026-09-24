@@ -1,5 +1,10 @@
 # adversarial-review
 
+[![npm](https://img.shields.io/npm/v/adversarial-review-gate.svg)](https://www.npmjs.com/package/adversarial-review-gate)
+[![CI](https://github.com/louisphamdev/adversarial-review/actions/workflows/ci.yml/badge.svg)](https://github.com/louisphamdev/adversarial-review/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/adversarial-review-gate.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/adversarial-review-gate.svg)](https://nodejs.org)
+
 Multi-agent adversarial review roundtable for coding agents.
 
 The roundtable organizes an adversarial debate between specialist review seats.
@@ -29,24 +34,51 @@ The installer configures adversarial-review for these agent hosts:
 
 ## Install
 
-Install the package globally or run commands with `npx`.
+The npm package is [`adversarial-review-gate`](https://www.npmjs.com/package/adversarial-review-gate).
+The package gives one command: `adversarial-review`.
+
+CAUTION: Do not run `adversarial-review`. The npm name `adversarial-review` belongs to a different package.
+
+Install the command globally:
+
+```bash
+npm install -g adversarial-review-gate
+adversarial-review --version
+```
+
+You can also run each command without an install:
+
+```bash
+npx adversarial-review-gate --version
+```
+
+The same package is on GitHub Packages as `@louisphamdev/adversarial-review-gate`.
+
+For Claude Code, you can use the plugin instead:
+
+```
+/plugin marketplace add louisphamdev/adversarial-review
+/plugin install adversarial-review@adversarial-review
+```
+
+The examples below use the global command. If you use `npx`, write `npx adversarial-review-gate` in place of `adversarial-review`.
 
 To install the skill for your host:
 
 ```bash
-npx adversarial-review install --host claude-code
+adversarial-review install --host claude-code
 ```
 
 To install the skill for a different host:
 
 ```bash
-npx adversarial-review install --host opencode
+adversarial-review install --host opencode
 ```
 
 To inspect your configuration and tools:
 
 ```bash
-npx adversarial-review doctor
+adversarial-review doctor
 ```
 
 ## Remove Version 2 Hooks
@@ -55,13 +87,13 @@ Version 3 removes the automatic background hooks from version 2.
 If you used version 2, remove the legacy hooks from your settings:
 
 ```bash
-npx adversarial-review uninstall --v2-hooks
+adversarial-review uninstall --v2-hooks
 ```
 
 If you installed version 2 globally, include the global flag:
 
 ```bash
-npx adversarial-review uninstall --v2-hooks --global
+adversarial-review uninstall --v2-hooks --global
 ```
 
 ## How to Run
@@ -76,7 +108,7 @@ The roundtable provides two execution routes:
 To receive an automatic recommendation, run:
 
 ```bash
-npx adversarial-review recommend
+adversarial-review recommend
 ```
 
 The command evaluates your quota and diff size, then recommends `spawn` or `swarm`.
@@ -86,19 +118,19 @@ The command evaluates your quota and diff size, then recommends `spawn` or `swar
 To run the roundtable on your current repository diff:
 
 ```bash
-npx adversarial-review run --route auto
+adversarial-review run --route auto
 ```
 
 You can choose a specific route directly:
 
 ```bash
-npx adversarial-review run --route spawn
+adversarial-review run --route spawn
 ```
 
 To review a specific specification or plan file, pass the target path:
 
 ```bash
-npx adversarial-review run --target docs/spec.md
+adversarial-review run --target docs/spec.md
 ```
 
 ### 3. Read the Results

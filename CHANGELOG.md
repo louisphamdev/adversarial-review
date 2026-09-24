@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-09-24
+
+### Fixed
+- The README told users to run npx with the bare name `adversarial-review`. That npm name
+  belongs to a different package. The docs now use the real package, `adversarial-review-gate`, and a
+  test stops the bare name from coming back.
+- The README has an npm install section and badges.
+
+### Added
+- The package is also published to GitHub Packages as `@louisphamdev/adversarial-review-gate`.
+
 ## [3.0.0] - 2026-09-23
 
 CAUTION: The Stop hook and the SessionStart hook are removed in version 3.0.0.

@@ -1,0 +1,33 @@
+name: Publish to GitHub Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: '@louisphamdev'
+
+      - name: Test
+        run: npm test
+
+      # GitHub Packages accepts only scoped names. npmjs keeps the unscoped name.
+      - name: Scope the package name for GitHub Packages
+        run: npm pkg set name=@louisphamdev/adversarial-review-gate
+
+      - name: Publish
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

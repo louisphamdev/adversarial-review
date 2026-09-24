@@ -319,3 +319,17 @@ test('docs and plugin tests', async (t) => {
     }
   });
 });
+
+test('docs name the published npm package, never the bare name of another owner', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const files = ['README.md', 'skills/adversarial-review/SKILL.md', 'CHANGELOG.md',
+    ...readdirSync('skills/adversarial-review/references').map((f) => `skills/adversarial-review/references/${f}`)];
+  for (const f of files) {
+    const text = readFileSync(f, 'utf8');
+    // `adversarial-review` on npm belongs to another owner; npx would run their code.
+    assert.equal(/npx\s+(-y\s+)?adversarial-review(?![-\w])/.test(text), false, `${f} runs npx on the bare name`);
+  }
+  const readme = readFileSync('README.md', 'utf8');
+  assert.match(readme, /npm install -g adversarial-review-gate/);
+  assert.match(readme, /npmjs\.com\/package\/adversarial-review-gate/);
+});
