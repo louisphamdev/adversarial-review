@@ -4,8 +4,8 @@
   "description": "The roundtable: an adversarial review where specialist seats find defects alone, attack each other's findings, and a clean-context judge rules. Runs on any coding agent (Claude Code, Codex, Gemini CLI, opencode) on Linux, Windows, and macOS.",
   "type": "module",
   "bin": {
-    "adversarial-review": "./bin/adversarial-review.js",
-    "adversarial-review-gate": "./bin/adversarial-review.js"
+    "adversarial-review": "bin/adversarial-review.js",
+    "adversarial-review-gate": "bin/adversarial-review.js"
   },
   "scripts": {
     "test": "node scripts/run-tests.mjs",
