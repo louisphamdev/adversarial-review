@@ -7,8 +7,11 @@ import {
   buildState,
   buildQuestions,
   compareSift,
+  clusterFindings,
   VERDICTS,
   SEVERITY,
+  TYPESAFE_API_URL,
+  TYPESAFE_DEFAULT_MODEL,
 } from '../skills/adversarial-review/scripts/lib/sift.mjs';
 
 function createServer(handler) {
@@ -443,6 +446,76 @@ describe('sift module', () => {
       });
       assert.deepEqual(compareSift(null, { closingList: [] }, []), { disagreements: [] });
       assert.deepEqual(compareSift({ status: 'used', rows: [] }, null, []), { disagreements: [] });
+    });
+  });
+
+  describe('clusterFindings and TypeSafe native routing', () => {
+    it('clusterFindings groups findings on same file and line, selecting highest confidence/severity canonical', () => {
+      const findings = [
+        { id: 'b-1', seat: 'breaker', file: 'src/app.js', line: 42, claim: 'null pointer' },
+        { id: 'e-1', seat: 'edge', file: 'src/app.js', line: 42, claim: 'undefined input' },
+        { id: 'm-1', seat: 'medic', file: 'src/other.js', line: 10, claim: 'missing rollback' },
+      ];
+      const rows = [
+        { id: 'b-1', severity: 1.0, confidence: 0.7 },
+        { id: 'e-1', severity: 2.0, confidence: 0.9 }, // higher severity and confidence
+        { id: 'm-1', severity: 1.5, confidence: 0.8 },
+      ];
+
+      const clusters = clusterFindings(findings, rows);
+      assert.equal(clusters.length, 1);
+      assert.equal(clusters[0].key, 'src/app.js:42');
+      assert.equal(clusters[0].canonical, 'e-1');
+      assert.deepEqual(clusters[0].duplicates, ['b-1']);
+      assert.equal(clusters[0].count, 2);
+    });
+
+    it('findKey falls back to TYPESAFE_API_KEY when JEV_API_KEY is not set', async () => {
+      const key = await findKey({}, { TYPESAFE_API_KEY: 'ts_test_key_123' });
+      assert.equal(key, 'ts_test_key_123');
+    });
+
+    it('siftFindings routes to native TypeSafe endpoint when TYPESAFE_API_KEY is present without JEV_API_KEY', async () => {
+      let requestedUrl = null;
+      let requestedBody = null;
+      const server = await createServer(async (req, res) => {
+        requestedUrl = req.url;
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        requestedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            answers: {
+              'b-1_verdict': { choice: 'confirmed', confidence: 0.95 },
+              'b-1_severity': { score: 2.0 },
+              'b-2_verdict': { choice: 'refuted', confidence: 0.9 },
+              'b-2_severity': { score: 0.5 },
+            },
+          }),
+        );
+      });
+
+      try {
+        const material = { kind: 'diff', text: 'code diff' };
+        const findings = [
+          { id: 'b-1', seat: 'breaker', file: 'a.js', line: 5, claim: 'leak' },
+          { id: 'b-2', seat: 'breaker', file: 'b.js', line: 10, claim: 'false alarm' },
+        ];
+        const result = await siftFindings({
+          material,
+          findings,
+          config: { url: server.url },
+          env: { TYPESAFE_API_KEY: 'ts_secret' },
+        });
+
+        assert.equal(result.status, 'used');
+        assert.deepEqual(result.highConfidenceConfirmed, ['b-1']);
+        assert.deepEqual(result.filteredOut, ['b-2']);
+        assert.equal(result.clusters.length, 0);
+      } finally {
+        await server.close();
+      }
     });
   });
 });

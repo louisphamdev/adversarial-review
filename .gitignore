@@ -2,5 +2,6 @@ node_modules/
 coverage/
 *.tgz
 temp/
+.adversarial-review/
 .DS_Store
 !test/fixtures/**/node_modules/

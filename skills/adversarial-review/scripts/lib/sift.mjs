@@ -13,6 +13,8 @@ export const SEVERITY = ['advisory', 'should fix', 'blocks release'];
 export const MAX_STATE_CHARS = 100000;
 export const DEFAULT_URL = 'https://openrouter.ai/api/alpha/decisions';
 export const DEFAULT_MODEL = 'typesafe/jev-1.13';
+export const TYPESAFE_API_URL = 'https://api.typesafe.ai/v1/systemone';
+export const TYPESAFE_DEFAULT_MODEL = 'jev-latest';
 export const DEFAULT_TIMEOUT_MS = 60000;
 export const DEFAULT_LOW_CONFIDENCE = 0.6;
 
@@ -46,22 +48,72 @@ export async function findKey(config = {}, env = process.env, readFile = default
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
     return fromEnv.trim();
   }
+  // Check TYPESAFE_API_KEY fallback if custom envName was not explicitly configured
+  if (!siftCfg.apiKeyEnv && env?.TYPESAFE_API_KEY && typeof env.TYPESAFE_API_KEY === 'string' && env.TYPESAFE_API_KEY.trim().length > 0) {
+    return env.TYPESAFE_API_KEY.trim();
+  }
   if (siftCfg.keyFile && typeof readFile === 'function') {
     try {
       const text = await readFile(siftCfg.keyFile, 'utf8');
       const prefix = `${envName}=`;
+      const fallbackPrefix = 'TYPESAFE_API_KEY=';
+      let fallbackKey = null;
       for (const line of text.split(/\r?\n/)) {
         const trimmed = line.trimStart();
         if (trimmed.startsWith(prefix)) {
           const val = trimmed.slice(prefix.length).trim();
           if (val.length > 0) return val;
+        } else if (!siftCfg.apiKeyEnv && trimmed.startsWith(fallbackPrefix)) {
+          const val = trimmed.slice(fallbackPrefix.length).trim();
+          if (val.length > 0) fallbackKey = val;
         }
       }
+      if (fallbackKey) return fallbackKey;
     } catch {
       // Missing or unreadable key file counts as absent key.
     }
   }
   return null;
+}
+
+// Clusters findings by file/line or claim to detect duplicate issues across seats.
+export function clusterFindings(findings = [], rows = []) {
+  if (!Array.isArray(findings) || findings.length === 0) return [];
+  const rowMap = new Map((rows || []).map((r) => [r.id, r]));
+
+  const groups = new Map();
+  for (const f of findings) {
+    const file = f.file || (f.evidence ? f.evidence.split(':')[0].trim() : '') || 'unknown';
+    let line = f.line != null ? String(f.line) : '';
+    if (!line && f.evidence && f.evidence.includes(':')) {
+      const match = f.evidence.match(/:(\d+)/);
+      if (match) line = match[1];
+    }
+    const claimSnippet = (f.claim || f.title || '').slice(0, 30).toLowerCase().trim();
+    const key = file !== 'unknown' && line ? `${file}:${line}` : `${file}#${claimSnippet}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+
+  const clusters = [];
+  for (const [key, group] of groups.entries()) {
+    if (group.length > 1) {
+      const sorted = [...group].sort((a, b) => {
+        const ra = rowMap.get(a.id);
+        const rb = rowMap.get(b.id);
+        const scoreA = (ra?.severity ?? 0) * 10 + (ra?.confidence ?? 0);
+        const scoreB = (rb?.severity ?? 0) * 10 + (rb?.confidence ?? 0);
+        return scoreB - scoreA;
+      });
+      clusters.push({
+        key,
+        canonical: sorted[0].id,
+        duplicates: sorted.slice(1).map((f) => f.id),
+        count: group.length,
+      });
+    }
+  }
+  return clusters;
 }
 
 // Sifts findings with Jev; never throws and returns skipped status on any failure.
@@ -108,8 +160,10 @@ export async function siftFindings({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const signal = controller.signal;
-    const url = siftCfg.url || DEFAULT_URL;
-    const model = siftCfg.model || DEFAULT_MODEL;
+    const isNativeTypeSafe = (!siftCfg.url && !siftCfg.model && (env?.TYPESAFE_API_KEY && !env?.JEV_API_KEY)) ||
+                             (siftCfg.url && siftCfg.url.includes('typesafe.ai'));
+    const url = siftCfg.url || (isNativeTypeSafe ? TYPESAFE_API_URL : DEFAULT_URL);
+    const model = siftCfg.model || (isNativeTypeSafe ? TYPESAFE_DEFAULT_MODEL : DEFAULT_MODEL);
     const questions = buildQuestions(findings);
 
     let res;
@@ -184,10 +238,17 @@ export async function siftFindings({
     const lowConfRows = rows.filter((r) => r.confidence < lowConfidence).sort((a, b) => a.confidence - b.confidence);
     const readingOrder = lowConfRows.map((r) => r.id);
 
+    const filteredOut = rows.filter((r) => r.verdict === 'refuted' && r.confidence >= 0.85).map((r) => r.id);
+    const highConfidenceConfirmed = rows.filter((r) => r.verdict === 'confirmed' && r.confidence >= 0.8).map((r) => r.id);
+    const clusters = clusterFindings(findings, rows);
+
     const result = {
       status: 'used',
       rows,
       readingOrder,
+      filteredOut,
+      highConfidenceConfirmed,
+      clusters,
     };
     if (data.model) result.model = data.model;
     if (data.usage) result.usage = data.usage;
