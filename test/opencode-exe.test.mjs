@@ -42,3 +42,16 @@ test('the last-resort lookup honors the injected exists seam, not the real files
   });
   assert.equal(r.exe, wrapper, 'the wrapper the seam reports as present is the last resort');
 });
+
+test('on POSIX PATH wins, and the installer path under HOME is the fallback', async () => {
+  const fixed = path.posix.join('/home/u', '.opencode', 'bin', 'opencode');
+  const onPath = path.posix.join('/usr/bin', 'opencode');
+  const env = { PATH: '/usr/bin', HOME: '/home/u' };
+  const both = await resolveOpencodeExe({}, env, { platform: 'linux', exists: async (p) => p === onPath || p === fixed });
+  assert.equal(both.exe, onPath);
+  const hit = await resolveOpencodeExe({}, env, { platform: 'darwin', exists: async (p) => p === fixed });
+  assert.equal(hit.exe, fixed);
+  const miss = await resolveOpencodeExe({}, env, { platform: 'linux', exists: async () => false });
+  assert.equal(miss.exe, null);
+  assert.ok(miss.searched.includes(fixed), 'the fallback is reported as searched');
+});

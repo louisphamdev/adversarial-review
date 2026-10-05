@@ -32,6 +32,13 @@ The installer configures adversarial-review for these agent hosts:
 - Codex (`codex`)
 - Gemini CLI (`gemini`)
 
+## Requirements
+
+- Node.js 20 or newer.
+- Linux, Windows, or macOS. CI runs every test on all three systems.
+- For the swarm route: opencode 2.0 or newer. The swarm route uses the free opencode zen models by default.
+- For the Claude Code plugin: a Claude Code version with the `claude plugin` command. Version 2.1.289 passes `claude plugin validate --strict` on this plugin.
+
 ## Install
 
 The npm package is [`adversarial-review-gate`](https://www.npmjs.com/package/adversarial-review-gate).
@@ -59,6 +66,13 @@ For Claude Code, you can use the plugin instead:
 ```
 /plugin marketplace add louisphamdev/adversarial-review
 /plugin install adversarial-review@adversarial-review
+```
+
+To get a new release of the plugin, update the marketplace, then update the plugin. Restart Claude Code after the update.
+
+```bash
+claude plugin marketplace update adversarial-review
+claude plugin update adversarial-review@adversarial-review
 ```
 
 The examples below use the global command. If you use `npx`, write `npx adversarial-review-gate` in place of `adversarial-review`.

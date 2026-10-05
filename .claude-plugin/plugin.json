@@ -1,10 +1,14 @@
 {
   "name": "adversarial-review",
+  "displayName": "Adversarial Review",
   "version": "3.1.0",
   "description": "The roundtable: an adversarial review where specialist seats find defects alone, attack each other's findings, and a clean-context judge rules. Runs on any coding agent (Claude Code, Codex, Gemini CLI, opencode) on Linux, Windows, and macOS.",
   "author": {
     "name": "louisphamdev"
   },
+  "homepage": "https://github.com/louisphamdev/adversarial-review#readme",
+  "repository": "https://github.com/louisphamdev/adversarial-review",
+  "license": "Apache-2.0",
   "keywords": [
     "code-review",
     "quality",

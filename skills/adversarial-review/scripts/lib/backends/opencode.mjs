@@ -38,7 +38,16 @@ export async function resolveOpencodeExe(
 
   const exe = await resolveExecutable('opencode', env, { platform, exists });
   searched.push('PATH:opencode');
-  return { exe, searched };
+  if (exe || platform === 'win32') return { exe, searched };
+
+  // The official install script puts the binary here and only edits the login shell profile.
+  const home = getEnvCaseInsensitive(env, 'HOME');
+  if (home) {
+    const fixed = path.posix.join(home, '.opencode', 'bin', 'opencode');
+    searched.push(fixed);
+    if (await exists(fixed)) return { exe: fixed, searched };
+  }
+  return { exe: null, searched };
 }
 
 const SECRET_ENV = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i;
