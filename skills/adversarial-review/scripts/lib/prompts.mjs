@@ -418,11 +418,12 @@ export function buildPrompt(stage, ctx = {}) {
     } else {
       stageSpecific = [
         open.length === 0
-          ? 'This is the final regression pass. Rule only on the seat reviews of the regression-check items.'
+          ? `${normStage === 'VERIFY_JUDGE' ? 'This is the final regression pass. ' : ''}Rule only on the seat reviews of the regression-check items.`
           : 'You ruled on this work in an earlier round. Your earlier demands are below, per open item.\nRule on each earlier demand: met or not-met.',
         'A new demand on an open item blocks only if a seat objection in this round names the same open item.\nA new demand outside the open items blocks only if a seat in this round reports it with a cited delta line, and you verify that the line appears in the DELTA block.\nPut every other new demand in advisory.',
         normStage === 'VERIFY_JUDGE' ? VERIFY_JUDGE_NEW_IN_DIFF : '',
         openItemsBlock(open),
+        reg.length > 0 ? regressionBlock(reg) : '',
         deltaBlock(ctx.reReview),
         `=== SEAT REVIEWS ===\n${judgeResponsesText(normStage, ctx.seatResponses || [], known)}`,
         stageBudgetLine,

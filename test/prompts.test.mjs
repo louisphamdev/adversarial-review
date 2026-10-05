@@ -526,6 +526,20 @@ describe('prompts module', () => {
     assert.ok(f.includes('=== OPEN ITEMS ===\n(none)'));
   });
 
+  it('judge re-review shows the regression list; only verify names the final regression pass', () => {
+    const regOnly = rr({ openItems: [] });
+    const patch = buildPrompt('PATCH_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], reReview: regOnly });
+    const verify = buildPrompt('VERIFY_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], reReview: regOnly });
+    for (const p of [patch, verify]) {
+      for (const s of ['=== REGRESSION CHECK ===\n[C3]', 'tests pin replay']) assert.ok(p.includes(s), s);
+    }
+    assert.ok(!patch.includes('final regression pass'));
+    assert.ok(patch.includes('Rule only on the seat reviews of the regression-check items.'));
+    assert.ok(verify.includes('This is the final regression pass.'));
+    const noReg = buildPrompt('PATCH_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], reReview: rr({ regressionList: [] }) });
+    assert.ok(!noReg.includes('=== REGRESSION CHECK ==='));
+  });
+
   it('re-review errors', () => {
     assert.throws(() => buildPrompt('FIND', { ...baseCtx, reReview: rr() }), ConfigError);
     assert.throws(() => buildPrompt('PATCH_SEAT', { ...baseCtx, seat: breaker, reReview: rr({ pass: 'first' }) }), ConfigError);
