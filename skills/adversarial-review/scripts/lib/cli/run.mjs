@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 import { loadConfig, resolveIdleMs } from '../config.mjs';
-import { hashMaterial } from '../material.mjs';
+import { resolveMaterial, hashMaterial } from '../material.mjs';
 import { loadSeats } from '../seats.mjs';
 import { decideRoute, STAGE_NAMES } from '../route.mjs';
 import { runSeatCall } from '../backends/index.mjs';
@@ -56,7 +56,8 @@ import {
   readState,
 } from '../rundir.mjs';
 import { findingEvent } from '../contain.mjs';
-import { computeDataLeaves, hostJudge, seatEntries } from '../bundle.mjs';
+import { buildBundle, computeDataLeaves, seatEntries } from '../bundle.mjs';
+import { readBundle } from './preflight.mjs';
 import { acquireLock, readLock, pidAlive } from '../lockfile.mjs';
 import { runTable, normalizeId } from '../pipeline.mjs';
 import { siftFindings } from '../sift.mjs';
@@ -247,6 +248,10 @@ export async function runCommand(
     }
   }
 
+  if (flags['from-preflight'] || flags.fromPreflight) {
+    return await runFromPreflight(flags, { env, cwd, stdout, stderr });
+  }
+
   // -------------------------------------------------------------------------
   // Branch B: normal start or --detach
   // -------------------------------------------------------------------------
@@ -270,7 +275,193 @@ export async function runCommand(
   } = plan;
   const effectiveRoute = plan.routeRequested;
 
-  const request = {
+  // A run with an open decision needs the user first (spec G2-4): preflight asks, then
+  // `run --from-preflight` runs the answered plan. The bundle rules decide what is open.
+  const preview = buildBundle(plan, flags, { config });
+  if (preview.decisions.length > 0) {
+    throw new ConfigError(
+      ['answer the decisions first: run preflight', ...preview.decisions.map((d) => `  ${d.id}: ${d.question}`)].join('\n')
+    );
+  }
+
+  const request = baseRequest({ flags, material, config, resolvedStage, chosen, noSeat, requirementsText, hostBackend, swarmBackend });
+  const run = await openRunDir({ env, material, request, flags, stderr });
+  const { runDir } = run;
+
+  // Steps 3 to 6 of the G2-2 order. A spawn run and an empty pool both skip them, so no spawn
+  // run builds a sandbox, writes a profile, or calls a model on the swarm.
+  const prep = { ...emptyPrep(), notes: discovered.notes, pool: discovered.pool, discovery: discovered.discovery };
+  if (prep.pool.length > 0 && effectiveRoute !== 'spawn') {
+    await prepareSwarmTree({
+      runDir,
+      material,
+      config,
+      env,
+      swarmBackend,
+      seats: chosen,
+      prior: discovered.prior,
+      named: discovered.named,
+      out: prep,
+    });
+  }
+
+  const host = { available: Boolean(hostBackendObj) };
+  const swarmOf = (overrides = {}) => ({
+    available: Object.keys(prep.seatModels).length > 0,
+    detail: swarmBackendObj ? 'no seat has a swarm model' : 'backend not found on PATH',
+    model: Object.values(prep.seatModels)[0]?.model || null,
+    free: prep.pool.some((p) => p.free),
+    tier: Object.values(prep.seatModels)[0]?.lensTier || 'unmeasured',
+    ...overrides,
+  });
+
+  const routeDecision = decideRoute({ config, flags, material, quota, host, swarm: swarmOf() });
+
+  // The second line of the approval gate. The probe and research can only narrow the plan, but a
+  // named model that research accepts is checked again here, before the canary: the canary lane
+  // is the first call that runs over the material.
+  const dataLeaves = computeDataLeaves(
+    usesSwarm(routeDecision) ? prep.seatModels : {},
+    plan.judge,
+    config.sift?.enabled !== false
+  );
+  const training = dataLeaves.filter((r) => r.trains).map((r) => r.provider);
+  if (training.length > 0 && config.swarm?.acknowledgeTraining !== true) {
+    // Nothing of this run reached a seat, so the run directory goes with the refusal.
+    setActiveRunDir(null);
+    await fs.rm(runDir, { recursive: true, force: true });
+    throw new ConfigError(
+      `answer the decisions first: run preflight (a provider can train on the material: ${training.join(', ')})`
+    );
+  }
+  request.approval = { source: 'config', dataLeaves };
+
+  return await launchRun({
+    run,
+    request,
+    flags,
+    config,
+    env,
+    stdout,
+    stderr,
+    material,
+    prep,
+    routeDecision,
+    effectiveRoute,
+    chosen,
+    hostBackend,
+    swarmBackend,
+    fallbackRoute: (detail) =>
+      decideRoute({ config, flags, material, quota, host, swarm: swarmOf({ available: false, model: null, detail }) }),
+  });
+}
+
+/**
+ * Branch C: `run --from-preflight <bundle>`. The bundle is the approved plan: no discovery, no
+ * probe, no new pick. Only the material is checked again.
+ */
+async function runFromPreflight(flags, { env, cwd, stdout, stderr }) {
+  for (const key of Object.keys(flags)) {
+    if (!FROM_PREFLIGHT_FLAGS.has(key)) {
+      throw new ConfigError(`Flag "--${key}" is not allowed with --from-preflight.`);
+    }
+  }
+  const bundle = await readBundle(path.resolve(cwd, flags['from-preflight'] || flags.fromPreflight));
+  if (bundle.stop) throw new ConfigError('the preflight answer was "stop"; this bundle does not run');
+  const open = bundle.decisions.filter((d) => !Object.hasOwn(bundle.answers || {}, d.id));
+  if (open.length > 0) {
+    throw new ConfigError(
+      `answer the decisions first: ${open.map((d) => d.id).join(', ')} (preflight --answer-bundle)`
+    );
+  }
+  const ageHours = (Date.now() - Date.parse(bundle.createdAt)) / 3600000;
+  if (ageHours > 24) stderr?.write?.(`warning: the bundle is ${Math.floor(ageHours)} hours old\n`);
+
+  const allowDrift = Boolean(flags['allow-drift'] || flags.allowDrift);
+  const runFlags = { ...bundle.flags };
+  let material;
+  try {
+    material = await resolveMaterial({
+      target: bundle.material.targetPath || undefined,
+      base: bundle.material.base || runFlags.base,
+      cwd: bundle.material.root,
+    });
+  } catch (err) {
+    throw new ConfigError(`material changed since preflight: ${err.message}`);
+  }
+  if (material.hash !== bundle.material.hash && !allowDrift) {
+    throw new ConfigError('material changed since preflight; run preflight again');
+  }
+
+  const { config } = loadConfig({ env, repoRoot: material.root, flags: runFlags, stderr });
+  if (bundle.sift?.enabled === false) config.sift = { ...config.sift, enabled: false };
+  const hostBackend = config.hostBackend || 'claude';
+  const swarmBackend = config.swarm?.backend || 'opencode';
+  const chosen = bundle.seats.map((key) => ({ key }));
+
+  const request = baseRequest({
+    flags: { ...runFlags, 'allow-drift': allowDrift },
+    material,
+    config,
+    resolvedStage: bundle.stage,
+    chosen,
+    noSeat: bundle.noSeat,
+    requirementsText: bundle.requirements,
+    hostBackend,
+    swarmBackend,
+  });
+  // request.json is written once with the approved plan, before anything can spawn.
+  request.approval = {
+    source: 'preflight',
+    bundleHash: bundle.bundleHash,
+    answers: bundle.answers,
+    dataLeaves: bundle.dataLeaves,
+  };
+  request.route = { ...bundle.route, seatModels: { ...bundle.seatModels, judge: { backend: 'host', capability: 'strong' } } };
+  if (bundle.sift?.enabled === false) request.sift = { enabled: false };
+
+  const run = await openRunDir({ env, material, request, flags: runFlags, stderr });
+  const prep = { ...emptyPrep(), seatModels: { ...bundle.seatModels } };
+  const routeDecision = { route: bundle.route.route, reason: bundle.route.reason, stages: bundle.route.stages };
+  if (usesSwarm(routeDecision) && Object.keys(prep.seatModels).length > 0) {
+    await buildApprovedTree({ runDir: run.runDir, material, config, out: prep });
+  }
+
+  // A bundle that moved to the host has nothing a swarm route could still demand.
+  const effectiveRoute = usesSwarm(routeDecision) ? runFlags.route || config.route || 'auto' : 'spawn';
+  const host = { available: true };
+  return await launchRun({
+    run,
+    request,
+    flags: { ...runFlags, json: flags.json, detach: flags.detach, 'allow-drift': allowDrift },
+    config,
+    env,
+    stdout,
+    stderr,
+    material,
+    prep,
+    routeDecision,
+    effectiveRoute,
+    chosen,
+    hostBackend,
+    swarmBackend,
+    fallbackRoute: (detail) =>
+      decideRoute({
+        config,
+        flags: runFlags,
+        material,
+        quota: { percent: bundle.route.quotaPercent ?? null },
+        host,
+        swarm: { available: false, model: null, detail },
+      }),
+  });
+}
+
+const FROM_PREFLIGHT_FLAGS = new Set(['from-preflight', 'fromPreflight', 'detach', 'json', 'allow-drift', 'allowDrift']);
+
+// The request fields every new run writes, whatever path resolved them.
+function baseRequest({ flags, material, config, resolvedStage, chosen, noSeat, requirementsText, hostBackend, swarmBackend }) {
+  return {
     // createRun stamps these too, but the run rewrites request.json after the route is decided,
     // and a rewrite without them makes every later resume fail the schema check.
     engineVersion: ENGINE_VERSION,
@@ -301,7 +492,19 @@ export async function runCommand(
       text: material.text,
     },
   };
+}
 
+/**
+ * Create the run directory, the material snapshot, the exit handler and the integrity baseline
+ * (step 2 of the G2-2 order).
+ */
+async function openRunDir({ env, material, request, flags, stderr }) {
+  const materialPathIn = (dir) =>
+    material.kind === 'diff'
+      ? path.join(dir, 'material.diff')
+      : material.kind === 'file'
+        ? path.join(dir, 'material.txt')
+        : material.path;
   const { runDir, runId } = await createRun({
     env,
     root: material.root,
@@ -309,21 +512,11 @@ export async function runCommand(
     mkdir: async (dir) => {
       await fs.mkdir(dir);
       request.runId = path.basename(dir);
-      request.materialPath =
-        material.kind === 'diff'
-          ? path.join(dir, 'material.diff')
-          : material.kind === 'file'
-            ? path.join(dir, 'material.txt')
-            : material.path;
+      request.materialPath = materialPathIn(dir);
     },
   });
   request.runId = runId;
-  request.materialPath =
-    material.kind === 'diff'
-      ? path.join(runDir, 'material.diff')
-      : material.kind === 'file'
-        ? path.join(runDir, 'material.txt')
-        : material.path;
+  request.materialPath = materialPathIn(runDir);
 
   await writeMaterial(runDir, material);
   setActiveRunDir(runDir);
@@ -335,65 +528,68 @@ export async function runCommand(
   const lockHolder = { lock: null };
   installCleanupHandler({ stderr, lockHolder });
 
-  // -------------------------------------------------------------------------
-  // Step 2 of the G2-2 order: the integrity baseline, which needs runDir. The route and the
-  // lane contract follow it.
-  // -------------------------------------------------------------------------
   const hooksDir = path.join(runDir, 'empty-hooks');
   await fs.mkdir(hooksDir, { recursive: true });
   const keepSandbox = Boolean(flags['keep-sandbox']);
   const baseline = await hashRepo(material.root, { hooksDir });
   await writeIntegrity(runDir, { baseline, state: { keepSandbox, integrityChanged: false } });
   request.integrity = { baselineWritten: true };
+  return { runDir, lockHolder, hooksDir, keepSandbox, baseline };
+}
 
-  // Steps 3 to 6 of the G2-2 order. A spawn run and an empty pool both skip them, so no spawn
-  // run builds a sandbox, writes a profile, or calls a model on the swarm.
-  const prep = { ...emptyPrep(), notes: discovered.notes, pool: discovered.pool, discovery: discovered.discovery };
-  if (prep.pool.length > 0 && effectiveRoute !== 'spawn') {
-    await prepareSwarmTree({
-      runDir,
-      material,
-      config,
-      env,
-      swarmBackend,
-      seats: chosen,
-      prior: discovered.prior,
-      named: discovered.named,
-      out: prep,
-    });
+/**
+ * The sandbox tree and context pack of an approved swarm plan: no probe, no research, no new
+ * assignment. A tree that cannot be built empties the seat models, so the run falls to the host.
+ */
+async function buildApprovedTree({ runDir, material, config, out }) {
+  const off = (note) => {
+    out.notes.push(note);
+    out.seatModels = {};
+  };
+  if (hasGlobChars(runDir)) return off(`the run path holds a glob character, so the swarm is off: ${runDir}`);
+  const sandbox = await createSandbox({ repoRoot: material.root, runDir, material, config });
+  if (sandbox.overCap) {
+    return off(`the sandbox tree is over the cap (${sandbox.overCap.files} files, ${sandbox.overCap.bytes} bytes), so the swarm is off`);
   }
-  const notes = [...prep.notes];
-
-  const host = { available: Boolean(hostBackendObj) };
-  const swarmOf = (overrides = {}) => ({
-    available: Object.keys(prep.seatModels).length > 0,
-    detail: swarmBackendObj ? 'no seat has a swarm model' : 'backend not found on PATH',
-    model: Object.values(prep.seatModels)[0]?.model || null,
-    free: prep.pool.some((p) => p.free),
-    tier: Object.values(prep.seatModels)[0]?.lensTier || 'unmeasured',
-    ...overrides,
+  out.sandbox = sandbox;
+  if (sandbox.skippedSecrets > 0) out.notes.push(`${sandbox.skippedSecrets} secret-shaped files were left out of the sandbox tree`);
+  const pack = await buildContextPack({
+    material,
+    treeDir: sandbox.treeDir,
+    repoRoot: material.root,
+    packChars: config.swarm?.packChars ?? 60000,
   });
+  out.packText = await fs.readFile(pack.path, 'utf8');
+  // The canary ranks the pool; the approved models are the whole pool, in seat order.
+  const models = new Set();
+  for (const sm of Object.values(out.seatModels)) for (const e of seatEntries(sm)) models.add(e.model);
+  out.pool = [...models].map((model) => ({ model }));
+}
 
-  let routeDecision = decideRoute({ config, flags, material, quota, host, swarm: swarmOf() });
+/**
+ * The shared tail of a new run: canary, the final request, then detach or execute.
+ */
+async function launchRun({
+  run,
+  request,
+  flags,
+  config,
+  env,
+  stdout,
+  stderr,
+  material,
+  prep,
+  routeDecision: decided,
+  effectiveRoute,
+  chosen,
+  hostBackend,
+  swarmBackend,
+  fallbackRoute,
+}) {
+  const { runDir, lockHolder, hooksDir, keepSandbox, baseline } = run;
+  const notes = [...prep.notes];
+  let routeDecision = decided;
   let canary = null;
-
-  // The approval gate (spec G2-4). It sits before the canary because the canary lane is the first
-  // call that runs over the material; the probe and the bench read no material.
-  const dataLeaves = computeDataLeaves(
-    usesSwarm(routeDecision) ? prep.seatModels : {},
-    hostJudge(hostBackend),
-    config.sift?.enabled !== false
-  );
-  const training = dataLeaves.filter((r) => r.trains).map((r) => r.provider);
-  if (training.length > 0 && config.swarm?.acknowledgeTraining !== true) {
-    // Nothing of this run reached a seat, so the run directory goes with the refusal.
-    setActiveRunDir(null);
-    await fs.rm(runDir, { recursive: true, force: true });
-    throw new ConfigError(
-      `answer the decisions first: run preflight (a provider can train on the material: ${training.join(', ')})`
-    );
-  }
-  request.approval = { source: 'config', dataLeaves };
 
   if (usesSwarm(routeDecision) && prep.sandbox) {
     const profiles = [];
@@ -432,14 +628,7 @@ export async function runCommand(
       const detail = `the canary could not verify the lane boundary (profile ${canary.detail.profile})`;
       if (effectiveRoute === 'swarm') throw new ConfigError(`${detail}; --route swarm cannot proceed`);
       notes.push(`${detail}; the route falls back to spawn`);
-      routeDecision = decideRoute({
-        config,
-        flags,
-        material,
-        quota,
-        host,
-        swarm: swarmOf({ available: false, model: null, detail }),
-      });
+      routeDecision = fallbackRoute(detail);
     }
   }
 
@@ -763,6 +952,9 @@ async function executePipeline({
   sandbox = null,
   packText,
 }) {
+  // An answered privacy=decline turned the sift off; a resume reloads config, so the request wins.
+  if (request.sift?.enabled === false) config = { ...config, sift: { ...config.sift, enabled: false } };
+
   // The owner holds the lock here. The repair must come before the first append of this owner.
   await repairEvents(runDir);
   await replayMissingEvents(runDir, {

@@ -119,10 +119,17 @@ export async function resolveRunPlan(flags = {}, { env = process.env, cwd = proc
   const requirementsText = await readRequirements({ config, flags, material, cwd, stderr });
 
   const discovered = await discoverPool({ config, env, flags, swarmBackend, swarmBackendObj });
+  const store = await readStore(stateDir(env));
   const seatModels =
     discovered.pool.length > 0 && routeRequested !== 'spawn'
-      ? assignSeats({ seats: chosen, pool: discovered.pool, store: await readStore(stateDir(env)) })
+      ? assignSeats({ seats: chosen, pool: discovered.pool, store })
       : {};
+  // Stored probe latency per primary model; the bundle turns it into a time estimate.
+  const latencies = {};
+  for (const sm of Object.values(seatModels)) {
+    const entry = store[`${swarmBackend}:${sm.model}`] || store[sm.model];
+    if (typeof entry?.latencyMs === 'number') latencies[sm.model] = entry.latencyMs;
+  }
 
   const assigned = Object.values(seatModels);
   const hostAvailable = Boolean(hostBackendObj);
@@ -158,9 +165,14 @@ export async function resolveRunPlan(flags = {}, { env = process.env, cwd = proc
     quota,
     requirementsText,
     discovered,
-    discoveryErrors: discovered.discovery.error ? [discovered.discovery.error] : [],
+    discoveryErrors: discovered.discovery.error
+      ? [discovered.discovery.error]
+      : swarmBackendObj
+        ? []
+        : [`${swarmBackend} executable not found`],
     discoveryCandidates: discovered.candidates,
     seatModels,
+    latencies,
     hostAvailable,
     swarmAvailable,
     judge: hostJudge(hostBackend, config.stages?.ruling?.model || null),

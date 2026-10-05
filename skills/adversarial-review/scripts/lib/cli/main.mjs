@@ -3,6 +3,7 @@ import { parseArgs } from './args.mjs';
 import { runCommand } from './run.mjs';
 import { statusCommand } from './status.mjs';
 import { watchCommand } from './watch.mjs';
+import { preflightCommand } from './preflight.mjs';
 import { patchReviewCommand, verifyCommand } from './closing.mjs';
 import { siftCommand } from './sift.mjs';
 import { recommendCommand } from './recommend.mjs';
@@ -20,6 +21,9 @@ function printHelp(stdout) {
 
 Usage:
   adversarial-review run [--target P] [--base R] [--stage S] [--seats a,b] [--requirements-file F] [--backend B] [--route R] [--allow-gaps] [--until find] [--detach] [--resume D [--allow-drift]] [--json]
+  adversarial-review run --from-preflight <bundle> [--detach] [--allow-drift] [--json]
+  adversarial-review preflight [run flags] [--out <file>] [--json]
+  adversarial-review preflight --answer-bundle <bundle> --answer <id>=<value> ... [--out <file>] [--json]
   adversarial-review status [<run-dir> | --latest] [--json]
   adversarial-review watch <run-dir> [--since <n>] [--timeout <sec>] [--json]
   adversarial-review patch-review <run-dir> --plan <file> [--json]
@@ -80,6 +84,9 @@ export async function main(
 
       case 'status':
         return await statusCommand(flags, positionals, io);
+
+      case 'preflight':
+        return await preflightCommand(flags, positionals, io);
 
       case 'watch':
         return await watchCommand(flags, positionals, io);

@@ -25,6 +25,7 @@ export const COMMAND_OPTIONS = {
     model: { type: 'string', multiple: true },
     'keep-sandbox': { type: 'boolean' },
     'allow-repo-change': { type: 'boolean' },
+    'from-preflight': { type: 'string' },
   },
   status: {
     latest: { type: 'boolean' },
@@ -85,6 +86,16 @@ export const COMMAND_OPTIONS = {
     'v2-hooks': { type: 'boolean' },
     global: { type: 'boolean' },
   },
+};
+
+// preflight takes the run flags it records, plus its own; never resume, detach or from-preflight.
+COMMAND_OPTIONS.preflight = {
+  ...Object.fromEntries(
+    Object.entries(COMMAND_OPTIONS.run).filter(([k]) => !['resume', 'detach', 'from-preflight'].includes(k))
+  ),
+  out: { type: 'string' },
+  'answer-bundle': { type: 'string' },
+  answer: { type: 'string', multiple: true },
 };
 
 export function parseArgs(argv = [], spec) {
