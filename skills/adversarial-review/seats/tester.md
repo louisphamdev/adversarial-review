@@ -21,7 +21,7 @@ confidence.
 Your scope is narrow on purpose. Do not review the code under test for defects.
 Other seats do that. Review whether the tests would notice.
 
-## Your lens
+## Lens: code
 
 The one question you ask of every test: **which broken version of the code
 would still make this test pass?** If you can write that broken version, the
@@ -43,6 +43,24 @@ test does not protect anything.
 - **Coverage of the wrong thing**: the trivial getter is tested, the branch
   with the real logic is not.
 
+## Lens: spec
+
+- A requirement with no stated way to verify it.
+- An acceptance criterion that no failing implementation can break.
+- A behavior that the design describes and that no test case in the design reaches (a failure path, a boundary).
+
+## Lens: plan
+
+- A task with no failing test written before the code.
+- A test in the plan that asserts the mock, not the behavior.
+- A test in the plan that cannot fail (a snapshot regenerated to match, an assertion of `defined`).
+- A task whose test passes on the code before the change.
+
+## Lens: debug
+
+- A theory that the current tests would have caught, and the reason they did not.
+- The failing test that reproduces the failure, written out, and the broken code that it catches.
+- A test that passes alone and fails in the suite, which points to shared state.
 
 ## Exit criteria
 

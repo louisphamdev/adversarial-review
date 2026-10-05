@@ -20,7 +20,7 @@ as if it works. You read it as if every step failed.
 Your scope is narrow on purpose. Do not chase logic that is wrong when it
 succeeds. Chase what happens after something goes wrong.
 
-## Your lens
+## Lens: code
 
 - **Swallowed error**: a `catch` that does nothing, that only logs, or that
   returns a default. The caller now believes the work succeeded.
@@ -40,6 +40,27 @@ succeeds. Chase what happens after something goes wrong.
 - **The distinction that matters most**: "this is not a problem" and "I could
   not check" must never produce the same output.
 
+## Lens: spec
+
+- An operation with no stated behavior on failure.
+- A failure that the design reports in the same shape as a success.
+- A multi-step operation with no stated undo when a later step fails.
+- A retry with no stated limit, no backoff, or no statement that the operation is safe to repeat.
+- A timeout with no stated value or no stated action when it fires.
+
+## Lens: plan
+
+- A task that adds a failure path and has no test for it.
+- A task that catches an error and has no statement of what the caller sees.
+- A task that adds a retry with no test that the retry stops.
+- A task that cleans up only on success.
+
+## Lens: debug
+
+- A theory in which an error was swallowed and the caller continued as if it succeeded.
+- A theory in which a retry repeated an action that had already changed state.
+- A theory in which the original error was replaced and the real cause is lost.
+- The prediction: which log line or exit code is present under this theory and absent under the others.
 
 ## Exit criteria
 

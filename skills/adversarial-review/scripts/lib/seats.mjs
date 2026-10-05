@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ConfigError } from './errors.mjs';
+import { RENDER_ORDER, REVIEW_STAGES, stageBlockText } from './stage-blocks.mjs';
 
 export function defaultSeatsDir() {
   return path.resolve(import.meta.dirname, '../../seats');
@@ -12,6 +13,77 @@ export const STAGE_SEATS = {
   plan: ['historian', 'medic', 'keeper', 'racer', 'simplifier', 'skeptic'],
   debug: ['racer', 'edge', 'medic', 'keeper', 'breaker', 'skeptic'],
 };
+
+const LENS_HEADING = /^## Lens: (.*?)\s*$/;
+const LEGACY_HEADING = /^## Your lens\s*$/;
+
+// Pulls `## Lens: <stage>` and the legacy `## Your lens` sections out of a seat body.
+function splitLenses(bodyText, filePath) {
+  const keep = [];
+  const lenses = {};
+  let legacyLens = null;
+  let current = null;
+  let buf = [];
+  const flush = () => {
+    if (current === null) return;
+    const text = buf.join('\n').trim();
+    if (current === 'legacy') {
+      legacyLens = text;
+    } else {
+      if (!/^- /m.test(text)) {
+        throw new ConfigError(`Lens section "${current}" has no bullet line in seat file: ${filePath}`);
+      }
+      lenses[current] = text;
+    }
+    current = null;
+    buf = [];
+  };
+  for (const line of bodyText.split(/\r?\n/)) {
+    const m = line.match(LENS_HEADING);
+    if (m) {
+      flush();
+      const name = m[1];
+      if (!REVIEW_STAGES.includes(name)) {
+        throw new ConfigError(`Unknown lens "${name}" in seat file: ${filePath}. Use one of: ${REVIEW_STAGES.join(', ')}`);
+      }
+      if (Object.hasOwn(lenses, name)) {
+        throw new ConfigError(`Duplicate lens heading for "${name}" in seat file: ${filePath}`);
+      }
+      current = name;
+      continue;
+    }
+    if (LEGACY_HEADING.test(line)) {
+      flush();
+      current = 'legacy';
+      continue;
+    }
+    if (current !== null && line.startsWith('## ')) flush();
+    if (current !== null) buf.push(line);
+    else keep.push(line);
+  }
+  flush();
+  return { body: keep.join('\n').trim(), lenses, legacyLens };
+}
+
+// Picks the lens text for one review stage; falls back to the legacy section, then the frontmatter line.
+export function lensFor(seat, reviewStage) {
+  const lenses = seat?.lenses || {};
+  if (Object.hasOwn(lenses, reviewStage) && typeof lenses[reviewStage] === 'string' && lenses[reviewStage]) {
+    return { text: lenses[reviewStage], source: 'stage' };
+  }
+  if (typeof seat?.legacyLens === 'string' && seat.legacyLens) {
+    return { text: seat.legacyLens, source: 'legacy' };
+  }
+  return { text: `- ${seat?.lens || 'your specialist lens'}`, source: 'frontmatter' };
+}
+
+export function normalizeStage(stage) {
+  const key = typeof stage === 'string' ? stage.trim().toLowerCase() : '';
+  if (!REVIEW_STAGES.includes(key)) {
+    throw new ConfigError(`Unknown review stage ${JSON.stringify(stage)}. Use one of: ${REVIEW_STAGES.join(', ')}.`);
+  }
+  return key;
+}
 
 function parseSeatFile(filePath) {
   const content = fs.readFileSync(filePath, 'utf8');
@@ -58,6 +130,7 @@ function parseSeatFile(filePath) {
 
   const budgetFactor = frontmatter.budgetFactor !== undefined ? Number(frontmatter.budgetFactor) : 1;
 
+  const { body, lenses, legacyLens } = splitLenses(bodyText, filePath);
   return {
     key: frontmatter.key,
     title: frontmatter.title || '',
@@ -65,7 +138,9 @@ function parseSeatFile(filePath) {
     description: frontmatter.description || '',
     tier: frontmatter.tier || 'standard',
     budgetFactor,
-    body: bodyText.trim(),
+    body,
+    lenses,
+    legacyLens,
   };
 }
 
@@ -97,6 +172,7 @@ export function resolveSeats({
   projectSeats,
   seats = loadSeats(),
 } = {}) {
+  const stageKey = normalizeStage(stage);
   const warnings = [];
   const chosenKeys = [];
   const seen = new Set();
@@ -117,7 +193,7 @@ export function resolveSeats({
     }
     keysToProcess = parts;
   } else {
-    const defaultList = STAGE_SEATS[stage] || STAGE_SEATS.code;
+    const defaultList = STAGE_SEATS[stageKey];
     keysToProcess = [...defaultList];
     if (Array.isArray(projectSeats)) {
       keysToProcess.push(...projectSeats);
@@ -169,7 +245,7 @@ export function resolveSeats({
     }
   }
 
-  return { chosen, noSeat, warnings };
+  return { chosen, noSeat, warnings, stage: stageKey };
 }
 
 export function renderSeat(seat, target = 'cli', ctx = {}) {
@@ -190,6 +266,24 @@ export function renderSeat(seat, target = 'cli', ctx = {}) {
       '',
       seat.body.trim(),
       '',
+      ...(seat.key === 'judge'
+        ? []
+        : [
+            '## Your lens by review stage',
+            '',
+            'The first line of your task names the review stage, in the form `Review stage: <stage>.`',
+            'Use only the rules and the lens for that stage. Ignore the other three.',
+            'If your task names no review stage, use the code rules and lens and write "no review stage named" in your first message to the lead.',
+            '',
+            ...RENDER_ORDER.flatMap((st) => [
+              `### ${st[0].toUpperCase()}${st.slice(1)} review`,
+              '',
+              stageBlockText(st),
+              '',
+              lensFor(seat, st).text,
+              '',
+            ]),
+          ]),
       '## Before you work',
       '',
       '1. Read `references/table-rules.md` in the `adversarial-review` skill directory. Those rules govern this seat.',
@@ -217,7 +311,12 @@ export function renderSeat(seat, target = 'cli', ctx = {}) {
   }
 
   if (target === 'cli') {
-    return `${seat.body.trim()}\n\n## Report\n\nYour final answer is the report. End it with ONE fenced json block that matches the schema below.\n`;
+    const parts = [seat.body.trim()];
+    if (ctx.reviewStage && seat.key !== 'judge') {
+      parts.push(`## Your lens (${ctx.reviewStage} review)\n\n${lensFor(seat, ctx.reviewStage).text}`);
+    }
+    parts.push('## Report\n\nYour final answer is the report. End it with ONE fenced json block that matches the schema below.');
+    return parts.join('\n\n') + '\n';
   }
 
   throw new ConfigError(`Unknown renderSeat target: "${target}"`);

@@ -41,6 +41,32 @@ You do. After you judge the claims, look for:
 - A defect that appears only when two findings combine.
 - A fix proposed by one seat that breaks an invariant another seat owns.
 
+## Lens: code
+
+- A defect that needs two lenses at once, so that one seat alone missed it.
+- A defect that appears only when two findings combine.
+- A fix proposed by one seat that breaks an invariant that another seat owns.
+- A finding whose `file:line` does not hold the code that the claim describes.
+
+## Lens: spec
+
+- A finding that quotes the design out of context, where the next sentence answers it.
+- A gap between two sections that no seat owns (for example, the error shape between two components).
+- A proposed rewrite that fixes one section and contradicts another.
+- A finding that measures the design against a requirement that nobody stated.
+
+## Lens: plan
+
+- A finding about a task that a later task in the plan already covers.
+- A gap between two tasks that no seat owns (a contract that one task produces and another task consumes differently).
+- A proposed task change that breaks the order of other tasks.
+
+## Lens: debug
+
+- A theory whose prediction every other theory also makes, so it tells nothing apart.
+- Two theories that are one cause seen through two lenses.
+- A check proposed for one theory that cannot reject it.
+- A theory that the evidence already rejects.
 
 ## Where your own confidence is not trustworthy
 

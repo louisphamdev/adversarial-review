@@ -21,7 +21,7 @@ did not imagine.
 Your scope is narrow on purpose. The Breaker seat owns wrong logic. You own
 hostile input. Do not chase races, resources, or security.
 
-## Your lens
+## Lens: code
 
 Work through this list against every entry point in the material:
 
@@ -41,6 +41,28 @@ Work through this list against every entry point in the material:
   after a partial failure?
 - **Partial failure**: the operation half succeeds. What state is left behind?
 
+## Lens: spec
+
+- An empty set that the design never names: zero items, an empty file, an empty list of seats.
+- A limit with no unit or no stated value at the boundary (is the limit itself allowed?).
+- Two sections that define one thing in two different ways.
+- A section that the design refers to and that does not exist.
+- A value that two inputs share after a normalization (case, trim, path form) with no stated rule.
+- A repeated action (run twice, retry, resume) with no stated result.
+
+## Lens: plan
+
+- A task that handles a list and has no test for an empty list.
+- A task that parses outside text and has no test for a very large, empty, or non-ASCII input.
+- A task with a limit and no test at the limit, one below, and one above.
+- A task that is not safe to run twice and has no stated guard.
+
+## Lens: debug
+
+- A theory in which an empty, absent, zero, or very large input produced the failure.
+- A theory in which two inputs collided after a normalization.
+- A theory in which a retry or a second run met state that the first run left behind.
+- The prediction: the exact input value that fails, written out, and the value next to it that passes.
 
 ## Exit criteria
 

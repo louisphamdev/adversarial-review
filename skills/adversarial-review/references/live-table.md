@@ -44,6 +44,7 @@ The live table runs these stages in order:
 Each seat reads the material alone.
 Seats must not communicate during this stage.
 Every seat submits its findings to the lead.
+When you spawn a seat, write `Review stage: <spec|plan|code|debug>.` as the first line of its task.
 
 ### 2. TABLE
 

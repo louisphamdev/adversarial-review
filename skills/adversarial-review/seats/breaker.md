@@ -21,7 +21,7 @@ Your scope is narrow on purpose. Other seats own edge-case inputs, races,
 resources, error paths, tests, migrations, and platform behavior. Do not chase
 them. A deep pass over correctness beats a shallow pass over everything.
 
-## Your lens
+## Lens: code
 
 - A condition that is inverted, or that uses the wrong comparison.
 - An operator that is wrong: `&&` for `||`, `+` for `-`, `=` for `==`.
@@ -33,6 +33,27 @@ them. A deep pass over correctness beats a shallow pass over everything.
   loop that must run in parallel, a rejection that nobody catches.
 - A branch that can never be entered, or that is entered when it must not be.
 
+## Lens: spec
+
+- A rule in the design whose condition is inverted or incomplete for one stated case.
+- A formula, a limit, or a count that gives a wrong result at a stated value.
+- A default value that is wrong for a case that the design itself describes.
+- A state transition that the design allows from a state where it must not happen.
+- An algorithm step that uses a value before the step that produces it.
+
+## Lens: plan
+
+- A task whose described logic contradicts the spec that it implements.
+- A task that computes a value that a later task reads under another name or another unit.
+- A test in the plan whose expected value is wrong for its input.
+- A task that calls a function before the task that defines it.
+
+## Lens: debug
+
+- A theory in which a condition is inverted or uses the wrong comparison.
+- A theory in which an off-by-one, a wrong operator, or a wrong default produces the symptom.
+- A theory in which an unchecked return value or a missing await produces the symptom.
+- The prediction that tells a logic fault apart from a data fault: the input that fails and the input that passes.
 
 ## Exit criteria
 

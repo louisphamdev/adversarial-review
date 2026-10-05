@@ -10,7 +10,9 @@ import {
   resolveSeats,
   seatBudget,
   renderSeat,
+  lensFor,
 } from '../skills/adversarial-review/scripts/lib/seats.mjs';
+import { RENDER_ORDER, REVIEW_STAGES, STAGE_BLOCKS, stageBlockText } from '../skills/adversarial-review/scripts/lib/stage-blocks.mjs';
 import { ConfigError } from '../skills/adversarial-review/scripts/lib/errors.mjs';
 
 test('seats module', async (t) => {
@@ -202,5 +204,163 @@ test('seats module', async (t) => {
     assert.ok(!rendered.includes('SendMessage'));
     assert.ok(rendered.includes('## Report'));
     assert.ok(rendered.includes('Your final answer is the report. End it with ONE fenced json block that matches the schema below.'));
+  });
+
+  const SEAT_HEAD = '---\nkey: KEY\ntitle: T\nlens: one line lens\ndescription: d\ntier: standard\nbudgetFactor: 1\n---\n\n# Seat\n\n## Identity\n\nText.\n\n';
+  const write = (dir, key, body) =>
+    fs.writeFileSync(path.join(dir, `${key}.md`), SEAT_HEAD.replace('KEY', key) + body, 'utf8');
+
+  await t.test('stage-blocks exports one list and four blocks', () => {
+    assert.deepEqual(REVIEW_STAGES, ['spec', 'plan', 'code', 'debug']);
+    for (const st of REVIEW_STAGES) {
+      assert.ok(typeof STAGE_BLOCKS[st].kind === 'string' && Array.isArray(STAGE_BLOCKS[st].hunt) && typeof STAGE_BLOCKS[st].evidence === 'string');
+    }
+    assert.ok(stageBlockText('spec').startsWith('The material is a design document.'));
+    assert.ok(stageBlockText('spec').includes('Report each term that the document uses and does not define.'));
+    assert.equal(Object.hasOwn(STAGE_BLOCKS, 'toString'), false);
+  });
+
+  await t.test('parses lens sections out of the body', () => {
+    const tmp = fs.mkdtempSync(path.join(tmpdir(), 'seats-lens-'));
+    try {
+      write(tmp, 'x', '## Lens: code\n\n- c1\n- c2\n\n## Lens: spec\n\n- s1\n  continued\n\n## Exit criteria\n\nDone.\n');
+      const x = loadSeats(tmp).get('x');
+      assert.deepEqual(Object.keys(x.lenses).sort(), ['code', 'spec']);
+      assert.equal(x.lenses.spec, '- s1\n  continued');
+      assert.ok(!x.body.includes('## Lens:'));
+      assert.ok(x.body.includes('## Exit criteria'));
+      assert.equal(x.legacyLens, null);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('keeps a legacy "Your lens" section apart from the body', () => {
+    const tmp = fs.mkdtempSync(path.join(tmpdir(), 'seats-legacy-'));
+    try {
+      write(tmp, 'y', '## Your lens\n\n- old bullet\n\n## Exit criteria\n\nDone.\n');
+      const y = loadSeats(tmp).get('y');
+      assert.equal(y.legacyLens, '- old bullet');
+      assert.ok(!y.body.includes('## Your lens'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await t.test('parses a CRLF seat file the same as LF', () => {
+    const tmp = fs.mkdtempSync(path.join(tmpdir(), 'seats-crlf-'));
+    try {
+      const lf = SEAT_HEAD.replace('KEY', 'z') + '## Lens: spec\n\n- s1\n- s2\n\n## Exit criteria\n\nDone.\n';
+      fs.writeFileSync(path.join(tmp, 'z.md'), lf.replace(/\n/g, '\r\n'), 'utf8');
+      const z = loadSeats(tmp).get('z');
+      assert.equal(z.lenses.spec, '- s1\n- s2');
+      assert.ok(!z.body.includes('\r'));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  for (const [label, body, re] of [
+    ['duplicate lens heading', '## Lens: spec\n\n- a\n\n## Lens: spec\n\n- b\n', /duplicate.*spec/i],
+    ['unknown lens name', '## Lens: docs\n\n- a\n', /docs/],
+    ['lens with no bullet', '## Lens: plan\n\nJust prose.\n', /no bullet/i],
+  ]) {
+    await t.test(`rejects a seat file with a ${label}`, () => {
+      const tmp = fs.mkdtempSync(path.join(tmpdir(), 'seats-bad-'));
+      try {
+        write(tmp, 'bad', body);
+        assert.throws(() => loadSeats(tmp), (err) => err instanceof ConfigError && re.test(err.message) && /bad\.md/.test(err.message));
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await t.test('lensFor falls back from stage to legacy to frontmatter', () => {
+    assert.deepEqual(lensFor({ lenses: { spec: '- s' }, legacyLens: '- l', lens: 'f' }, 'spec'), { text: '- s', source: 'stage' });
+    assert.deepEqual(lensFor({ lenses: {}, legacyLens: '- l', lens: 'f' }, 'spec'), { text: '- l', source: 'legacy' });
+    assert.deepEqual(lensFor({ lenses: {}, legacyLens: null, lens: 'f' }, 'spec'), { text: '- f', source: 'frontmatter' });
+  });
+
+  await t.test('resolveSeats checks the stage first and returns it normalized', () => {
+    for (const bad of ['docs', 'toString', '__proto__', '', 7]) {
+      assert.throws(() => resolveSeats({ stage: bad }), (err) => err instanceof ConfigError && /spec, plan, code, debug/.test(err.message));
+      assert.throws(() => resolveSeats({ stage: bad, seatsFlag: 'breaker' }), ConfigError);
+    }
+    const r = resolveSeats({ stage: ' Spec ' });
+    assert.equal(r.stage, 'spec');
+    assert.equal(r.chosen[0].key, 'historian');
+  });
+
+  await t.test('renderSeat cli adds the lens for the review stage', () => {
+    const seat = { key: 'q', body: '# Q', lenses: { spec: '- s1' }, legacyLens: null, lens: 'f' };
+    const out = renderSeat(seat, 'cli', { reviewStage: 'spec' });
+    assert.ok(out.includes('## Your lens (spec review)\n\n- s1'));
+    assert.ok(out.indexOf('## Your lens') < out.indexOf('## Report'));
+    assert.equal(renderSeat(seat, 'cli'), '# Q\n\n## Report\n\nYour final answer is the report. End it with ONE fenced json block that matches the schema below.\n');
+  });
+
+  await t.test('renderSeat claude-agent holds the stage rule, the four stage blocks and lenses; judge has none', () => {
+    const seat = { key: 'q', description: 'd', tier: 'standard', body: '# Q', lenses: { code: '- c', spec: '- s', plan: '- p', debug: '- d' }, legacyLens: null, lens: 'f' };
+    const out = renderSeat(seat, 'claude-agent');
+    assert.ok(out.includes('The first line of your task names the review stage, in the form `Review stage: <stage>.`'));
+    assert.ok(out.includes('Use only the rules and the lens for that stage. Ignore the other three.'));
+    const specAt = out.indexOf('### Spec review');
+    assert.ok(specAt > 0 && out.indexOf('Report each term that the document uses and does not define.', specAt) > specAt);
+    for (const h of ['### Code review', '### Plan review', '### Debug review']) assert.ok(out.includes(h));
+    assert.ok(out.indexOf('## Your lens by review stage') < out.indexOf('## Before you work'));
+    const judge = renderSeat({ key: 'judge', description: 'd', tier: 'strong', body: '# J', lenses: {}, legacyLens: null, lens: '' }, 'claude-agent');
+    assert.ok(!judge.includes('Your lens by review stage'));
+  });
+
+  await t.test('the claude-agent render emits one section per review stage, in RENDER_ORDER', () => {
+    assert.equal(RENDER_ORDER.length, REVIEW_STAGES.length);
+    assert.deepEqual([...RENDER_ORDER].sort(), [...REVIEW_STAGES].sort());
+
+    const seat = { key: 'q', description: 'd', tier: 'standard', body: '# Q', lenses: {}, legacyLens: null, lens: 'f' };
+    const out = renderSeat(seat, 'claude-agent');
+    const headings = [...out.matchAll(/^### (.*) review$/gm)].map((m) => m[1]);
+    assert.deepEqual(headings, RENDER_ORDER.map((st) => `${st[0].toUpperCase()}${st.slice(1)}`));
+  });
+
+  const LENS_SEATS_A = ['attacker', 'breaker', 'edge', 'historian', 'keeper', 'medic'];
+  await t.test('batch A seats have four lens sections with at least 3 bullets', () => {
+    const seats = loadSeats();
+    for (const key of LENS_SEATS_A) {
+      const s = seats.get(key);
+      for (const st of ['code', 'spec', 'plan', 'debug']) {
+        assert.ok(s.lenses[st], `${key} has no ${st} lens`);
+        assert.ok((s.lenses[st].match(/^- /gm) || []).length >= 3, `${key} ${st} lens has fewer than 3 bullets`);
+      }
+      assert.equal(s.legacyLens, null, `${key} still has a "## Your lens" section`);
+    }
+    const edgeSpec = seats.get('edge').lenses.spec;
+    assert.ok(!edgeSpec.includes('undefined') && !edgeSpec.includes('null'));
+    assert.ok(edgeSpec.includes('Two sections that define one thing in two different ways.'));
+  });
+
+  const FINDER_SEATS = ['attacker', 'breaker', 'edge', 'historian', 'keeper', 'medic', 'native', 'plumber', 'racer', 'simplifier', 'skeptic', 'tester'];
+  await t.test('every finder seat has four lens sections and no near-miss heading', () => {
+    const seats = loadSeats();
+    for (const key of FINDER_SEATS) {
+      const s = seats.get(key);
+      for (const st of ['code', 'spec', 'plan', 'debug']) {
+        assert.ok(s.lenses[st] && (s.lenses[st].match(/^- /gm) || []).length >= 3, `${key} ${st}`);
+      }
+      const raw = fs.readFileSync(path.join(defaultSeatsDir(), `${key}.md`), 'utf8');
+      const withoutReal = raw.replace(/^## Lens: (code|spec|plan|debug)$/gm, '');
+      assert.ok(!/^#{2,3} ?[Ll]ens:/m.test(withoutReal), `${key} has a near-miss lens heading`);
+    }
+    assert.deepEqual(Object.keys(seats.get('judge').lenses), []);
+  });
+
+  await t.test('generated rt-edge agent carries the stage rule and the spec block; rt-judge has no lens block', () => {
+    const root = path.resolve(import.meta.dirname, '..');
+    const edge = fs.readFileSync(path.join(root, 'agents', 'rt-edge.md'), 'utf8');
+    assert.ok(edge.includes('The first line of your task names the review stage'));
+    const at = edge.indexOf('### Spec review');
+    assert.ok(at > 0 && edge.indexOf('Report each term that the document uses and does not define.', at) > at);
+    const judge = fs.readFileSync(path.join(root, 'agents', 'rt-judge.md'), 'utf8');
+    assert.ok(!judge.includes('Your lens by review stage'));
   });
 });

@@ -19,7 +19,7 @@ only seat that reads the requirement before it reads the work.
 
 Other seats ask "is this correct". You ask "is this what we agreed".
 
-## Your lens
+## Lens: code
 
 - A stated requirement with no matching behavior in the material.
 - Behavior in the material that no requirement asked for.
@@ -29,6 +29,28 @@ Other seats ask "is this correct". You ask "is this what we agreed".
 - An interface that two parts describe in two different ways.
 - A term that means one thing in the requirement and another in the material.
 - A public contract that the documentation and the code state differently.
+
+## Lens: spec
+
+- A stated requirement with no section that meets it.
+- A section that no requirement asked for.
+- A term that means one thing in the requirement and another in the design.
+- A decision that the design changes from an earlier record with no reason given.
+- An interface that two sections describe in two different ways.
+
+## Lens: plan
+
+- A spec requirement with no task that implements it.
+- A task that implements behavior that the spec does not ask for.
+- A task whose acceptance test does not measure the spec requirement it names.
+- A public contract that the plan changes with no task for its callers or its docs.
+
+## Lens: debug
+
+- The expected behavior, quoted from a spec, a doc, or a test, that the failure breaks.
+- A theory in which a caller depends on a contract that a recent change broke.
+- A theory in which two documents state the contract in two ways and the code follows one of them.
+- The prediction: which promise the failure breaks and which earlier version kept it.
 
 ## The boundary of your seat
 

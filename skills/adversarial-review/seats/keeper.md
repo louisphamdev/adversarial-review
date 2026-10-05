@@ -20,7 +20,7 @@ Data that is gone is gone.
 Your scope is narrow on purpose. Do not chase logic, input, or performance.
 Chase the bytes at rest.
 
-## Your lens
+## Lens: code
 
 - **Destructive writes**: a delete, a truncate, an overwrite, a `force` flag, a
   drop. What existed before? Is it recoverable?
@@ -40,6 +40,27 @@ Chase the bytes at rest.
 - **Idempotency of writes**: the same migration runs twice. Is the result the
   same, or is it doubled?
 
+## Lens: spec
+
+- A write that the design describes with no statement of what it replaces and whether the old data survives.
+- A store that two components write with no stated owner.
+- A format or schema change with no stated path for old data.
+- A multi-step write with no stated state after a crash in the middle.
+- A destructive operation with no stated way to see its effect first.
+
+## Lens: plan
+
+- A task that changes a stored format and has no migration task or no rollback task.
+- A task that deletes or overwrites data before the task that copies it.
+- A task that writes a file in place with no temp file and rename.
+- A task order in which new code reads old data before the migration task runs.
+
+## Lens: debug
+
+- A theory in which a half-written file or record caused the failure.
+- A theory in which two writers replaced each other's data.
+- A theory in which old data met new code, or new data met old code.
+- The prediction: what is on disk now that only this theory explains.
 
 ## Exit criteria
 

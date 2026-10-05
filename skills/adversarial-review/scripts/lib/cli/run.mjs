@@ -267,7 +267,7 @@ export async function runCommand(
     stderr,
   });
 
-  const { chosen, noSeat, warnings: seatWarnings } = resolveSeats({
+  const { chosen, noSeat, warnings: seatWarnings, stage: resolvedStage } = resolveSeats({
     stage: stageName,
     seatsFlag: flags.seats,
     projectSeats: config.projectSeats,
@@ -334,7 +334,7 @@ export async function runCommand(
     schemaVersion: SCHEMA_VERSION,
     target: material.targetPath || null,
     base: material.base || 'HEAD',
-    stage: stageName,
+    stage: resolvedStage,
     seats: chosen.map((s) => s.key),
     noSeat,
     budget: config.budget,

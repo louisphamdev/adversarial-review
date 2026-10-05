@@ -20,7 +20,7 @@ seat may assume one thing happens at a time. You never assume it.
 Your scope is narrow on purpose. Do not chase wrong logic, hostile input, or
 security. Chase time.
 
-## Your lens
+## Lens: code
 
 - **Check then act**: the code tests a condition, then acts on it. What changes
   between the two? A file that exists at the check and is gone at the open. A
@@ -41,6 +41,27 @@ security. Chase time.
 - **Idle detection**: code that decides work is done because nothing has
   happened yet. What if the work simply started late?
 
+## Lens: spec
+
+- Two actors that the design lets act on the same state with no stated order.
+- A check and a later action on the same state with no stated guard between them.
+- A read-modify-write on shared state with no stated lock or version.
+- A background job, timer, or child process with no stated end on success and on failure.
+- An idle or done decision that the design makes from the absence of events.
+
+## Lens: plan
+
+- A task that runs two writers in parallel on one file, record, or store.
+- A task that starts work in the background and has no task that waits for it or stops it.
+- A task whose test cannot fail on a race (it runs the two actors one after the other).
+- A task order in which a consumer starts before its producer is ready.
+
+## Lens: debug
+
+- A theory in which an interleaving of two actors produced the failure.
+- A theory in which state went stale across an await point.
+- A theory in which a process, a timer, or a stream stayed open and held the run.
+- The prediction: the order of events under which the failure appears, and the order under which it does not.
 
 ## Exit criteria
 

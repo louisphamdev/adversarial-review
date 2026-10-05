@@ -21,7 +21,7 @@ will run on another.
 Your scope is narrow on purpose. Do not chase logic, input, or performance.
 Chase the ground the code stands on.
 
-## Your lens
+## Lens: code
 
 - **Path separators**: a hard-coded `/` or `\`, a path built by joining
   strings, a path compared as text, a drive letter, a UNC path.
@@ -45,6 +45,26 @@ Chase the ground the code stands on.
   different one. `2>/dev/null` against `2>$null`.
 - **Temporary directories and home paths**: a hard-coded `/tmp` or `~`.
 
+## Lens: spec
+
+- A path, a command, or an environment variable that the design names in one platform form only.
+- A design step that assumes a POSIX shell, a symlink, an executable bit, or a case-sensitive file system.
+- A file operation that the design runs on a file that another process can hold open.
+- A text comparison that line endings or path separators can change.
+
+## Lens: plan
+
+- A task that builds a path from strings and has no Windows test.
+- A task that runs a command through a shell and has no test for a `.cmd` shim.
+- A task that renames or deletes a file that is open, with no Windows handling.
+- A test that passes only on one platform and is not marked as such.
+
+## Lens: debug
+
+- A theory in which the failure appears on one platform only.
+- A theory in which a path separator, a drive letter, a line ending, or variable case caused the failure.
+- A theory in which a file lock on Windows blocked a rename or a delete.
+- The prediction: the platform and the exact path or byte that differs.
 
 ## Exit criteria
 

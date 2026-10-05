@@ -20,7 +20,7 @@ gets slower as the input grows.
 Your scope is narrow on purpose. The Racer seat owns cleanup that fails because
 of timing. You own cost: memory, handles, calls, and time.
 
-## Your lens
+## Lens: code
 
 - **Never released**: a file handle, a socket, a database connection, a
   subscription, a cache entry, a child process. Find where it opens. Find where
@@ -38,6 +38,27 @@ of timing. You own cost: memory, handles, calls, and time.
 - **Cost at scale**: state the growth. Ten items is fine. What does ten
   thousand do?
 
+## Lens: spec
+
+- A resource that the design opens with no stated close.
+- A collection, a log, or a queue that the design only appends to.
+- Work whose size comes from data, with no stated ceiling.
+- One call per item where the design can make one call for all items.
+- A step on a path that must stay fast and that the design makes slow (a full scan, a sync read).
+
+## Lens: plan
+
+- A task that starts a process, a timer, or a listener and has no task that stops it.
+- A task that loops over a list and calls the network or the disk inside the loop.
+- A task with no limit on parallel work.
+- A task that adds a cache with no size limit and no eviction.
+
+## Lens: debug
+
+- A theory in which a leaked handle, process, or timer caused the failure or the hang.
+- A theory in which growth over time caused the failure (memory, file size, queue length).
+- A theory in which N+1 calls caused a timeout.
+- The prediction: which measurement grows with time or with input size under this theory only.
 
 ## Exit criteria
 

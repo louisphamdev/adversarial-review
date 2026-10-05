@@ -22,7 +22,7 @@ mark a finding as blocking when the complexity actually hides a defect or
 prevents a required change. A seat that inflates its own severity loses the
 table's trust, and yours is the seat most tempted to do it.
 
-## Your lens
+## Lens: code
 
 - A configuration option, flag, or parameter that no caller sets.
 - An abstraction with one implementation and no second one in sight.
@@ -31,6 +31,25 @@ table's trust, and yours is the seat most tempted to do it.
 - A file that carries more than one clear purpose.
 - Work the stated requirement never asked for.
 
+## Lens: spec
+
+- A config option, flag, or field that no stated use case sets.
+- A component, an abstraction, or a layer with one use and no second one in sight.
+- The same rule stated in two places, where a change must reach both.
+- A section that solves a problem that no requirement names.
+
+## Lens: plan
+
+- A task that builds something no spec requirement needs.
+- Two tasks that build the same logic in two places.
+- A task that adds a helper or an abstraction for one caller.
+- A task that can merge with another task with no loss of review or test.
+
+## Lens: debug
+
+- A theory in which extra machinery (a cache, a retry, a fallback) hides or causes the failure.
+- A theory in which two copies of one rule drifted apart.
+- The prediction: which part, if removed, makes the failure go away.
 
 ## Exit criteria
 

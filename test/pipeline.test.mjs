@@ -116,6 +116,7 @@ describe('pipeline module', () => {
           stage: 'code',
           materialPath: '/repo/diff.diff',
           repoRoot: '/repo',
+          lane: { tools: ['read', 'glob', 'grep'] },
         },
         seats: threeSeats,
         judge,
@@ -176,7 +177,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -211,7 +212,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -233,7 +234,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -307,7 +308,7 @@ describe('pipeline module', () => {
       };
 
       await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -383,7 +384,7 @@ describe('pipeline module', () => {
       };
 
       await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -420,7 +421,7 @@ describe('pipeline module', () => {
 
       // Case 1: without allowGaps -> BLOCK
       const resBlock = await runTable({
-        request: { stage: 'code', allowGaps: false },
+        request: { stage: 'code', allowGaps: false, lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent: runAgentWithDeadFinder,
@@ -432,7 +433,7 @@ describe('pipeline module', () => {
 
       // Case 2: with allowGaps: true -> PASS
       const resPass = await runTable({
-        request: { stage: 'code', allowGaps: true },
+        request: { stage: 'code', allowGaps: true, lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent: runAgentWithDeadFinder,
@@ -483,7 +484,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -509,7 +510,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -564,7 +565,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -616,7 +617,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -668,7 +669,7 @@ describe('pipeline module', () => {
       };
 
       await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge: { key: 'judge', body: 'Adjudicate the review.' },
         runAgent,
@@ -715,7 +716,7 @@ describe('pipeline module', () => {
       };
 
       await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -751,7 +752,7 @@ describe('pipeline module', () => {
       };
 
       const result = await runTable({
-        request: { stage: 'code' },
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
         seats: threeSeats,
         judge,
         runAgent,
@@ -883,6 +884,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         ruling: {
           closingList: [
             {
@@ -927,6 +930,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         ruling: {
           closingList: [{ n: 1, item: 'Fix bug', sources: ['breaker-1'] }],
         },
@@ -950,6 +955,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         ruling: { closingList: [{ n: 1, sources: ['edge-1'] }] },
       };
 
@@ -992,6 +999,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         findings: [
           { id: 'breaker-1', seat: 'breaker', title: 'b1', doneWhen: 'w1' },
           { id: 'edge-1', seat: 'edge', title: 'e1', doneWhen: 'w2' },
@@ -1037,6 +1046,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         ruling: { closingList: [{ n: 1, sources: ['breaker-1'] }] },
       };
 
@@ -1058,6 +1069,8 @@ describe('pipeline module', () => {
       };
 
       const state = {
+
+        request: { lane: { tools: ['read', 'glob', 'grep'] } },
         ruling: { closingList: [{ n: 1, sources: ['breaker-1'] }] },
       };
 

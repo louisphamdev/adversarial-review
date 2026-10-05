@@ -81,6 +81,11 @@ test('docs and plugin tests', async (t) => {
     assert.match(content, /~\/\.adversarial-review\/memory\//);
   });
 
+  await t.test('live-table.md tells the lead to name the review stage', () => {
+    const body = fs.readFileSync(liveTablePath, 'utf8');
+    assert.ok(body.includes('When you spawn a seat, write `Review stage: <spec|plan|code|debug>.` as the first line of its task.'));
+  });
+
   await t.test('table-rules.md ports rules and replaces host mechanics', () => {
     assert.ok(fs.existsSync(tableRulesPath), 'table-rules.md must exist');
     const content = fs.readFileSync(tableRulesPath, 'utf8');
