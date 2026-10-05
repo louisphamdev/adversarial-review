@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { resolveStageTarget, routeKeyOf, buildSeatObjects } from '../skills/adversarial-review/scripts/lib/cli/run.mjs';
+import { resolveRunPlan } from '../skills/adversarial-review/scripts/lib/runplan.mjs';
+import { runsDir } from '../skills/adversarial-review/scripts/lib/paths.mjs';
+import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 
 const base = {
   hostBackend: 'claude',
@@ -85,4 +90,31 @@ test('seat objects carry capability and, for a swarm FIND seat, the context pack
   assert.equal(by.tester.capability, 'strong', 'a host seat on sonnet is strong');
   assert.equal(by.tester.contextPack, undefined, 'a host seat gets no pack');
   assert.ok(typeof by.edge.body === 'string' && by.edge.body.length > 0, 'the seat file body is kept');
+});
+
+test('resolveRunPlan: the same inputs give the same plan, with no run directory', async () => {
+  // A hermetic PATH, so a real opencode on the developer PATH does not answer discovery.
+  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+  const { env, cleanup } = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+  const { root, cleanup: rc } = await makeTempRepo({ git: true, files: { 'a.mjs': 'export const a = 1;\n' } });
+  try {
+    const flags = { target: path.join(root, 'a.mjs'), stage: 'code', route: 'spawn', backend: 'claude' };
+    const quiet = { write() {} };
+    const a = await resolveRunPlan(flags, { env, cwd: root, stderr: quiet });
+    const b = await resolveRunPlan(flags, { env, cwd: root, stderr: quiet });
+    assert.equal(a.material.hash, b.material.hash);
+    assert.deepEqual(a.chosen.map((s) => s.key), b.chosen.map((s) => s.key));
+    assert.equal(a.routeDecision.route, 'spawn');
+    assert.equal(a.routeRequested, 'spawn');
+    assert.equal(a.hostBackend, 'claude');
+    assert.deepEqual(a.judge, { backend: 'claude', model: 'opus', provider: 'anthropic', trains: false });
+    assert.ok(Array.isArray(a.discoveryErrors));
+    assert.equal(a.discoveryCandidates, 0);
+    assert.deepEqual(a.seatModels, {});
+    assert.equal(existsSync(runsDir(env)), false, 'resolving a plan creates no run directory');
+  } finally {
+    await rc();
+    await cleanup();
+    await bins.cleanup();
+  }
 });

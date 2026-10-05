@@ -7,19 +7,15 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 import { loadConfig, resolveIdleMs } from '../config.mjs';
-import { resolveMaterial, hashMaterial } from '../material.mjs';
-import { resolveSeats, loadSeats } from '../seats.mjs';
-import { readQuota } from '../quota.mjs';
+import { hashMaterial } from '../material.mjs';
+import { loadSeats } from '../seats.mjs';
 import { decideRoute, STAGE_NAMES } from '../route.mjs';
-import { resolveBackend, runSeatCall } from '../backends/index.mjs';
+import { runSeatCall } from '../backends/index.mjs';
+import { resolveRunPlan } from '../runplan.mjs';
 import {
   LENSES,
   LENS_DIR,
   assignSeats,
-  buildPool,
-  cleanNamed,
-  discover,
-  loadPrior,
   probe,
   readStore,
   research,
@@ -64,7 +60,7 @@ import { computeDataLeaves, hostJudge, seatEntries } from '../bundle.mjs';
 import { acquireLock, readLock, pidAlive } from '../lockfile.mjs';
 import { runTable, normalizeId } from '../pipeline.mjs';
 import { siftFindings } from '../sift.mjs';
-import { stateDir, isInside, homeDir } from '../paths.mjs';
+import { stateDir, homeDir } from '../paths.mjs';
 import { SCHEMA_VERSION, ENGINE_VERSION } from '../version.mjs';
 import { ConfigError, RunError } from '../errors.mjs';
 
@@ -254,85 +250,25 @@ export async function runCommand(
   // -------------------------------------------------------------------------
   // Branch B: normal start or --detach
   // -------------------------------------------------------------------------
-  const stageName = flags.stage || 'code';
-  let material;
-  try {
-    material = await resolveMaterial({
-      target: flags.target,
-      base: flags.base,
-      cwd,
-    });
-  } catch (err) {
-    if (err instanceof ConfigError) throw err;
-    throw new ConfigError(`Failed to resolve material: ${err.message}`);
-  }
-
-  const { config, warnings: configWarnings } = loadConfig({
-    env,
-    repoRoot: material.root,
-    flags,
-    stderr,
-  });
-
-  const { chosen, noSeat, warnings: seatWarnings, stage: resolvedStage } = resolveSeats({
-    stage: stageName,
-    seatsFlag: flags.seats,
-    projectSeats: config.projectSeats,
-  });
-
-  for (const w of [...configWarnings, ...seatWarnings]) {
-    if (stderr?.write) stderr.write(`Warning: ${w}\n`);
-  }
-
-  const hostBackend = config.hostBackend || 'claude';
-  const swarmBackend = config.swarm?.backend || 'opencode';
-
-  let hostBackendObj = null;
-  try {
-    hostBackendObj = await resolveBackend(hostBackend, { config, env });
-  } catch {
-    hostBackendObj = null;
-  }
-
-  let swarmBackendObj = null;
-  try {
-    swarmBackendObj = await resolveBackend(swarmBackend, { config, env });
-  } catch {
-    swarmBackendObj = null;
-  }
-
-  const effectiveRoute = flags.route || config.route || 'auto';
-  let quota = { percent: null };
-  if (effectiveRoute === 'auto' || effectiveRoute === 'swarm') {
-    quota = await readQuota({ config, env, stateDir: stateDir(env) });
-  }
-
-  let requirementsText = '';
-  if (config.requirementsFile) {
-    try {
-      const reqPath = path.resolve(material.root, config.requirementsFile);
-      if (!isInside(reqPath, material.root)) {
-        stderr.write(
-          `warning: requirementsFile "${config.requirementsFile}" ignored: resolves outside repository root\n`
-        );
-      } else {
-        requirementsText = await fs.readFile(reqPath, 'utf8');
-      }
-    } catch {}
-  }
-  if (flags['requirements-file'] || flags.requirementsFile) {
-    try {
-      const reqPath = path.resolve(cwd, flags['requirements-file'] || flags.requirementsFile);
-      requirementsText = await fs.readFile(reqPath, 'utf8');
-    } catch (err) {
-      throw new ConfigError(`Cannot read requirements file: ${err.message}`);
-    }
-  }
-
-  // Step 1 of the section 10 G2-2 order. Discovery and the pool run whatever the route is, and
-  // they need no run directory, so a spawn run still records why the swarm was unreachable
-  // (G2-10). Nothing here calls a model.
-  const discovered = await discoverPool({ config, env, flags, swarmBackend, swarmBackendObj });
+  // Everything before the run directory comes from the one resolver that preflight also uses.
+  // Discovery runs whatever the route is, so a spawn run still records why the swarm was
+  // unreachable (G2-10). Nothing in it calls a model.
+  const plan = await resolveRunPlan(flags, { env, cwd, stderr });
+  const {
+    material,
+    config,
+    resolvedStage,
+    chosen,
+    noSeat,
+    hostBackend,
+    swarmBackend,
+    hostBackendObj,
+    swarmBackendObj,
+    quota,
+    requirementsText,
+    discovered,
+  } = plan;
+  const effectiveRoute = plan.routeRequested;
 
   const request = {
     // createRun stamps these too, but the run rewrites request.json after the route is decided,
@@ -671,49 +607,6 @@ const usesSwarm = (decision) => Object.values(decision?.stages || {}).includes('
 const latencyOf = (results, model) => results?.[model]?.latencyMs ?? Number.MAX_SAFE_INTEGER;
 
 const PROBE_PROMPT = 'Reply with one fenced JSON block and nothing else: {"ok":true}';
-
-// How old the models.dev prior is. A null means no prior was read at all, which is not the same
-// as a fresh one: with no prior, no discovered model can be proven free.
-async function priorAgeHours(dir) {
-  try {
-    const st = await fs.stat(path.join(dir, 'cache', 'models-dev.json'));
-    return Math.round(((Date.now() - st.mtimeMs) / 3600000) * 10) / 10;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Step 1 of the G2-2 order: discovery and the candidate pool. It reads the executable, the
- * models.dev prior, and the local store; it calls no model and it needs no run directory, so it
- * runs on every route and its notes reach `request.route.discovery.notes` whatever the route is.
- */
-async function discoverPool({ config, env, flags, swarmBackend, swarmBackendObj }) {
-  const notes = [];
-  const disc = swarmBackendObj
-    ? await discover(swarmBackend, { config, env })
-    : { candidates: [], notes: ['opencode executable not found'] };
-  notes.push(...(disc.notes || []));
-
-  const prior = await loadPrior({ stateDir: stateDir(env) });
-  const discovery = {
-    error: disc.error ?? null,
-    hint: disc.hint ?? null,
-    priorAgeHours: await priorAgeHours(stateDir(env)),
-  };
-  const store = await readStore(stateDir(env));
-  const named = cleanNamed(
-    [...(flags.model ? [].concat(flags.model) : []), ...(config.swarm?.models || [])],
-    disc.candidates
-  );
-  notes.push(...named.notes);
-  const built = buildPool({ candidates: disc.candidates, prior, store, named: named.named, probeResults: {} });
-  notes.push(...(built.notes || []));
-  if (built.pool.length === 0) {
-    notes.push('no model is both callable and free, and no model was named, so the swarm pool is empty');
-  }
-  return { notes, pool: built.pool, prior, named, discovery };
-}
 
 /**
  * Steps 3 to 6 of the G2-2 order: the sandbox tree, the context pack, the probe, research, and
