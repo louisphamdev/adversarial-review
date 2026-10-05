@@ -1,0 +1,36 @@
+{
+  "closingList": [
+    {
+      "n": 1,
+      "severity": "critical",
+      "sources": [
+        "seat-1-1"
+      ],
+      "item": "C1: closing item 1",
+      "doneWhen": "closing item 1 is done"
+    },
+    {
+      "n": 2,
+      "severity": "important",
+      "sources": [
+        "seat-2-1",
+        "seat-2-2",
+        "seat-2-3"
+      ],
+      "item": "C2: closing item 2",
+      "doneWhen": "closing item 2 is done"
+    },
+    {
+      "n": 3,
+      "severity": "important",
+      "sources": [
+        "seat-3-1",
+        "seat-3-2",
+        "seat-3-3",
+        "seat-3-4"
+      ],
+      "item": "C3: closing item 3",
+      "doneWhen": "closing item 3 is done"
+    }
+  ]
+}

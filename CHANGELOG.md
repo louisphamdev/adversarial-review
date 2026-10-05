@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.1.0] - Unreleased
 
 ### Changed
 - CAUTION: A plain `run` with no `--route` flag stops with exit code 2 when both routes are
@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `swarm.acknowledgeTraining: true` or the user answers the `privacy` decision.
 - CAUTION: Schema version 2. A 3.0.2 run paused with `--until find` cannot resume under 3.1.
 - A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
+- Patch-review and verify round records carry the engine version 3.1.0. A record from 3.0.2 does not count as a 3.1 round.
 
 ### Added
 - Live seat events in `events.jsonl`: `stage_start`, `call_start` with model and attempt,

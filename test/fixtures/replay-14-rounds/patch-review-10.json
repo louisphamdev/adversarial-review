@@ -1,0 +1,83 @@
+{
+  "seatResponses": [
+    {
+      "seat": "attacker",
+      "items": [
+        {
+          "id": "1",
+          "plan": "sound"
+        },
+        {
+          "id": "2",
+          "plan": "sound"
+        },
+        {
+          "id": "3",
+          "plan": "collides"
+        }
+      ]
+    },
+    {
+      "seat": "edge",
+      "items": [
+        {
+          "id": "1",
+          "plan": "sound"
+        },
+        {
+          "id": "2",
+          "plan": "sound"
+        },
+        {
+          "id": "3",
+          "plan": "sound"
+        }
+      ]
+    },
+    {
+      "seat": "tester",
+      "items": [
+        {
+          "id": "1",
+          "plan": "sound"
+        },
+        {
+          "id": "2",
+          "plan": "sound"
+        },
+        {
+          "id": "3",
+          "plan": "collides"
+        }
+      ]
+    },
+    {
+      "seat": "skeptic",
+      "items": [
+        {
+          "id": "1",
+          "plan": "sound"
+        },
+        {
+          "id": "2",
+          "plan": "sound"
+        },
+        {
+          "id": "3",
+          "plan": "collides"
+        }
+      ]
+    }
+  ],
+  "judge": {
+    "revise": [
+      {
+        "item": "demand on C2, C3",
+        "itemIds": [
+          "C2",
+          "C3"
+        ]
+      }
+    ]
+  }
+}

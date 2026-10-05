@@ -4,6 +4,13 @@ import { ConfigError } from './errors.mjs';
 export const DELTA_CAP = 12000;
 export const SECTION_LINE_CAP = 2000;
 
+// Normalizes finding, last-call, or seat identifiers: trim, lowercase, strip leading rt-.
+export function normalizeId(s) {
+  if (typeof s !== 'string') return '';
+  const trimmed = s.trim().toLowerCase();
+  return trimmed.replace(/^rt-/, '');
+}
+
 const ITEM_HEAD = /^##\s*C0*(\d+)\b/i;
 const CROSS_HEAD = /^##\s*Cross-cutting\s*$/i;
 const SHAPE =

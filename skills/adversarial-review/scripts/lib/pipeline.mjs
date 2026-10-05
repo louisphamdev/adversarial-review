@@ -13,13 +13,9 @@ import { buildPrompt } from './prompts.mjs';
 import { findingEvent } from './contain.mjs';
 import { compareSift } from './sift.mjs';
 import { loadSeats } from './seats.mjs';
+import { normalizeId } from './plan-sections.mjs';
 
-// Normalizes finding, last-call, or seat identifiers: trim, lowercase, strip leading rt-.
-export function normalizeId(s) {
-  if (typeof s !== 'string') return '';
-  const trimmed = s.trim().toLowerCase();
-  return trimmed.replace(/^rt-/, '');
-}
+export { normalizeId };
 
 // Relayed adversarial review table runner across all stages.
 export async function runTable({
