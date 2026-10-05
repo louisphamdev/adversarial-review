@@ -180,3 +180,21 @@ test('doctor --probe runs the canary on the fastest stored callable model and re
     await cleanup();
   }
 });
+
+test('doctor prints the lane cap and the parts that decide it', async () => {
+  const { env, home, cleanup } = await makeIsolatedEnv();
+  try {
+    const state = path.join(home, '.adversarial-review');
+    await mkdir(state, { recursive: true });
+    await writeFile(path.join(state, 'config.json'), JSON.stringify({
+      version: 3,
+      maxParallel: 1,
+      lanes: { reserveRamMb: 0, laneRamMb: 1 },
+    }));
+    const stdout = sink();
+    await runMain(['doctor'], { env, cwd: home, stdout, stderr: sink() });
+    assert.match(stdout.text, /^lane cap: 1 \(ramCap \d+, cpuCap \d+, maxParallel 1; memory \d+ MB\)$/m);
+  } finally {
+    await cleanup();
+  }
+});

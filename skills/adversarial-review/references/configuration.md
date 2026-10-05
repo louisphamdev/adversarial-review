@@ -128,6 +128,10 @@ The memory model that sizes the lane count.
 `reserveRamMb` is the free memory that the engine leaves for the operating system.
 `laneRamMb` is the memory that one lane uses. The measured maximum is 380 MB.
 The lane count is also limited by the logical core count and by the provider rate limits.
+On macOS, the free memory is the sum of the free, inactive, and speculative pages that `vm_stat` shows.
+The kernel gives inactive pages back on demand, but `os.freemem()` does not count them.
+If `vm_stat` fails, the engine uses `os.freemem()`.
+The `doctor` command shows the lane cap and its parts (`ramCap`, `cpuCap`, `maxParallel`) before a run starts.
 
 ### budget
 

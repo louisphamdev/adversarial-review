@@ -4,6 +4,7 @@ import {
   laneCap,
   createLanePool,
   readMachine,
+  parseVmStat,
   laneProvider,
   laneOutcome,
 } from '../skills/adversarial-review/scripts/lib/lanes.mjs';
@@ -133,4 +134,39 @@ test('readMachine never throws and returns numbers', () => {
   const m = readMachine();
   assert.ok(Number.isFinite(m.freeRamMb) && m.freeRamMb > 0);
   assert.ok(Number.isInteger(m.logicalCores) && m.logicalCores > 0);
+});
+
+// vm_stat from the macOS 3.1.0 report: 63 MB free, about 2.7 GB inactive.
+const VM_STAT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                4048.
+Pages active:                            301234.
+Pages inactive:                          173654.
+Pages speculative:                         1200.
+Pages throttled:                              0.
+Pages wired down:                         98765.
+Pages purgeable:                           5000.
+`;
+
+test('parseVmStat counts free, inactive and speculative pages, not purgeable', () => {
+  assert.equal(parseVmStat(VM_STAT), Math.floor(((4048 + 173654 + 1200) * 16384) / 1048576));
+});
+
+test('parseVmStat returns null for text it cannot read', () => {
+  assert.equal(parseVmStat(''), null);
+  assert.equal(parseVmStat('Pages free: 10.\n'), null);
+});
+
+test('readMachine on darwin reads reclaimable memory from vm_stat, not os.freemem', () => {
+  const m = readMachine({ platform: 'darwin', vmStat: () => VM_STAT, freemem: () => 63 * 1048576 });
+  assert.equal(m.freeRamMb, parseVmStat(VM_STAT));
+});
+
+test('readMachine on darwin falls back to os.freemem when vm_stat fails', () => {
+  const m = readMachine({ platform: 'darwin', vmStat: () => { throw new Error('ENOENT'); }, freemem: () => 63 * 1048576 });
+  assert.equal(m.freeRamMb, 63);
+});
+
+test('readMachine off darwin never runs vm_stat', () => {
+  const m = readMachine({ platform: 'linux', vmStat: () => { throw new Error('must not run'); }, freemem: () => 5000 * 1048576 });
+  assert.equal(m.freeRamMb, 5000);
 });

@@ -1,5 +1,6 @@
 // Lane count from the machine and from provider rate limits (spec 3.1-A, A11).
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 
 const posInt = (v) => (Number.isInteger(v) && v > 0 ? v : null);
 
@@ -28,9 +29,31 @@ export function laneOutcome(res) {
   return res?.ok ? 'ok' : 'error';
 }
 
-export function readMachine() {
+// Purgeable pages already sit in the active and inactive counts, so adding them counts twice.
+export function parseVmStat(text) {
+  const pageSize = Number(/page size of (\d+) bytes/.exec(text)?.[1]);
+  const pages = (name) => Number(new RegExp(`^Pages ${name}:\\s+(\\d+)`, 'm').exec(text)?.[1]);
+  const total = pages('free') + pages('inactive') + pages('speculative');
+  if (!(pageSize > 0) || !Number.isFinite(total)) return null;
+  return Math.floor((total * pageSize) / (1024 * 1024));
+}
+
+const readVmStat = () => execFileSync('/usr/bin/vm_stat', { encoding: 'utf8', timeout: 5000 });
+
+// os.freemem() on macOS counts only free pages; the kernel gives inactive pages back on demand.
+function freeRamMb({ platform, vmStat, freemem }) {
+  const free = Math.floor(freemem() / (1024 * 1024));
+  if (platform !== 'darwin') return free;
   try {
-    return { freeRamMb: Math.floor(os.freemem() / (1024 * 1024)), logicalCores: os.cpus().length || 4 };
+    return Math.max(free, parseVmStat(vmStat()) ?? 0);
+  } catch {
+    return free;
+  }
+}
+
+export function readMachine({ platform = process.platform, vmStat = readVmStat, freemem = os.freemem } = {}) {
+  try {
+    return { freeRamMb: freeRamMb({ platform, vmStat, freemem }), logicalCores: os.cpus().length || 4 };
   } catch {
     return { freeRamMb: 4096, logicalCores: 4 };
   }

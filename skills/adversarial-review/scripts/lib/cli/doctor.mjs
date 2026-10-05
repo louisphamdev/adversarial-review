@@ -13,6 +13,7 @@ import { readLock, pidAlive } from '../lockfile.mjs';
 import { readStore } from '../catalog.mjs';
 import { makeLaneCall } from '../lane.mjs';
 import { runCanary } from '../canary.mjs';
+import { laneCap, readMachine } from '../lanes.mjs';
 
 const MIN_VERSIONS = {
   claude: '2.1.248',
@@ -200,6 +201,12 @@ export async function doctorCommand(
   stdout.write('isolation: sandbox copy + permission profile\n');
   stdout.write('lanes: standalone, isolated config (no global MCP, instructions, or plugins)\n');
   stdout.write(`os-isolation: ${await detectOsIsolation(env)}\n`);
+  const machine = readMachine();
+  const { parts } = laneCap({ machine, config, callsReady: Infinity });
+  const maxParallel = Number.isFinite(parts.maxParallel) ? parts.maxParallel : 'none';
+  stdout.write(
+    `lane cap: ${Math.min(parts.ramCap, parts.cpuCap, parts.maxParallel)} (ramCap ${parts.ramCap}, cpuCap ${parts.cpuCap}, maxParallel ${maxParallel}; memory ${machine.freeRamMb} MB)\n`
+  );
   const stale = await removeStaleSandboxKeys(env);
   stdout.write(
     `stale sandbox/xdg removed: ${stale.removed}${stale.held ? ` (${stale.held} held by a live run)` : ''}\n`

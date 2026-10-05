@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- On macOS, the lane count was 1 on a machine with free memory in inactive pages, so the FIND
+  seats ran one after the other. `os.freemem()` on macOS counts only free pages. The engine now
+  reads the free, inactive, and speculative pages from `vm_stat`. If `vm_stat` fails, the engine
+  uses `os.freemem()`.
+
+### Added
+- `doctor` shows the lane cap and its parts: `ramCap`, `cpuCap`, `maxParallel`, and the free memory.
+
 ## [3.1.0] - 2026-10-05
 
 ### Changed
