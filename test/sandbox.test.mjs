@@ -61,6 +61,25 @@ test('createSandbox copies tracked files, skips secrets, missing paths, and rese
   }
 });
 
+// The sandbox tree goes to free providers, so it uses the same path rule as the Jev client:
+// every path part counts, in any case, not only the base name.
+test('createSandbox leaves out secret paths by every part, in any case', async () => {
+  const secrets = ['.ssh/config', '.credentials.json', 'credentials', 'hosts.yml', 'gh/HOSTS.YML', 'home/.SSH/known_hosts'];
+  const files = { 'src/a.js': 'a' };
+  for (const s of secrets) files[s] = 'SECRET';
+  const repo = await makeTempRepo({ files });
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    const r = await createSandbox({ repoRoot: repo.root, runDir, material: { kind: 'file', text: '' }, config: {} });
+    for (const s of secrets) assert.ok(!existsSync(path.join(r.treeDir, s)), s);
+    assert.ok(existsSync(path.join(r.treeDir, 'src', 'a.js')));
+    assert.equal(r.skippedSecrets, secrets.length);
+  } finally {
+    await repo.cleanup();
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
 test('createSandbox copies an untracked file that the diff material adds', async () => {
   const repo = await makeTempRepo({ files: { 'a.js': '1' } });
   const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));

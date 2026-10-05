@@ -2,7 +2,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { runChild as defaultRunChild } from './proc.mjs';
-import { isSecretName } from './sandbox.mjs';
+import { isSecretRel } from './sandbox.mjs';
 import { materialDiffPaths, containedPath } from './diff-paths.mjs';
 import { safeGitArgs } from './integrity.mjs';
 
@@ -34,7 +34,7 @@ export async function buildContextPack({ material, treeDir, repoRoot, packChars 
     sections.push(block); used += sep + block.length; return true;
   };
   const readTree = async (rel) => {
-    if (isSecretName(path.posix.basename(rel))) { skippedSecrets++; return null; }
+    if (isSecretRel(rel)) { skippedSecrets++; return null; }
     const real = await containedPath(treeDir, rel);
     if (!real) return null;
     try { return await fs.readFile(real, 'utf8'); } catch { return null; }
@@ -58,7 +58,7 @@ export async function buildContextPack({ material, treeDir, repoRoot, packChars 
       const hits = [];
       for (const line of res.stdout.split('\n').filter(Boolean).slice(0, 20)) {
         const rel = line.split(':')[0];
-        if (isSecretName(path.posix.basename(rel))) { skippedSecrets++; continue; }
+        if (isSecretRel(rel)) { skippedSecrets++; continue; }
         hits.push(line.slice(0, 400));
       }
       if (hits.length && !add(`callers of ${name}`, hits.join('\n'))) break;

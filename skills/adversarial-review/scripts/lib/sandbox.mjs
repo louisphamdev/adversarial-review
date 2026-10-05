@@ -6,6 +6,7 @@ import { runChild as defaultRunChild } from './proc.mjs';
 import { safeGitArgs, listIntegrityPaths } from './integrity.mjs';
 import { writeFileAtomic } from './fsx.mjs';
 import { materialDiffPaths, containedPath, decodeGitPath } from './diff-paths.mjs';
+import { isSecretPath } from './jev.mjs';
 
 export { decodeGitPath };
 
@@ -18,6 +19,9 @@ const SECRET_RES = [
 ];
 
 export const isSecretName = (base) => SECRET_RES.some((re) => re.test(String(base).toLowerCase()));
+
+// The tree and the pack go to free providers, so they also apply the Jev path rule to every part.
+export const isSecretRel = (rel) => isSecretName(path.posix.basename(String(rel).replace(/\\/g, '/'))) || isSecretPath(rel);
 
 // A permission resource cannot escape these, so a run path that holds one disables the swarm.
 export const hasGlobChars = (p) => /[*?[\]{}]/.test(String(p));
@@ -47,7 +51,7 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
   let skippedOutside = 0;
   for (const rel of all) {
     if (rel.split('/')[0].toLowerCase() === '.ar-review') { skippedReserved++; continue; }
-    if (isSecretName(path.posix.basename(rel))) { skippedSecrets++; continue; }
+    if (isSecretRel(rel)) { skippedSecrets++; continue; }
     let st;
     try {
       st = await fs.lstat(path.join(repoRoot, rel));

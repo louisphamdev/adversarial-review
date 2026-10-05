@@ -121,7 +121,7 @@ export async function askJev({ url, model, key, state, questions, fetch: f = glo
 
 // Path segments and value shapes that never leave the machine (spec B8, shared with buildExcerpt).
 export const SECRET_SEGMENTS = new Set(['.git', '.ssh', '.aws', '.gnupg']);
-export const SECRET_BASENAME = /^(\.env.*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|.*\.tfstate.*|credentials.*|id_rsa.*|id_ed25519.*|\.npmrc|\.netrc|\.pgpass)$/i;
+export const SECRET_BASENAME = /^(\.env.*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|.*\.tfstate.*|\.?credentials.*|hosts\.yml|id_rsa.*|id_ed25519.*|\.npmrc|\.netrc|\.pgpass)$/i;
 const SECRET_VALUE = /(sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._-]{16,}|[A-Fa-f0-9]{40,})/;
 
 export function isSecretPath(p) {

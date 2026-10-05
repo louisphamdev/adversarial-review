@@ -47,7 +47,7 @@ describe('capText', () => {
 
 describe('secret patterns', () => {
   it('match every segment in any case', () => {
-    for (const p of ['.ENV', 'config/credentials.json', 'a\\.ssh\\config', 'x/.git/HEAD', 'deploy/id_rsa.pub', 'k.PEM']) assert.equal(isSecretPath(p), true, p);
+    for (const p of ['.ENV', 'config/credentials.json', 'a\\.ssh\\config', 'x/.git/HEAD', 'deploy/id_rsa.pub', 'k.PEM', 'home/.credentials.json', 'credentials', 'gh/Hosts.yml']) assert.equal(isSecretPath(p), true, p);
     assert.equal(isSecretPath('lib/env.mjs'), false);
   });
   it('remove a line with a secret value or path', () => {

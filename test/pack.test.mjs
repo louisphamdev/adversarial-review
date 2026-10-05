@@ -28,6 +28,23 @@ test('a tracked secret that holds a changed identifier never reaches pack.txt', 
   } finally { await repo.cleanup(); await rm(runDir, { recursive: true, force: true }); }
 });
 
+// The callers come from `git grep` in the repository, not from the tree, so they need the same
+// secret path rule as the tree itself.
+test('a tracked file under a secret path never reaches pack.txt through the callers', async () => {
+  const repo = await makeTempRepo({ files: { 'a.js': 'export function backoffDelay(n) { return n; }\n', 'hosts.yml': 'backoffDelay: HOSTS_SECRET\n', '.ssh/config': 'backoffDelay SSH_SECRET\n', 'b.js': 'backoffDelay(2);\n' } });
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    const diff = 'diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1 @@\n-export function backoffDelay(n) { return n; }\n+export function backoffDelay(n) { return n * 2; }\n';
+    const material = { kind: 'diff', text: diff };
+    const { treeDir } = await createSandbox({ repoRoot: repo.root, runDir, material, config: {} });
+    const r = await buildContextPack({ material, treeDir, repoRoot: repo.root, packChars: 60000 });
+    const text = await readFile(r.path, 'utf8');
+    assert.ok(text.includes('b.js'), 'the caller is in the pack');
+    assert.ok(!text.includes('HOSTS_SECRET'));
+    assert.ok(!text.includes('SSH_SECRET'));
+  } finally { await repo.cleanup(); await rm(runDir, { recursive: true, force: true }); }
+});
+
 // The pack goes into every swarm prompt, so a path read from the material must stay in the tree.
 test('a forged +++ line in a hunk never brings an outside file into pack.txt', async () => {
   const repo = await makeTempRepo({ files: { 'a.js': 'export const a = 1;\n' } });
