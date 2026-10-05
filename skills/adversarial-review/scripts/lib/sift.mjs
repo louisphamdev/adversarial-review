@@ -1,4 +1,7 @@
 import { readFile as defaultReadFile } from 'node:fs/promises';
+import { findKey, resolveJevTarget, DEFAULT_URL, DEFAULT_MODEL, TYPESAFE_API_URL, TYPESAFE_DEFAULT_MODEL } from './jev.mjs';
+
+export { findKey, DEFAULT_URL, DEFAULT_MODEL, TYPESAFE_API_URL, TYPESAFE_DEFAULT_MODEL };
 
 // Criteria legend is sent with each question; keep labels concise to save tokens.
 export const VERDICTS = {
@@ -11,10 +14,6 @@ export const VERDICTS = {
 export const SEVERITY = ['advisory', 'should fix', 'blocks release'];
 
 export const MAX_STATE_CHARS = 100000;
-export const DEFAULT_URL = 'https://openrouter.ai/api/alpha/decisions';
-export const DEFAULT_MODEL = 'typesafe/jev-1.13';
-export const TYPESAFE_API_URL = 'https://api.typesafe.ai/v1/systemone';
-export const TYPESAFE_DEFAULT_MODEL = 'jev-latest';
 export const DEFAULT_TIMEOUT_MS = 60000;
 export const DEFAULT_LOW_CONFIDENCE = 0.6;
 
@@ -38,42 +37,6 @@ export function buildQuestions(findings) {
     questions[`${f.id}_severity`] = { type: 'score', instructions: `${f.id} severity`, criteria: SEVERITY };
   }
   return questions;
-}
-
-// Env var takes precedence over keyFile; empty or whitespace-only values count as absent.
-export async function findKey(config = {}, env = process.env, readFile = defaultReadFile) {
-  const siftCfg = (config && 'sift' in config && typeof config.sift === 'object') ? config.sift : (config || {});
-  const envName = siftCfg.apiKeyEnv || 'JEV_API_KEY';
-  const fromEnv = env?.[envName];
-  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
-    return fromEnv.trim();
-  }
-  // Check TYPESAFE_API_KEY fallback if custom envName was not explicitly configured
-  if (!siftCfg.apiKeyEnv && env?.TYPESAFE_API_KEY && typeof env.TYPESAFE_API_KEY === 'string' && env.TYPESAFE_API_KEY.trim().length > 0) {
-    return env.TYPESAFE_API_KEY.trim();
-  }
-  if (siftCfg.keyFile && typeof readFile === 'function') {
-    try {
-      const text = await readFile(siftCfg.keyFile, 'utf8');
-      const prefix = `${envName}=`;
-      const fallbackPrefix = 'TYPESAFE_API_KEY=';
-      let fallbackKey = null;
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trimStart();
-        if (trimmed.startsWith(prefix)) {
-          const val = trimmed.slice(prefix.length).trim();
-          if (val.length > 0) return val;
-        } else if (!siftCfg.apiKeyEnv && trimmed.startsWith(fallbackPrefix)) {
-          const val = trimmed.slice(fallbackPrefix.length).trim();
-          if (val.length > 0) fallbackKey = val;
-        }
-      }
-      if (fallbackKey) return fallbackKey;
-    } catch {
-      // Missing or unreadable key file counts as absent key.
-    }
-  }
-  return null;
 }
 
 // Clusters findings by file/line or claim to detect duplicate issues across seats.
@@ -160,10 +123,7 @@ export async function siftFindings({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const signal = controller.signal;
-    const isNativeTypeSafe = (!siftCfg.url && !siftCfg.model && (env?.TYPESAFE_API_KEY && !env?.JEV_API_KEY)) ||
-                             (siftCfg.url && siftCfg.url.includes('typesafe.ai'));
-    const url = siftCfg.url || (isNativeTypeSafe ? TYPESAFE_API_URL : DEFAULT_URL);
-    const model = siftCfg.model || (isNativeTypeSafe ? TYPESAFE_DEFAULT_MODEL : DEFAULT_MODEL);
+    const { url, model } = resolveJevTarget(siftCfg, env);
     const questions = buildQuestions(findings);
 
     let res;
