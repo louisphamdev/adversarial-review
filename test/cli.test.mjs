@@ -85,6 +85,22 @@ describe('cli unit and command tests', () => {
       assert.ok(io.stdout.text.includes('run'));
     });
 
+    it('watch is routed: usage line in help, bad --since exits 2', async () => {
+      const help = createMockIO();
+      await main(['--help'], help);
+      assert.ok(help.stdout.text.includes('adversarial-review watch <run-dir> [--since <n>] [--timeout <sec>] [--json]'));
+      const iso = await makeIsolatedEnv();
+      try {
+        const io = createMockIO();
+        const runDir = path.join(iso.home, '.adversarial-review', 'runs', 'r', 'x');
+        const code = await main(['watch', runDir, '--since', 'abc'], { env: iso.env, ...io });
+        assert.equal(code, 2);
+        assert.match(io.stderr.text, /--since/);
+      } finally {
+        await iso.cleanup();
+      }
+    });
+
     it('unknown command returns 2', async () => {
       const io = createMockIO();
       const code = await main(['foobar'], io);

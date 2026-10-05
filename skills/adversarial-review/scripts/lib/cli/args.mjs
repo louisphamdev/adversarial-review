@@ -30,6 +30,11 @@ export const COMMAND_OPTIONS = {
     latest: { type: 'boolean' },
     json: { type: 'boolean' },
   },
+  watch: {
+    since: { type: 'string' },
+    timeout: { type: 'string' },
+    json: { type: 'boolean' },
+  },
   'patch-review': {
     plan: { type: 'string' },
     json: { type: 'boolean' },

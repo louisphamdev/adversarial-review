@@ -2,6 +2,7 @@
 import { parseArgs } from './args.mjs';
 import { runCommand } from './run.mjs';
 import { statusCommand } from './status.mjs';
+import { watchCommand } from './watch.mjs';
 import { patchReviewCommand, verifyCommand } from './closing.mjs';
 import { siftCommand } from './sift.mjs';
 import { recommendCommand } from './recommend.mjs';
@@ -20,6 +21,7 @@ function printHelp(stdout) {
 Usage:
   adversarial-review run [--target P] [--base R] [--stage S] [--seats a,b] [--requirements-file F] [--backend B] [--route R] [--allow-gaps] [--until find] [--detach] [--resume D [--allow-drift]] [--json]
   adversarial-review status [<run-dir> | --latest] [--json]
+  adversarial-review watch <run-dir> [--since <n>] [--timeout <sec>] [--json]
   adversarial-review patch-review <run-dir> --plan <file> [--json]
   adversarial-review verify <run-dir> [--base <ref>] [--json]
   adversarial-review sift --material <file> --findings <file> [--out <file>] [--json]
@@ -78,6 +80,9 @@ export async function main(
 
       case 'status':
         return await statusCommand(flags, positionals, io);
+
+      case 'watch':
+        return await watchCommand(flags, positionals, io);
 
       case 'patch-review':
         return await withExitCleanup({ stderr }, () => patchReviewCommand(flags, positionals, io));
