@@ -105,6 +105,14 @@ Example of the JSON shape. The values are not a finding. Do not copy them.
       "id": "1",
       "reason": "Example reason.",
       "plan": "sound"
+    },
+    {
+      "id": "cross",
+      "reason": "Example: the shared change also moves the check of item 2.",
+      "plan": "collides",
+      "affects": [
+        "2"
+      ]
     }
   ]
 }
@@ -145,6 +153,12 @@ Your report is your final message. Never write the report to a file.
           },
           "collidesWith": {
             "type": "string"
+          },
+          "affects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [

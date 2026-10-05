@@ -13,7 +13,9 @@ import { buildPrompt } from './prompts.mjs';
 import { findingEvent } from './contain.mjs';
 import { compareSift } from './sift.mjs';
 import { loadSeats } from './seats.mjs';
-import { normalizeId } from './plan-sections.mjs';
+import { normalizeId, itemIdsOf, parsePlan, sectionDelta, normalizePlanText } from './plan-sections.mjs';
+import { deriveLedger, applyRound, selectRegression, countsAsRound, versionAtLeast, closingListHashOf } from './ledger.mjs';
+import { ENGINE_VERSION } from './version.mjs';
 
 export { normalizeId };
 
@@ -532,83 +534,145 @@ export async function runTable({
   };
 }
 
-export async function runPatchReview({ state = {}, plan = '', runAgent }) {
-  const closingList = state.ruling?.closingList || [];
-  const candidateSeats = new Set();
+function ownerSeatsOf(item) {
+  return [...new Set((item?.sources || []).map((s) => normalizeId(s).split('-')[0]).filter(Boolean))];
+}
 
-  for (const item of closingList) {
-    if (Array.isArray(item.sources)) {
-      for (const src of item.sources) {
-        const owner = normalizeId(src).split('-')[0];
-        if (owner) candidateSeats.add(owner);
-      }
+export async function runPatchReview({ state = {}, plan = '', runAgent, records = [], config = {}, router = null, maxRounds = 3 }) {
+  const closingList = state.ruling?.closingList || [];
+  const findings = state.findings || [];
+  const stage = state.request?.stage || 'code';
+  const { ids, byId } = itemIdsOf(closingList);
+  const ledger = deriveLedger(records, closingList, findings, stage);
+  const counted = records.filter(countsAsRound);
+  // Baseline: the latest record that is not judgeDead and carries sections (counted or skipped).
+  const baseline = records.filter((r) => r && !r.judgeDead && r.sections && versionAtLeast(r.engineVersion)).at(-1) || null;
+  const baseSections = baseline?.sections || {};
+  const openIds = ids.filter((id) => ledger.items[id].state === 'open');
+  const planText = normalizePlanText(plan);
+  const samePlan = baseline && normalizePlanText(baseline.plan) === planText;
+  const describeOpen = () =>
+    openIds.map((id) => `${id} open: ${ledger.items[id].demands.filter((d) => d.status !== 'met').map((d) => d.text).join(' | ') || ledger.items[id].lastObjections.join(' | ')}`).join('\n');
+
+  if (closingList.length === 0) {
+    const record = { stage: 'patch-review', round: counted.length, skipped: 'no-items', decision: 'APPLY', engineVersion: ENGINE_VERSION };
+    return { decision: 'APPLY', exitCode: 0, record, ledger, message: 'No closing items: nothing to review.' };
+  }
+  // Step 2 runs before the cap: the same plan at the cap is still "already applied".
+  if (baseline && openIds.length === 0 && samePlan) {
+    return { decision: 'APPLY', exitCode: 0, record: null, ledger, message: 'Plan already applied: every item is settled.' };
+  }
+  if (counted.length >= maxRounds) {
+    const message = openIds.length
+      ? `Round cap ${maxRounds} reached. Open items:\n${describeOpen()}`
+      : `Round cap ${maxRounds} reached. Raise --max-rounds to review a changed plan.`;
+    return { decision: 'REVISE', exitCode: 1, record: null, ledger, message };
+  }
+
+  const round = counted.length + 1;
+  const parsed = parsePlan(planText, ids, { mustHave: ids });
+  const sections = parsed.sections;
+  const delta = baseline ? sectionDelta(baseSections, sections) : { changed: [], changedLines: {}, text: '', cut: false };
+  const threshold = typeof config.sift?.routerThreshold === 'number' ? config.sift.routerThreshold : 0.3;
+  const reg = baseline
+    ? await selectRegression(ledger, delta, router, { threshold })
+    : { list: [], router: 'not-needed', fallbackIds: [] };
+
+  const reviewedIds = [...new Set([...openIds, ...reg.list.map((e) => e.id)])];
+  const base = {
+    stage: 'patch-review',
+    round,
+    plan: planText,
+    preamble: parsed.preamble,
+    sections,
+    closingListHash: closingListHashOf(closingList),
+    engineVersion: ENGINE_VERSION,
+  };
+  if (reviewedIds.length === 0) {
+    const record = { ...base, skipped: 'no-open-items', decision: 'APPLY', delta, regressionList: [], router: reg.router };
+    return { decision: 'APPLY', exitCode: 0, record, ledger, message: 'No open item and no regression to review.' };
+  }
+
+  const regressionList = reg.list.map((e) => ({ id: e.id, doneWhen: byId[e.id]?.doneWhen || '', sectionText: sections[e.id] || '', reason: e.reason }));
+  const openItems = openIds.map((id) => ({
+    id,
+    item: byId[id]?.item || '',
+    doneWhen: byId[id]?.doneWhen || '',
+    priorDemands: [
+      ...ledger.items[id].demands.filter((d) => d.status !== 'met').map((d) => d.text),
+      ...ledger.items[id].lastObjections,
+    ],
+    sectionText: sections[id] || '',
+  }));
+
+  const askedFor = new Map();
+  for (const id of reviewedIds) {
+    for (const seatKey of [...ownerSeatsOf(byId[id]), 'skeptic']) {
+      if (!askedFor.has(seatKey)) askedFor.set(seatKey, []);
+      askedFor.get(seatKey).push(id);
     }
   }
-  candidateSeats.add('skeptic');
 
-  const seatKeys = Array.from(candidateSeats);
   const seatsMap = loadSeats();
+  // Round 1 (no baseline) is a first pass. Later rounds pass ctx.reReview (Part D renders it).
+  const ctxFor = (forIds) =>
+    !baseline
+      ? { plan: planText, closingList: closingList.filter((_, i) => forIds.includes(ids[i])) }
+      : {
+          reReview: {
+            pass: 're-review',
+            openItems: openItems.filter((o) => forIds.includes(o.id)),
+            regressionList: regressionList.filter((r) => forIds.includes(r.id)),
+            delta: delta.text,
+            deltaCut: delta.cut,
+            round,
+          },
+        };
 
   const seatResponses = await Promise.all(
-    seatKeys.map(async (key) => {
+    [...askedFor.entries()].map(async ([key, forIds]) => {
       const seat = seatsMap.get(key) || { key, body: '', lens: '' };
-      const prompt = buildPrompt('PATCH_SEAT', {
-        seat,
-        plan,
-        closingList,
-        state,
-      });
+      const prompt = buildPrompt('PATCH_SEAT', { seat, state, ...ctxFor(forIds) });
       const res = await runAgent({ stage: 'PATCH_SEAT', seat, prompt, schema: PATCH_SEAT });
-      return {
-        seat: key,
-        items: res?.ok && Array.isArray(res.value?.items) ? res.value.items : [],
-        error: res?.ok ? null : res?.error,
-      };
+      const ok = res?.ok && Array.isArray(res.value?.items);
+      return { seat: key, askedFor: forIds, items: ok ? res.value.items : null, error: ok ? null : res?.error || 'no-answer' };
     })
   );
 
   const judgeSeat = seatsMap.get('judge') || { key: 'judge', body: '', lens: 'adjudicator' };
-  const judgePrompt = buildPrompt('PATCH_JUDGE', {
-    seat: judgeSeat,
-    plan,
-    seatResponses,
-    closingList,
-    state,
-  });
+  const judgePrompt = buildPrompt('PATCH_JUDGE', { seat: judgeSeat, state, ...ctxFor(reviewedIds), seatResponses });
+  const judgeRes = await runAgent({ stage: 'PATCH_JUDGE', seat: judgeSeat, prompt: judgePrompt, schema: PATCH_JUDGE });
+  const record = { ...base, reviewedIds, delta, regressionList, router: reg.router, fallbackIds: reg.fallbackIds, seatResponses };
 
-  const judgeRes = await runAgent({
-    stage: 'PATCH_JUDGE',
-    seat: judgeSeat,
-    prompt: judgePrompt,
-    schema: PATCH_JUDGE,
-  });
-
-  if (!judgeRes || !judgeRes.ok || !judgeRes.value) {
+  if (!judgeRes?.ok || !judgeRes.value) {
     return {
       decision: 'REVISE',
       exitCode: 3,
-      record: {
-        stage: 'patch-review',
-        plan,
-        seatResponses,
-        judge: null,
-        error: judgeRes?.error || 'judge failed',
-      },
+      record: { ...record, judge: null, judgeDead: true, error: judgeRes?.error || 'judge failed' },
+      ledger,
+      message: 'The judge died. The round does not count. Run patch-review again.',
     };
   }
 
-  const decision = judgeRes.value.decision === 'APPLY' ? 'APPLY' : 'REVISE';
-  const exitCode = decision === 'APPLY' ? 0 : 1;
-
+  const fullRecord = { ...record, judge: judgeRes.value };
+  const nextLedger = applyRound(ledger, fullRecord);
+  fullRecord.decision = nextLedger.last.decision;
+  fullRecord.blocking = nextLedger.last.blocking;
+  fullRecord.advisory = nextLedger.last.advisory;
+  fullRecord.itemStates = Object.fromEntries(ids.map((id) => [id, nextLedger.items[id].state]));
   return {
-    decision,
-    exitCode,
-    record: {
-      stage: 'patch-review',
-      plan,
-      seatResponses,
-      judge: judgeRes.value,
-    },
+    decision: fullRecord.decision,
+    exitCode: fullRecord.decision === 'APPLY' ? 0 : 1,
+    record: fullRecord,
+    ledger: nextLedger,
+    message: ids
+      .map((id) => {
+        const it = nextLedger.items[id];
+        if (it.state !== 'open') return `${id} ${it.state}`;
+        const why = it.demands.filter((d) => d.status !== 'met').map((d) => d.text);
+        return `${id} open: ${(why.length ? why : it.lastObjections).join(' | ')}`;
+      })
+      .join('\n'),
   };
 }
 

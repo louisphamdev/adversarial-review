@@ -38,6 +38,7 @@ export const COMMAND_OPTIONS = {
   },
   'patch-review': {
     plan: { type: 'string' },
+    'max-rounds': { type: 'string' },
     json: { type: 'boolean' },
   },
   verify: {

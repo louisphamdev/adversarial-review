@@ -78,7 +78,12 @@ export const EXAMPLES = {
   TABLE: { positions: [{ id: 'example-1', reason: 'Example reason with evidence.', position: 'pass' }], missedBetweenLenses: [], fixRisks: [] },
   REBUTTAL: { id: 'example-1', rebuttal: 'Example answer to each challenger.', standsFirm: true },
   LASTCALL: { notYetSaid: [] },
-  PATCH_SEAT: { items: [{ id: '1', reason: 'Example reason.', plan: 'sound' }] },
+  PATCH_SEAT: {
+    items: [
+      { id: '1', reason: 'Example reason.', plan: 'sound' },
+      { id: 'cross', reason: 'Example: the shared change also moves the check of item 2.', plan: 'collides', affects: ['2'] },
+    ],
+  },
   VERIFY_SEAT: { items: [{ id: 'example-1', evidence: 'example/path.js:12', status: 'met' }], newInDiff: [] },
 };
 

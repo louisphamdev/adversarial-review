@@ -9,6 +9,16 @@ import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
 import { modelsCommand } from '../skills/adversarial-review/scripts/lib/cli/models.mjs';
 import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 import { ENGINE_VERSION } from '../skills/adversarial-review/scripts/lib/version.mjs';
+import { readRecords } from '../skills/adversarial-review/scripts/lib/cli/closing.mjs';
+
+// A run directory under the isolated state root, with a ruling of one closing item.
+async function makeRunDirWithRuling(home) {
+  const runDir = path.join(home, '.adversarial-review', 'runs', 'repo', 'run1');
+  await fs.mkdir(path.join(runDir, 'stages'), { recursive: true });
+  const ruling = { verdict: 'blocked', closingList: [{ n: 1, item: 'x', severity: 'important', doneWhen: 'y', sources: [] }], coverage: '' };
+  await fs.writeFile(path.join(runDir, 'stages', 'ruling.json'), JSON.stringify(ruling));
+  return runDir;
+}
 
 function createMockIO({ stdinData = '' } = {}) {
   let out = '';
@@ -301,6 +311,63 @@ describe('cli unit and command tests', () => {
         await fs.mkdir(dummyRun, { recursive: true });
         const code = await main(['patch-review', dummyRun], { env: iso.env, ...io });
         assert.equal(code, 2);
+      } finally {
+        await iso.cleanup();
+      }
+    });
+
+    it('patch-review and verify refuse a lock whose owner pid is alive, even when it is old (C8)', async () => {
+      const iso = await makeIsolatedEnv();
+      const { spawn } = await import('node:child_process');
+      const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+      try {
+        const dummyRun = await makeRunDirWithRuling(iso.home);
+        const lockPath = path.join(dummyRun, 'lock');
+        await fs.writeFile(lockPath, JSON.stringify({ pid: child.pid, token: 't', createdAt: Date.now() - 3600 * 1000 }));
+        const old = new Date(Date.now() - 3600 * 1000);
+        await fs.utimes(lockPath, old, old);
+        const planFile = path.join(iso.home, 'plan.md');
+        await fs.writeFile(planFile, '## C1\nx\n');
+        const io1 = createMockIO();
+        assert.equal(await main(['patch-review', dummyRun, '--plan', planFile], { env: iso.env, ...io1 }), 3);
+        assert.match(io1.stderr.text, /owner still alive/);
+        const io2 = createMockIO();
+        assert.equal(await main(['verify', dummyRun], { env: iso.env, ...io2 }), 3);
+        assert.match(io2.stderr.text, /owner still alive/);
+        assert.equal(JSON.parse(await fs.readFile(lockPath, 'utf8')).pid, child.pid, 'the lock was not taken over');
+      } finally {
+        child.kill();
+        await iso.cleanup();
+      }
+    });
+
+    it('patch-review rejects --max-rounds 0 with exit 2', async () => {
+      const iso = await makeIsolatedEnv();
+      try {
+        const dummyRun = await makeRunDirWithRuling(iso.home);
+        const planFile = path.join(iso.home, 'plan.md');
+        await fs.writeFile(planFile, '## C1\nx\n');
+        const io = createMockIO();
+        const code = await main(['patch-review', dummyRun, '--plan', planFile, '--max-rounds', '0'], { env: iso.env, ...io });
+        assert.equal(code, 2);
+        assert.match(io.stderr.text, /max-rounds/);
+      } finally {
+        await iso.cleanup();
+      }
+    });
+
+    it('readRecords reads in numeric order and refuses a gap or an unreadable record', async () => {
+      const iso = await makeIsolatedEnv();
+      try {
+        const dummyRun = await makeRunDirWithRuling(iso.home);
+        const stages = path.join(dummyRun, 'stages');
+        for (const n of [1, 2, 10, 3, 4, 5, 6, 7, 8, 9]) await fs.writeFile(path.join(stages, `patch-review-${n}.json`), JSON.stringify({ n }));
+        assert.deepEqual((await readRecords(dummyRun, 'patch-review')).map((r) => r.n), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        await fs.writeFile(path.join(stages, 'verify-1.json'), '{}');
+        await fs.writeFile(path.join(stages, 'verify-3.json'), '{}');
+        await assert.rejects(() => readRecords(dummyRun, 'verify'), (e) => e.exitCode === 2 && /verify-3\.json/.test(e.message));
+        await fs.writeFile(path.join(stages, 'verify-2.json'), '{not json');
+        await assert.rejects(() => readRecords(dummyRun, 'verify'), (e) => e.exitCode === 2 && /verify-2\.json/.test(e.message));
       } finally {
         await iso.cleanup();
       }

@@ -858,116 +858,164 @@ describe('pipeline module', () => {
   });
 
   describe('runPatchReview', () => {
-    it('calls owner seat and skeptic, then judge approves -> exitCode 0', async () => {
+    const state = {
+      request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
+      ruling: {
+        closingList: [
+          { n: 1, item: 'Fix `parseToken`', doneWhen: 'd1', sources: ['breaker-1'] },
+          { n: 2, item: 'Fix limits', doneWhen: 'd2', sources: ['edge-1'] },
+        ],
+      },
+      findings: [
+        { id: 'breaker-1', seat: 'breaker', file: 'lib/auth.mjs', line: '10', evidence: 'lib/auth.mjs:10', title: 't' },
+        { id: 'edge-1', seat: 'edge', file: 'lib/limits.mjs', line: '5', evidence: 'lib/limits.mjs:5', title: 't' },
+      ],
+    };
+    const plan1 = '# plan\n## C1\nfix auth\n## C2\nfix limits\n';
+    const agent = (answers, judge = { reasons: [], revise: [], priorDemands: [] }) => {
       const calls = [];
-      const runAgent = async ({ stage, seat }) => {
-        calls.push({ stage, seat: seat?.key || seat });
-        if (stage === 'PATCH_SEAT') {
-          return {
-            ok: true,
-            value: {
-              items: [{ id: 'breaker-1', reason: 'looks good', plan: 'sound' }],
-            },
-          };
-        }
-        if (stage === 'PATCH_JUDGE') {
-          return {
-            ok: true,
-            value: {
-              reasons: ['Sound patch'],
-              decision: 'APPLY',
-              revise: [],
-            },
-          };
-        }
+      const fn = async ({ stage, seat, prompt, ctx }) => {
+        calls.push({ stage, seat: seat.key, prompt });
+        if (stage === 'PATCH_SEAT') return { ok: true, value: { items: answers(seat.key) } };
+        if (stage === 'PATCH_JUDGE') return judge ? { ok: true, value: judge } : { ok: false, error: 'dead' };
         return { ok: false };
       };
+      fn.calls = calls;
+      return fn;
+    };
+    const allSound = () => [{ id: 'C1', plan: 'sound', reason: 'ok' }, { id: 'C2', plan: 'sound', reason: 'ok' }];
 
-      const state = {
-
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        ruling: {
-          closingList: [
-            {
-              n: 1,
-              item: 'Fix bug',
-              sources: ['breaker-1'],
-              doneWhen: 'fixed',
-            },
-          ],
-        },
-      };
-
-      const res = await runPatchReview({
-        state,
-        plan: 'Patch plan content for breaker-1',
-        runAgent,
-      });
-
+    it('round 1 settles everything on explicit sound answers -> APPLY', async () => {
+      const runAgent = agent(allSound);
+      const res = await runPatchReview({ state, plan: plan1, runAgent });
       assert.equal(res.decision, 'APPLY');
       assert.equal(res.exitCode, 0);
-      assert.ok(calls.some((c) => c.stage === 'PATCH_SEAT' && c.seat === 'breaker'));
-      assert.ok(calls.some((c) => c.stage === 'PATCH_SEAT' && c.seat === 'skeptic'));
-      assert.ok(calls.some((c) => c.stage === 'PATCH_JUDGE'));
+      assert.equal(res.record.round, 1);
+      assert.ok(runAgent.calls.some((c) => c.seat === 'skeptic'));
+      assert.ok(runAgent.calls.some((c) => c.seat === 'breaker'));
     });
 
-    it('judge decides REVISE -> exitCode 1', async () => {
-      const runAgent = async ({ stage }) => {
-        if (stage === 'PATCH_SEAT') {
-          return { ok: true, value: { items: [] } };
-        }
-        if (stage === 'PATCH_JUDGE') {
-          return {
-            ok: true,
-            value: {
-              reasons: ['Needs rollback step'],
-              decision: 'REVISE',
-              revise: [{ item: 'Fix bug', doneWhen: 'add rollback' }],
-            },
-          };
-        }
-        return { ok: false };
-      };
+    it('a plan without C<n> sections throws a ConfigError (exit 2)', async () => {
+      await assert.rejects(() => runPatchReview({ state, plan: 'free text', runAgent: agent(allSound) }), (e) => e.exitCode === 2);
+    });
 
-      const state = {
-
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        ruling: {
-          closingList: [{ n: 1, item: 'Fix bug', sources: ['breaker-1'] }],
-        },
-      };
-
-      const res = await runPatchReview({
+    it('round 2 sends only open and listed items', async () => {
+      const r1 = await runPatchReview({
         state,
-        plan: 'Incomplete plan',
-        runAgent,
+        plan: plan1,
+        runAgent: agent((seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'breaks-my-lens', reason: 'r' }, { id: 'C2', plan: 'sound', reason: 'ok' }] : allSound())),
       });
+      assert.equal(r1.decision, 'REVISE');
+      const runAgent = agent(() => [{ id: 'C1', plan: 'sound', reason: 'ok' }]);
+      // The router says C2 is untouched; with no router every settled item would be listed (fallback).
+      const r2 = await runPatchReview({ state, plan: '## C1\nfix auth better\n## C2\nfix limits\n', runAgent, records: [r1.record], router: async () => new Map([['C2', 0]]) });
+      assert.equal(r2.decision, 'APPLY');
+      for (const c of runAgent.calls) assert.equal(/fix limits/.test(c.prompt), false, 'settled C2 leaked into a prompt');
+    });
 
-      assert.equal(res.decision, 'REVISE');
+    it('a settled item comes back when another section names its file', async () => {
+      const r1 = await runPatchReview({
+        state,
+        plan: plan1,
+        runAgent: agent((seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'sound', reason: 'ok' }, { id: 'C2', plan: 'oversized', reason: 'r' }] : allSound())),
+      });
+      const r2 = await runPatchReview({ state, plan: '## C1\nfix auth\n## C2\nfix limits, also touch lib/auth.mjs\n', runAgent: agent(allSound), records: [r1.record] });
+      assert.ok(r2.record.regressionList.some((e) => e.id === 'C1'));
+    });
+
+    it('already applied: same plan after APPLY writes nothing', async () => {
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound) });
+      const r2 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound), records: [r1.record] });
+      assert.equal(r2.exitCode, 0);
+      assert.equal(r2.record, null);
+      assert.match(r2.message, /already applied/);
+    });
+
+    it('the cap stops a new round with exit 1 and no seat call', async () => {
+      const blockC1 = (seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'breaks-my-lens', reason: 'r' }, { id: 'C2', plan: 'sound', reason: 'ok' }] : allSound());
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(blockC1), maxRounds: 1 });
+      const runAgent = agent(allSound);
+      const r2 = await runPatchReview({ state, plan: '## C1\nnew\n## C2\nfix limits\n', runAgent, records: [r1.record], maxRounds: 1 });
+      assert.equal(r2.exitCode, 1);
+      assert.equal(r2.record, null);
+      assert.equal(runAgent.calls.length, 0);
+      assert.match(r2.message, /C1/);
+    });
+
+    it('a changed plan at the cap after APPLY exits 1 with no seat call', async () => {
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound), maxRounds: 1 });
+      assert.equal(r1.decision, 'APPLY');
+      const runAgent = agent(allSound);
+      const r2 = await runPatchReview({ state, plan: '## C1\nfix auth again\n## C2\nfix limits\n', runAgent, records: [r1.record], maxRounds: 1 });
+      assert.equal(r2.exitCode, 1);
+      assert.equal(r2.record, null);
+      assert.equal(runAgent.calls.length, 0);
+      assert.match(r2.message, /--max-rounds/);
+    });
+
+    it('refuses a round when counted rounds exceed the cap (5 rounds, cap 3)', async () => {
+      const blockC1 = (seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'breaks-my-lens', reason: 'r' }, { id: 'C2', plan: 'sound', reason: 'ok' }] : allSound());
+      const records = [];
+      for (let i = 0; i < 5; i++) {
+        const r = await runPatchReview({ state, plan: `## C1\ntry ${i}\n## C2\nfix limits\n`, runAgent: agent(blockC1), records, maxRounds: 99 });
+        records.push(r.record);
+      }
+      const runAgent = agent(allSound);
+      const res = await runPatchReview({ state, plan: '## C1\ntry 9\n## C2\nfix limits\n', runAgent, records, maxRounds: 3 });
       assert.equal(res.exitCode, 1);
+      assert.equal(res.record, null);
+      assert.equal(runAgent.calls.length, 0);
+      assert.match(res.message, /C1 open/);
     });
 
-    it('judge dead -> exitCode 3', async () => {
-      const runAgent = async ({ stage }) => {
-        if (stage === 'PATCH_SEAT') return { ok: true, value: { items: [] } };
-        if (stage === 'PATCH_JUDGE') return { ok: false, error: 'judge died' };
-        return { ok: false };
-      };
-
-      const state = {
-
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        ruling: { closingList: [{ n: 1, sources: ['edge-1'] }] },
-      };
-
-      const res = await runPatchReview({
+    it('a round-2 plan without a settled item section exits 2', async () => {
+      const r1 = await runPatchReview({
         state,
-        plan: 'Plan text',
-        runAgent,
+        plan: plan1,
+        runAgent: agent((seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'breaks-my-lens', reason: 'r' }, { id: 'C2', plan: 'sound', reason: 'ok' }] : allSound())),
       });
+      await assert.rejects(() => runPatchReview({ state, plan: '## C1\nnew\n', runAgent: agent(allSound), records: [r1.record] }), (e) => e.exitCode === 2 && /C2/.test(e.message));
+    });
 
-      assert.equal(res.exitCode, 3);
-      assert.equal(res.decision, 'REVISE');
+    it('uses a skipped record as the baseline: APPLY, unrelated cross change, same plan at the cap', async () => {
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound) });
+      assert.equal(r1.decision, 'APPLY');
+      const plan2 = `${plan1}## Cross-cutting\nformat the changelog\n`;
+      const r2 = await runPatchReview({ state, plan: plan2, runAgent: agent(allSound), records: [r1.record], router: async ({ items }) => new Map(items.map((i) => [i.id, 0])) });
+      assert.equal(r2.exitCode, 0);
+      assert.equal(r2.record.skipped, 'no-open-items');
+      const runAgent = agent(allSound);
+      const r3 = await runPatchReview({ state, plan: plan2, runAgent, records: [r1.record, r2.record], maxRounds: 1 });
+      assert.equal(r3.exitCode, 0);
+      assert.equal(r3.record, null);
+      assert.match(r3.message, /already applied/);
+      assert.equal(runAgent.calls.length, 0);
+    });
+
+    it('an empty closing list calls no seat and writes a skipped record', async () => {
+      const runAgent = agent(allSound);
+      const res = await runPatchReview({ state: { ...state, ruling: { closingList: [] } }, plan: plan1, runAgent });
+      assert.equal(res.decision, 'APPLY');
+      assert.equal(res.record.skipped, 'no-items');
+      assert.equal(runAgent.calls.length, 0);
+    });
+
+    it('stores closingListHash in every record', async () => {
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound) });
+      assert.match(r1.record.closingListHash, /^[0-9a-f]{64}$/);
+    });
+
+    it('APPLY comes from item states, not from the judge field', async () => {
+      const res = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound, { reasons: [], decision: 'REVISE', revise: [], priorDemands: [] }) });
+      assert.equal(res.decision, 'APPLY');
+    });
+
+    it('a dead judge gives exit 3 and a judgeDead record that does not count', async () => {
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound, null) });
+      assert.equal(r1.exitCode, 3);
+      assert.equal(r1.record.judgeDead, true);
+      const r2 = await runPatchReview({ state, plan: plan1, runAgent: agent(allSound), records: [r1.record] });
+      assert.equal(r2.record.round, 1);
     });
   });
 

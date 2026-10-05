@@ -114,6 +114,7 @@ export const PATCH_SEAT = {
           reason: { type: 'string' },
           plan: { type: 'string', enum: ['sound', 'breaks-my-lens', 'collides', 'oversized'] },
           collidesWith: { type: 'string' },
+          affects: { type: 'array', items: { type: 'string' } },
         },
         required: ['id', 'reason', 'plan'],
       },
@@ -128,20 +129,35 @@ export const PATCH_JUDGE = {
   properties: {
     reasons: { type: 'array', items: { type: 'string' } },
     decision: { type: 'string', enum: ['APPLY', 'REVISE'] },
+    priorDemands: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          itemId: { type: 'string' },
+          demand: { type: 'string' },
+          status: { type: 'string', enum: ['met', 'not-met'] },
+          evidence: { type: 'string' },
+        },
+        required: ['itemId', 'demand', 'status', 'evidence'],
+      },
+    },
     revise: {
       type: 'array',
       items: {
         type: 'object',
         additionalProperties: false,
         properties: {
+          itemId: { type: 'string' },
           item: { type: 'string' },
           doneWhen: { type: 'string' },
         },
-        required: ['item', 'doneWhen'],
+        required: ['itemId', 'item', 'doneWhen'],
       },
     },
   },
-  required: ['reasons', 'decision', 'revise'],
+  required: ['reasons', 'revise'],
 };
 
 export const VERIFY_SEAT = {

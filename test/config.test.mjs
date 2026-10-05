@@ -482,4 +482,40 @@ test('config module', async (t) => {
     assert.equal(resolveIdleMs(config, 'FIND', { warn: (m) => warnings.push(m) }), 1500000);
     assert.match(warnings.join(''), /hard timeout/);
   });
+
+  await t.test('review loop keys: defaults, bad values, and the project config boundary', async () => {
+    const { env, home, cleanup: c1 } = await makeIsolatedEnv();
+    const { root, cleanup: c2 } = await makeTempRepo({
+      git: false,
+      files: { '.adversarial-review/config.json': JSON.stringify({ version: 3, patchReview: { maxRounds: 9 } }) },
+    });
+    try {
+      const first = loadConfig({ env, repoRoot: root });
+      assert.equal(first.config.patchReview.maxRounds, 3, 'a project config cannot set patchReview');
+      assert.equal(first.config.sift.concurrency, 8);
+      assert.equal(first.config.sift.routerThreshold, 0.3);
+      assert.ok(first.warnings.some((w) => w.includes('patchReview')));
+
+      const userCfgPath = path.join(home, '.adversarial-review', 'config.json');
+      fs.mkdirSync(path.dirname(userCfgPath), { recursive: true });
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3, patchReview: { maxRounds: 0 }, sift: { concurrency: 99, routerThreshold: 2 } }));
+      const bad = loadConfig({ env });
+      assert.equal(bad.config.patchReview.maxRounds, 3);
+      assert.equal(bad.config.sift.concurrency, 8);
+      assert.equal(bad.config.sift.routerThreshold, 0.3);
+      assert.ok(bad.warnings.some((w) => /patchReview.maxRounds/.test(w)));
+      assert.ok(bad.warnings.some((w) => /sift.concurrency/.test(w)));
+      assert.ok(bad.warnings.some((w) => /sift.routerThreshold/.test(w)));
+
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3, patchReview: { maxRounds: 5 }, sift: { concurrency: 2, routerThreshold: 0.5 } }));
+      const good = loadConfig({ env });
+      assert.equal(good.config.patchReview.maxRounds, 5);
+      assert.equal(good.config.sift.concurrency, 2);
+      assert.equal(good.config.sift.routerThreshold, 0.5);
+      assert.equal(good.warnings.length, 0);
+    } finally {
+      await c1();
+      await c2();
+    }
+  });
 });

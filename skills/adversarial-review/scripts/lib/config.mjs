@@ -50,6 +50,11 @@ export const DEFAULTS = Object.freeze({
     keyFile: null,
     lowConfidence: 0.6,
     timeoutMs: 60000,
+    concurrency: 8,
+    routerThreshold: 0.3,
+  }),
+  patchReview: Object.freeze({
+    maxRounds: 3,
   }),
   catalog: Object.freeze({
     maxAgeDays: 7,
@@ -137,6 +142,9 @@ export function loadConfig({ env = process.env, repoRoot, flags = {}, stderr } =
       }
       if (userJson.sift && typeof userJson.sift === 'object' && !Array.isArray(userJson.sift)) {
         config.sift = { ...config.sift, ...userJson.sift };
+      }
+      if (userJson.patchReview && typeof userJson.patchReview === 'object' && !Array.isArray(userJson.patchReview)) {
+        config.patchReview = { ...config.patchReview, ...userJson.patchReview };
       }
       if (userJson.catalog && typeof userJson.catalog === 'object' && !Array.isArray(userJson.catalog)) {
         config.catalog = { ...config.catalog, ...userJson.catalog };
@@ -252,6 +260,20 @@ export function loadConfig({ env = process.env, repoRoot, flags = {}, stderr } =
 
   if (config.sift && config.sift.model != null && !isValidModel(config.sift.model)) {
     throw new ConfigError(`Invalid model in sift.model: "${config.sift.model}"`);
+  }
+
+  // An invalid review-loop value falls back to its default with a warning; the command still runs.
+  if (!Number.isInteger(config.patchReview?.maxRounds) || config.patchReview.maxRounds < 1) {
+    warnings.push('patchReview.maxRounds must be an integer >= 1; the default 3 is used');
+    config.patchReview = { ...config.patchReview, maxRounds: 3 };
+  }
+  if (!Number.isInteger(config.sift?.concurrency) || config.sift.concurrency < 1 || config.sift.concurrency > 32) {
+    warnings.push('sift.concurrency must be an integer from 1 to 32; the default 8 is used');
+    config.sift = { ...config.sift, concurrency: 8 };
+  }
+  if (typeof config.sift?.routerThreshold !== 'number' || config.sift.routerThreshold < 0 || config.sift.routerThreshold > 1) {
+    warnings.push('sift.routerThreshold must be a number from 0 to 1; the default 0.3 is used');
+    config.sift = { ...config.sift, routerThreshold: 0.3 };
   }
 
   if (stderr && typeof stderr.write === 'function') {

@@ -253,7 +253,21 @@ Confidence cutoff below which findings receive extra review.
 
 Default: `60000` (60 seconds)
 Settable by: user config.
-Timeout in milliseconds for HTTP calls to the sift service.
+The deadline in milliseconds for all Jev requests of one sift or one router call together.
+
+#### sift.concurrency
+
+Default: `8`
+Settable by: user config.
+The number of Jev requests that run at the same time.
+Allowed values are integers from 1 to 32.
+
+#### sift.routerThreshold
+
+Default: `0.3`
+Settable by: user config.
+The Jev probability at which a settled closing item goes back to review after a plan change.
+Jev can add an item to the review list. Jev cannot remove an item from it.
 
 ### catalog
 
@@ -271,6 +285,19 @@ Maximum age in days for cached benchmark scores.
 Default: `6`
 Settable by: user config.
 Maximum candidate models to probe per run.
+
+### patchReview
+
+Settable by: user config.
+Settings for the patch-review loop.
+
+#### patchReview.maxRounds
+
+Default: `3`
+Settable by: user config, `--max-rounds` flag.
+The number of counted patch-review rounds for one run.
+After the last round, patch-review prints the open items and stops with exit code 1.
+A project config cannot set this key.
 
 ## Project Config Keys
 

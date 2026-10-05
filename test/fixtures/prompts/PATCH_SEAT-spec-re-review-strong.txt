@@ -138,6 +138,12 @@ Your report is your final message. Never write the report to a file.
           },
           "collidesWith": {
             "type": "string"
+          },
+          "affects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
