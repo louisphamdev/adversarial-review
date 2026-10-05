@@ -280,7 +280,10 @@ export async function runCommand(
   const preview = buildBundle(plan, flags, { config });
   if (preview.decisions.length > 0) {
     throw new ConfigError(
-      ['answer the decisions first: run preflight', ...preview.decisions.map((d) => `  ${d.id}: ${d.question}`)].join('\n')
+      [
+        'answer the decisions first: run preflight',
+        ...preview.decisions.map((d) => `  ${d.id}: ${d.question}${PLAIN_RUN_HINT[d.id] ? ` (${PLAIN_RUN_HINT[d.id]})` : ''}`),
+      ].join('\n')
     );
   }
 
@@ -456,6 +459,12 @@ async function runFromPreflight(flags, { env, cwd, stdout, stderr }) {
       }),
   });
 }
+
+// What a user without the host loop does instead of preflight.
+const PLAIN_RUN_HINT = {
+  route: 'or pass --route spawn or --route swarm',
+  privacy: 'or set swarm.acknowledgeTraining to true in the user config',
+};
 
 const FROM_PREFLIGHT_FLAGS = new Set(['from-preflight', 'fromPreflight', 'detach', 'json', 'allow-drift', 'allowDrift']);
 

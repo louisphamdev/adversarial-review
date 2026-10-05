@@ -293,3 +293,56 @@ test('privacy=decline through the CLI: no lane call reaches the swarm and every 
     await bins.cleanup();
   }
 });
+
+test('a plain run with an open route question exits 2 and names the --route shortcut', async () => {
+  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+  const iso = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+  const repo = await makeTempRepo({ git: true, files: { 'index.js': 'console.log("a");\n' } });
+  try {
+    await writeFile(path.join(repo.root, 'index.js'), 'console.log("b");\n');
+    await writeSwarmBin({ dir: bins.dir, models: ['p/m1'] });
+    await seedModelStore({ home: iso.home, model: 'p/m1', lenses: ['breaker'] });
+    const r = await runCli(['run', '--model', 'p/m1', '--backend', 'claude', '--seats', 'breaker'], { env: iso.env, cwd: repo.root });
+    assert.equal(r.code, 2, r.stderr);
+    assert.match(r.stderr, /answer the decisions first/);
+    assert.match(r.stderr, /route: .*--route spawn or --route swarm/);
+    assert.equal(existsSync(path.join(iso.home, '.adversarial-review', 'runs')), false);
+  } finally {
+    await repo.cleanup();
+    await iso.cleanup();
+    await bins.cleanup();
+  }
+});
+
+test('run --from-preflight --allow-drift --detach finishes on changed material', async () => {
+  const { iso, repo, cleanup } = await setupRepo();
+  try {
+    const pre = await runCli(['preflight', '--route', 'spawn', '--backend', 'custom', '--seats', 'breaker', '--until', 'find', '--json'], {
+      env: iso.env,
+      cwd: repo.root,
+    });
+    assert.equal(pre.code, 0, pre.stderr);
+    const { path: bundlePath } = JSON.parse(pre.stdout);
+    await writeFile(path.join(repo.root, 'index.js'), 'console.log("drifted");\n');
+    const r = await runCli(['run', '--from-preflight', bundlePath, '--allow-drift', '--detach'], { env: iso.env, cwd: repo.root });
+    assert.equal(r.code, 0, r.stderr);
+    const runDir = r.stdout.trim();
+    const req = JSON.parse(await readFile(path.join(runDir, 'request.json'), 'utf8'));
+    assert.equal(req.allowDrift, true);
+    // The detached owner stops at FIND and records its exit sweep last.
+    const start = Date.now();
+    let done = false;
+    while (!done && Date.now() - start < 30000) {
+      const text = existsSync(path.join(runDir, 'events.jsonl')) ? await readFile(path.join(runDir, 'events.jsonl'), 'utf8') : '';
+      done = text.includes('"cleanup"');
+      if (!done) await new Promise((res) => setTimeout(res, 200));
+    }
+    await new Promise((res) => setTimeout(res, 500));
+    const events = (await readFile(path.join(runDir, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const end = events.filter((e) => e.event !== 'cleanup').at(-1);
+    assert.equal(end.event, 'run_end', JSON.stringify(events.slice(-3)));
+    assert.equal(end.stopped, 'until-find');
+  } finally {
+    await cleanup();
+  }
+});
