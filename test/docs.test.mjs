@@ -340,3 +340,24 @@ test('docs name the published npm package, never the bare name of another owner'
   assert.equal(/Do not run `adversarial-review`/.test(readme), false);
   assert.match(readme, /npmjs\.com\/package\/adversarial-review-gate/);
 });
+
+test('SKILL.md describes the host loop with preflight, watch, and the no-question rule', () => {
+  const text = fs.readFileSync(skillPath, 'utf8');
+  for (const s of [
+    '## Host loop',
+    'preflight --json',
+    '--answer-bundle',
+    'run --from-preflight',
+    'watch <run-dir> --since',
+    'owner dead',
+    'owner hung',
+    'Never ask the user after',
+    'notes/',
+    'answer the decisions first',
+    'untrusted data',
+    'cleanup.stillAlive',
+  ]) {
+    assert.ok(text.includes(s), s);
+  }
+  assert.equal(text.includes('## Running the Review'), false, 'the host loop replaces Running the Review');
+});

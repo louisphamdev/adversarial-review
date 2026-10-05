@@ -133,6 +133,24 @@ To review a specific specification or plan file, pass the target path:
 adversarial-review run --target docs/spec.md
 ```
 
+A plain `run` stops with exit code 2 when a decision is open.
+The error text names each decision and the flag or config key that removes it.
+
+### Ask Once, Then Watch
+
+An agent host asks all user decisions before the launch, and asks nothing after it:
+
+```bash
+adversarial-review preflight --json
+adversarial-review preflight --answer-bundle <bundle> --answer privacy=accept
+adversarial-review run --from-preflight <answered bundle> --detach
+adversarial-review watch <run-dir> --since 0
+```
+
+`preflight` writes a decision bundle and starts no seat.
+`watch` stops at the next seat or stage event and prints the `next` index for the next call.
+`status <run-dir>` shows the model, the attempt, and the idle time of each seat call.
+
 ### 3. Read the Results
 
 The run produces a `result.json` file in the run state directory.

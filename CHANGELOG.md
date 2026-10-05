@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- CAUTION: A plain `run` with no `--route` flag stops with exit code 2 when both routes are
+  available and the user config keeps `routeAsk: true`. Pass `--route`, or use `preflight`.
+- CAUTION: A swarm model counts as a model that can train on the material. A run that sends
+  the material to one stops with exit code 2, unless the user config sets
+  `swarm.acknowledgeTraining: true` or the user answers the `privacy` decision.
+- CAUTION: Schema version 2. A 3.0.2 run paused with `--until find` cannot resume under 3.1.
+- A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
+
+### Added
+- Live seat events in `events.jsonl`: `stage_start`, `call_start` with model and attempt,
+  `seat_output`, `seat_stalled`, `seat_failover`, `seat_done` per FIND seat with its findings,
+  `stage_end`, and `run_end`.
+- `watch <run-dir> [--since n] [--timeout sec] [--json]` stops at the next important event.
+- `preflight` writes a decision bundle with a hash. `preflight --answer-bundle` records the
+  answers. `run --from-preflight` runs the answered plan with no further question.
+- Idle failover: `timeouts.idle.find` and `timeouts.idle.other` stop a silent streaming call
+  and move it to the next model of the seat.
+- `status` shows the model, the attempt, and the idle time of each call, and a hung owner.
+
+### Fixed
+- `run --resume` never takes over a lock whose pid is alive, also when the lock is old.
+  `run --resume --detach` returns 0 only after the new owner holds the lock.
+- `run --detach --until find` now stops at FIND: the run stores `until` in `request.json`.
+
 ## [3.0.2] - 2026-09-24
 
 ### Fixed

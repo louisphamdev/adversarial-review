@@ -49,10 +49,12 @@ Allowed values are `"auto"`, `"spawn"`, and `"swarm"`.
 ### routeAsk
 
 Default: `true`
-Settable by: user config.
-Controls user confirmation for the recommend command.
-If `true`, the host asks the user before choosing a swarm route.
-If `false`, the host accepts the recommendation without asking.
+Settable by: user config only.
+Controls the `route` decision of `preflight`.
+If `true` and both routes are available, `preflight` adds a `route` decision.
+The `--route` flag removes this decision.
+If `false`, the engine accepts the recommended route without a question.
+A plain `run` with an open `route` decision stops with exit code 2.
 
 ### swarm
 
@@ -70,6 +72,16 @@ The backend used for swarm execution.
 Removed in schema 2. The route no longer refuses a free model: the sandbox tree is the privacy
 boundary, and a run on the swarm prints a warning that the provider can train on every file in
 that tree. The key is accepted and ignored.
+
+#### swarm.acknowledgeTraining
+
+Default: `false`
+Settable by: user config only.
+Removes the `privacy` decision of `preflight`.
+The engine counts a swarm model as a model that can train on the material.
+A model with no recorded training status also counts as such a model.
+If this key is not `true`, a run that sends the material to such a model needs an answer first.
+A plain `run` with an open `privacy` decision stops with exit code 2.
 
 #### swarm.wideFiles
 
@@ -146,6 +158,29 @@ Timeout in milliseconds for the RULING stage.
 Default: `600000` (10 minutes)
 Settable by: user config.
 Timeout in milliseconds for other stages.
+
+When a seat call reaches its timeout, the engine moves the call to the next model of the seat.
+If the seat has no next model, the engine runs the same model one more time only.
+
+#### timeouts.idle.find
+
+Default: `300000` (5 minutes)
+Settable by: user config only.
+Idle deadline in milliseconds for a FIND seat call that streams its output.
+If the call writes no output for this time, the engine stops the call.
+Then the engine moves the call to the next model of the seat.
+The engine raises a value under `120000` to `120000` and prints a warning.
+A healthy free model was measured silent for 98.9 seconds inside one step.
+
+#### timeouts.idle.other
+
+Default: `180000` (3 minutes)
+Settable by: user config only.
+Idle deadline in milliseconds for a streaming seat call of every other stage.
+The same floor of `120000` applies.
+A value that is not a number stops the run with exit code 2.
+A value at or above the hard timeout of the stage gives a warning.
+Only streaming backends use an idle deadline: `claude`, and `opencode` in its JSON event mode.
 
 ### quota
 
