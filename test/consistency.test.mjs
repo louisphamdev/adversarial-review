@@ -45,6 +45,15 @@ test('the README names both registries and the command the package installs', ()
   assert.ok(wf.includes(`name=@louisphamdev/${pkg.name}`), 'workflow publishes the name the README gives');
 });
 
+test('every command points at the file under cli/, and no top-level bin/ ships', () => {
+  for (const [name, file] of Object.entries(pkg.bin)) {
+    assert.equal(file, 'cli/adversarial-review.js', name);
+    assert.ok(read(file).startsWith('#!/usr/bin/env node'), `${name} entry has a shebang`);
+  }
+  assert.ok(!pkg.files.includes('bin/'), 'claude.ai refuses a plugin with a top-level bin/');
+  assert.ok(!readdirSync('.').includes('bin'), 'no top-level bin/ directory');
+});
+
 test('repository links point at this repository', () => {
   assert.match(pkg.repository.url, /github\.com\/louisphamdev\/adversarial-review\.git$/);
   assert.match(pkg.bugs, /louisphamdev\/adversarial-review\/issues$/);

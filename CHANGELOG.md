@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CAUTION: The command file moved from `bin/adversarial-review.js` to `cli/adversarial-review.js`,
   because claude.ai refuses a plugin with a top-level `bin/` directory. The command names do not
   change. A script that calls the file by its path must use the new path.
-- CAUTION: The swarm sandbox copies only the files that `git ls-files` lists. If `git ls-files`
-  fails, for example outside a git repository, the swarm route stops with exit code 2.
+- CAUTION: The swarm sandbox copies the files that `git ls-files` lists and the files that the
+  diff headers name. It does not walk the directory. If `git ls-files` fails, for example outside
+  a git repository, the swarm route stops with exit code 2.
 - A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
 - Patch review keeps a state for each closing item. A settled item is not sent again. A plan change that touches a settled item sends it back. A judge demand blocks only with a seat objection on the same item in the same round. Patch review stops after `patchReview.maxRounds` rounds (default 3).
 - The patch plan has one `## C<n>` section per closing item and an optional `## Cross-cutting` section. A plan with another shape stops with exit code 2.
