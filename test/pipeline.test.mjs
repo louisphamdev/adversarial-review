@@ -777,7 +777,7 @@ describe('pipeline module', () => {
       };
       const checkpoints = {};
       const p = runTable({
-        request: {}, seats: threeSeats, runAgent,
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } }, seats: threeSeats, runAgent,
         checkpoint: async (n, d) => { checkpoints[n] = d; },
         loadCheckpoint: async () => null,
         seatCheckpoint: async (k, d) => { seatFiles.set(k, d); },
@@ -802,7 +802,7 @@ describe('pipeline module', () => {
       const saved = { seat: 'edge', findings: [{ id: 'edge-1', seat: 'edge', title: 'old', severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w' }], notRead: [] };
       const checkpoints = {};
       await runTable({
-        request: {}, seats: threeSeats, runAgent,
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } }, seats: threeSeats, runAgent,
         checkpoint: async (n, d) => { checkpoints[n] = d; },
         loadCheckpoint: async () => null,
         seatCheckpoint: async () => {},
@@ -819,7 +819,7 @@ describe('pipeline module', () => {
       const runAgent = async ({ stage }) => (stage === 'FIND'
         ? { ok: true, value: { findings: [{ title: 't', severity: 'important', detail: 'd', evidence: 'e', doneWhen: 'w', file: 'C:\\Windows\\win.ini', line: '1' }], notRead: [] } }
         : { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } });
-      await runTable({ request: {}, seats: [edge], runAgent, onSeatDone: async (e) => events.push(e) });
+      await runTable({ request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } }, seats: [edge], runAgent, onSeatDone: async (e) => events.push(e) });
       assert.equal(events[0].findings[0].file, null);
       assert.equal(events[0].findings[0].outOfRoot, true);
     });
@@ -834,7 +834,7 @@ describe('pipeline module', () => {
         return { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } };
       };
       const result = await runTable({
-        request: {}, seats: threeSeats, runAgent,
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } }, seats: threeSeats, runAgent,
         onSeatDone: async (e) => announced.push(e.seat),
       });
       assert.deepEqual(announced.sort(), ['breaker', 'edge']);
@@ -848,7 +848,7 @@ describe('pipeline module', () => {
         : { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } });
       const logged = [];
       const result = await runTable({
-        request: {}, seats: [edge], runAgent,
+        request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } }, seats: [edge], runAgent,
         log: (m) => logged.push(m),
         onSeatDone: async () => { throw new Error('event sink is gone'); },
       });
