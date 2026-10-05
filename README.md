@@ -147,7 +147,8 @@ To review a specific specification or plan file, pass the target path:
 adversarial-review run --target docs/spec.md
 ```
 
-A plain `run` stops with exit code 2 when a decision is open.
+A plain `run` with no `--route` takes the recommended route.
+It stops with exit code 2 when another decision is open, for example the `privacy` decision of a swarm route.
 The error text names each decision and the flag or config key that removes it.
 
 ### Ask Once, Then Watch

@@ -92,7 +92,8 @@ You can also pass:
 - `--route <spawn|swarm>`: sets the route and removes the `route` decision.
 - `--json`: writes machine-readable output to stdout.
 
-If a decision is open, the plain `run` stops with exit code 2 and the text "answer the decisions first".
+A plain `run` with no `--route` takes the recommended route and asks no route question.
+If another decision is open, the plain `run` stops with exit code 2 and the text "answer the decisions first".
 The text names each open decision and the flag or config key that removes it.
 Run `recommend` to see the route that the engine recommends, with its reasons.
 

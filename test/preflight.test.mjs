@@ -316,24 +316,39 @@ test('privacy=decline through the CLI: no lane call reaches the swarm and every 
   }
 });
 
-test('a plain run with an open route question exits 2 and names the --route shortcut', async () => {
-  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
-  const iso = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+// Both routes are open and training is not acknowledged; only the quota moves the recommendation.
+async function plainRunWithBothRoutes(quotaPercent) {
+  const bins = await makeFakeBins({});
+  const iso = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv, ADVERSARIAL_REVIEW_QUOTA_PERCENT: String(quotaPercent) });
   const repo = await makeTempRepo({ git: true, files: { 'index.js': 'console.log("a");\n' } });
   try {
     await writeFile(path.join(repo.root, 'index.js'), 'console.log("b");\n');
     await writeSwarmBin({ dir: bins.dir, models: ['p/m1'] });
-    await seedModelStore({ home: iso.home, model: 'p/m1', lenses: ['breaker'] });
-    const r = await runCli(['run', '--model', 'p/m1', '--backend', 'claude', '--seats', 'breaker'], { env: iso.env, cwd: repo.root });
-    assert.equal(r.code, 2, r.stderr);
-    assert.match(r.stderr, /answer the decisions first/);
-    assert.match(r.stderr, /route: .*--route spawn or --route swarm/);
-    assert.equal(existsSync(path.join(iso.home, '.adversarial-review', 'runs')), false);
+    await seedModelStore({ home: iso.home, model: 'p/m1', lenses: ['breaker'], acknowledgeTraining: false });
+    await writeStubBackend({ home: iso.home });
+    const r = await runCli(['run', '--model', 'p/m1', '--backend', 'custom', '--seats', 'breaker', '--until', 'find'], { env: iso.env, cwd: repo.root });
+    return { r, ran: existsSync(path.join(iso.home, '.adversarial-review', 'runs')) };
   } finally {
     await repo.cleanup();
     await iso.cleanup();
     await bins.cleanup();
   }
+}
+
+test('a plain run with no --route takes the recommended spawn route and asks nothing', async () => {
+  const { r, ran } = await plainRunWithBothRoutes(10);
+  assert.equal(r.code, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /answer the decisions first/);
+  assert.equal(ran, true);
+});
+
+test('a plain run whose recommended route is the swarm stops on the privacy decision only', async () => {
+  const { r, ran } = await plainRunWithBothRoutes(90);
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stderr, /answer the decisions first/);
+  assert.match(r.stderr, /privacy: .*swarm\.acknowledgeTraining/);
+  assert.doesNotMatch(r.stderr, /route: /);
+  assert.equal(ran, false);
 });
 
 test('run --from-preflight --allow-drift --detach finishes on changed material', async () => {

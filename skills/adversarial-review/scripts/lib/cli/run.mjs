@@ -278,8 +278,9 @@ export async function runCommand(
   const effectiveRoute = plan.routeRequested;
 
   // A run with an open decision needs the user first (spec G2-4): preflight asks, then
-  // `run --from-preflight` runs the answered plan. The bundle rules decide what is open.
-  const preview = buildBundle(plan, flags, { config });
+  // `run --from-preflight` runs the answered plan. A plain run takes the recommended route,
+  // so an open route question never stops it; consent for the swarm still does.
+  const preview = buildBundle(plan, { ...flags, route: flags.route ?? plan.routeDecision?.route }, { config });
   if (preview.decisions.length > 0) {
     throw new ConfigError(
       [
@@ -464,7 +465,6 @@ async function runFromPreflight(flags, { env, cwd, stdout, stderr }) {
 
 // What a user without the host loop does instead of preflight.
 const PLAIN_RUN_HINT = {
-  route: 'or pass --route spawn or --route swarm',
   privacy: 'or set swarm.acknowledgeTraining to true in the user config',
 };
 

@@ -54,7 +54,7 @@ Controls the `route` decision of `preflight`.
 If `true` and both routes are available, `preflight` adds a `route` decision.
 The `--route` flag removes this decision.
 If `false`, the engine accepts the recommended route without a question.
-A plain `run` with an open `route` decision stops with exit code 2.
+A plain `run` asks no `route` question. It takes the recommended route.
 
 ### swarm
 

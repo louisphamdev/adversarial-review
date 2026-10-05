@@ -8,11 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [3.1.0] - Unreleased
 
 ### Changed
-- CAUTION: A plain `run` with no `--route` flag stops with exit code 2 when both routes are
-  available and the user config keeps `routeAsk: true`. Pass `--route`, or use `preflight`.
-- CAUTION: A swarm model counts as a model that can train on the material. A run that sends
-  the material to one stops with exit code 2, unless the user config sets
-  `swarm.acknowledgeTraining: true` or the user answers the `privacy` decision.
+- CAUTION: `routeAsk: true` adds a `route` decision to `preflight` only. A plain `run` with no
+  `--route` flag asks no route question. It takes the recommended route, as in 3.0.2.
+- CAUTION: A swarm model counts as a model that can train on the material. A plain `run` whose
+  route sends the material to one stops with exit code 2, unless the user config sets
+  `swarm.acknowledgeTraining: true`. With `preflight`, the user answers the `privacy` decision.
 - CAUTION: Schema version 2. A 3.0.2 run paused with `--until find` cannot resume under 3.1.
 - A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
 - Patch review keeps a state for each closing item. A settled item is not sent again. A plan change that touches a settled item sends it back. A judge demand blocks only with a seat objection on the same item in the same round. Patch review stops after `patchReview.maxRounds` rounds (default 3).
