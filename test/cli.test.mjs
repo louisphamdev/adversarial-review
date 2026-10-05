@@ -1,12 +1,19 @@
 import { join } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { parseArgs } from '../skills/adversarial-review/scripts/lib/cli/args.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
 import { resetClosingForTests } from '../skills/adversarial-review/scripts/lib/proc.mjs';
+
+// Each command ends with the exit sweep, which leaves the process closed to new lanes. This
+// file runs many commands in one process, so each one starts open, as a real command does.
+function runMain(argv, io) {
+  resetClosingForTests();
+  return main(argv, io);
+}
 import { modelsCommand } from '../skills/adversarial-review/scripts/lib/cli/models.mjs';
 import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 import { ENGINE_VERSION } from '../skills/adversarial-review/scripts/lib/version.mjs';
@@ -53,9 +60,6 @@ function createMockIO({ stdinData = '' } = {}) {
 }
 
 describe('cli unit and command tests', () => {
-  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
-  // file runs many commands in one process, so each one starts open, as a real command does.
-  beforeEach(resetClosingForTests);
   describe('args.mjs parseArgs', () => {
     it('parses command, flags, and positionals with camelCase and kebab-case', () => {
       const res = parseArgs(['run', '--route', 'spawn', '--allow-gaps', '--stage', 'spec', 'extra']);
@@ -86,14 +90,14 @@ describe('cli unit and command tests', () => {
   describe('main dispatcher top-level', () => {
     it('--version prints version and exits 0', async () => {
       const io = createMockIO();
-      const code = await main(['--version'], io);
+      const code = await runMain(['--version'], io);
       assert.equal(code, 0);
       assert.ok(io.stdout.text.includes(ENGINE_VERSION));
     });
 
     it('--help prints usage and exits 0', async () => {
       const io = createMockIO();
-      const code = await main(['--help'], io);
+      const code = await runMain(['--help'], io);
       assert.equal(code, 0);
       assert.ok(io.stdout.text.includes('Usage:'));
       assert.ok(io.stdout.text.includes('run'));
@@ -101,13 +105,13 @@ describe('cli unit and command tests', () => {
 
     it('watch is routed: usage line in help, bad --since exits 2', async () => {
       const help = createMockIO();
-      await main(['--help'], help);
+      await runMain(['--help'], help);
       assert.ok(help.stdout.text.includes('adversarial-review watch <run-dir> [--since <n>] [--timeout <sec>] [--json]'));
       const iso = await makeIsolatedEnv();
       try {
         const io = createMockIO();
         const runDir = path.join(iso.home, '.adversarial-review', 'runs', 'r', 'x');
-        const code = await main(['watch', runDir, '--since', 'abc'], { env: iso.env, ...io });
+        const code = await runMain(['watch', runDir, '--since', 'abc'], { env: iso.env, ...io });
         assert.equal(code, 2);
         assert.match(io.stderr.text, /--since/);
       } finally {
@@ -117,7 +121,7 @@ describe('cli unit and command tests', () => {
 
     it('unknown command returns 2', async () => {
       const io = createMockIO();
-      const code = await main(['foobar'], io);
+      const code = await runMain(['foobar'], io);
       assert.equal(code, 2);
       assert.ok(io.stderr.text.includes('Unknown command'));
     });
@@ -131,7 +135,7 @@ describe('cli unit and command tests', () => {
       iso.env[bins.pathKey] = bins.pathEnv;
       const io = createMockIO();
       try {
-        const code = await main(['recommend', '--target', 'a.js', '--json'], {
+        const code = await runMain(['recommend', '--target', 'a.js', '--json'], {
           env: iso.env,
           cwd: repo.root,
           ...io,
@@ -156,7 +160,7 @@ describe('cli unit and command tests', () => {
       iso.env[bins.pathKey] = bins.pathEnv;
       const io = createMockIO();
       try {
-        const code = await main(['recommend', '--target', 'a.js', '--json'], {
+        const code = await runMain(['recommend', '--target', 'a.js', '--json'], {
           env: iso.env,
           cwd: repo.root,
           ...io,
@@ -177,7 +181,7 @@ describe('cli unit and command tests', () => {
       const isoLow = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '20' });
       const ioLow = createMockIO();
       try {
-        const codeLow = await main(['quota', '--gate', '80'], { env: isoLow.env, ...ioLow });
+        const codeLow = await runMain(['quota', '--gate', '80'], { env: isoLow.env, ...ioLow });
         assert.equal(codeLow, 0);
       } finally {
         await isoLow.cleanup();
@@ -186,7 +190,7 @@ describe('cli unit and command tests', () => {
       const isoHigh = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '90' });
       const ioHigh = createMockIO();
       try {
-        const codeHigh = await main(['quota', '--gate', '80'], { env: isoHigh.env, ...ioHigh });
+        const codeHigh = await runMain(['quota', '--gate', '80'], { env: isoHigh.env, ...ioHigh });
         assert.equal(codeHigh, 1);
       } finally {
         await isoHigh.cleanup();
@@ -197,7 +201,7 @@ describe('cli unit and command tests', () => {
       const iso = await makeIsolatedEnv();
       const io = createMockIO();
       try {
-        const code = await main(['quota'], { env: iso.env, ...io });
+        const code = await runMain(['quota'], { env: iso.env, ...io });
         assert.equal(code, 3);
       } finally {
         await iso.cleanup();
@@ -210,7 +214,7 @@ describe('cli unit and command tests', () => {
       const iso = await makeIsolatedEnv();
       const io = createMockIO();
       try {
-        const code = await main(['doctor'], { env: iso.env, ...io });
+        const code = await runMain(['doctor'], { env: iso.env, ...io });
         assert.ok(code === 0 || code === 1);
         assert.ok(io.stdout.text.includes('Node:'));
       } finally {
@@ -224,7 +228,7 @@ describe('cli unit and command tests', () => {
       const iso = await makeIsolatedEnv();
       const io = createMockIO();
       try {
-        const code = await main(['models', '--backend', 'not-a-backend'], {
+        const code = await runMain(['models', '--backend', 'not-a-backend'], {
           env: iso.env,
           ...io,
         });
@@ -313,7 +317,7 @@ describe('cli unit and command tests', () => {
       try {
         const dummyRun = path.join(iso.home, '.adversarial-review', 'runs', 'repo', 'run1');
         await fs.mkdir(dummyRun, { recursive: true });
-        const code = await main(['patch-review', dummyRun], { env: iso.env, ...io });
+        const code = await runMain(['patch-review', dummyRun], { env: iso.env, ...io });
         assert.equal(code, 2);
       } finally {
         await iso.cleanup();
@@ -333,10 +337,10 @@ describe('cli unit and command tests', () => {
         const planFile = path.join(iso.home, 'plan.md');
         await fs.writeFile(planFile, '## C1\nx\n');
         const io1 = createMockIO();
-        assert.equal(await main(['patch-review', dummyRun, '--plan', planFile], { env: iso.env, ...io1 }), 3);
+        assert.equal(await runMain(['patch-review', dummyRun, '--plan', planFile], { env: iso.env, ...io1 }), 3);
         assert.match(io1.stderr.text, /owner still alive/);
         const io2 = createMockIO();
-        assert.equal(await main(['verify', dummyRun], { env: iso.env, ...io2 }), 3);
+        assert.equal(await runMain(['verify', dummyRun], { env: iso.env, ...io2 }), 3);
         assert.match(io2.stderr.text, /owner still alive/);
         assert.equal(JSON.parse(await fs.readFile(lockPath, 'utf8')).pid, child.pid, 'the lock was not taken over');
       } finally {
@@ -352,7 +356,7 @@ describe('cli unit and command tests', () => {
         const planFile = path.join(iso.home, 'plan.md');
         await fs.writeFile(planFile, '## C1\nx\n');
         const io = createMockIO();
-        const code = await main(['patch-review', dummyRun, '--plan', planFile, '--max-rounds', '0'], { env: iso.env, ...io });
+        const code = await runMain(['patch-review', dummyRun, '--plan', planFile, '--max-rounds', '0'], { env: iso.env, ...io });
         assert.equal(code, 2);
         assert.match(io.stderr.text, /max-rounds/);
       } finally {
@@ -382,9 +386,9 @@ describe('cli unit and command tests', () => {
       try {
         const dummyRun = await makeRunDirWithRuling(iso.home);
         const io = createMockIO();
-        assert.equal(await main(['verify', dummyRun, '--base', '--output=x'], { env: iso.env, ...io }), 2);
+        assert.equal(await runMain(['verify', dummyRun, '--base', '--output=x'], { env: iso.env, ...io }), 2);
         const io2 = createMockIO();
-        assert.equal(await main(['verify', dummyRun, '--base=--output=x'], { env: iso.env, ...io2 }), 2);
+        assert.equal(await runMain(['verify', dummyRun, '--base=--output=x'], { env: iso.env, ...io2 }), 2);
       } finally {
         await iso.cleanup();
       }
@@ -402,7 +406,7 @@ describe('cli unit and command tests', () => {
         const record = { round: 1, baseSha: first, items: {}, judge: { verdict: 'BLOCK' }, diffHash: 'h', engineVersion: ENGINE_VERSION };
         await fs.writeFile(path.join(dummyRun, 'stages', 'verify-1.json'), JSON.stringify(record));
         const io = createMockIO();
-        assert.equal(await main(['verify', dummyRun, '--base', 'HEAD'], { env: iso.env, ...io }), 2);
+        assert.equal(await runMain(['verify', dummyRun, '--base', 'HEAD'], { env: iso.env, ...io }), 2);
         assert.match(io.stderr.text, /verifies against/);
       } finally {
         await iso.cleanup();
@@ -416,7 +420,7 @@ describe('cli unit and command tests', () => {
       try {
         const dummyRun = path.join(iso.home, '.adversarial-review', 'runs', 'repo', 'run1');
         await fs.mkdir(dummyRun, { recursive: true });
-        const code = await main(['verify', dummyRun], { env: iso.env, ...io });
+        const code = await runMain(['verify', dummyRun], { env: iso.env, ...io });
         assert.equal(code, 2);
       } finally {
         await iso.cleanup();
@@ -426,9 +430,6 @@ describe('cli unit and command tests', () => {
 });
 
 describe('recommend picks a measured swarm model', () => {
-  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
-  // file runs many commands in one process, so each one starts open, as a real command does.
-  beforeEach(resetClosingForTests);
   it('quota at 85% with a measured top model on the swarm backend routes to swarm', async () => {
     const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
     const bins = await makeFakeBins({
@@ -446,7 +447,7 @@ describe('recommend picks a measured swarm model', () => {
         version: 3,
         'opencode:p/good-model': { backend: 'opencode', model: 'p/good-model', callable: true, contract: true, score: 6, invented: 0, tier: 'top', latencyMs: 100, measuredAt: Date.now() },
       }));
-      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      const code = await runMain(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
       assert.equal(code, 0, io.stderr.text);
       const parsed = JSON.parse(io.stdout.text);
       assert.equal(parsed.signals.swarmModel, 'p/good-model');
@@ -481,7 +482,7 @@ describe('recommend picks a measured swarm model', () => {
         version: 3,
         'opencode:p/good-model': { backend: 'opencode', model: 'p/good-model', callable: true, contract: true, score: 6, invented: 0, tier: 'top', latencyMs: 100, measuredAt: Date.now() },
       }));
-      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      const code = await runMain(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
       assert.equal(code, 0, io.stderr.text);
       const parsed = JSON.parse(io.stdout.text);
       assert.equal(parsed.signals.swarmModel, 'p/good-model');
@@ -510,7 +511,7 @@ describe('recommend picks a measured swarm model', () => {
         swarm: { backend: 'opencode', models: ['p/good-model'] },
         backends: { opencode: { exe } },
       }));
-      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      const code = await runMain(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
       assert.equal(code, 0);
       assert.match(io.stderr.text, /note: discovery failed/);
     } finally {
@@ -522,12 +523,9 @@ describe('recommend picks a measured swarm model', () => {
 });
 
 describe('status per seat (3.1 part C, task 8)', () => {
-  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
-  // file runs many commands in one process, so each one starts open, as a real command does.
-  beforeEach(resetClosingForTests);
   async function statusJson(runDir, env) {
     const io = createMockIO();
-    const code = await main(['status', runDir, '--json'], { env, ...io });
+    const code = await runMain(['status', runDir, '--json'], { env, ...io });
     assert.equal(code, 0, io.stderr.text);
     return JSON.parse(io.stdout.text);
   }
