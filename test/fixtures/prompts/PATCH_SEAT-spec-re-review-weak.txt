@@ -96,6 +96,9 @@ Apply your lens only to the open items, the regression-check items, and the delt
 4. Report a new defect only if it cites a line of the delta. Put that delta line in the evidence.
 5. A new defect with no delta line is advisory. It never blocks.
 
+Prefer a fix that removes or simplifies a mechanism over a fix that adds one.
+Mark each new unit that the plan adds (a function, a flag, a mode, a file) as `oversized`, unless no cut meets the `doneWhen`.
+
 Answer rules 1 and 3 for one item at a time. Then apply rules 2, 4 and 5 once.
 
 Example of the JSON shape. The values are not a finding. Do not copy them.

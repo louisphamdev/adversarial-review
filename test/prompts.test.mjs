@@ -540,6 +540,21 @@ describe('prompts module', () => {
     assert.ok(!noReg.includes('=== REGRESSION CHECK ==='));
   });
 
+  it('patch prompts put a cut before an addition in the first pass and in re-review', () => {
+    const closingList = [{ n: 1, item: 'i', doneWhen: 'd', sources: [] }];
+    for (const extra of [{ plan: 'p', closingList }, { reReview: rr() }]) {
+      const seatP = buildPrompt('PATCH_SEAT', { ...baseCtx, seat: breaker, ...extra });
+      assert.ok(seatP.includes('Prefer a fix that removes or simplifies a mechanism over a fix that adds one.'));
+      assert.ok(seatP.includes('Mark each new unit that the plan adds (a function, a flag, a mode, a file) as `oversized`, unless no cut meets the `doneWhen`.'));
+      const judgeP = buildPrompt('PATCH_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], ...extra });
+      assert.ok(judgeP.includes('Prefer a fix that removes or simplifies a mechanism over a fix that adds one.'));
+      assert.ok(judgeP.includes('Demand a cut of each new unit that the plan adds (a function, a flag, a mode, a file), unless no cut meets the `doneWhen`.'));
+    }
+    for (const step of ['VERIFY_SEAT', 'VERIFY_JUDGE']) {
+      assert.ok(!buildPrompt(step, { ...baseCtx, seat: step === 'VERIFY_SEAT' ? breaker : judge, seatResponses: [], diff: 'x' }).includes('removes or simplifies'));
+    }
+  });
+
   it('re-review errors', () => {
     assert.throws(() => buildPrompt('FIND', { ...baseCtx, reReview: rr() }), ConfigError);
     assert.throws(() => buildPrompt('PATCH_SEAT', { ...baseCtx, seat: breaker, reReview: rr({ pass: 'first' }) }), ConfigError);

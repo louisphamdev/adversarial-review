@@ -265,6 +265,11 @@ const SEAT_RE_REVIEW_RULES = [
   '5. A new defect with no delta line is advisory. It never blocks.',
 ].join('\n');
 
+// A patch loop that only adds mechanisms grows each round, so a cut comes before an addition.
+const CUT_FIRST = 'Prefer a fix that removes or simplifies a mechanism over a fix that adds one.';
+const PATCH_SEAT_CUT = `${CUT_FIRST}\nMark each new unit that the plan adds (a function, a flag, a mode, a file) as \`oversized\`, unless no cut meets the \`doneWhen\`.`;
+const PATCH_JUDGE_CUT = `${CUT_FIRST}\nDemand a cut of each new unit that the plan adds (a function, a flag, a mode, a file), unless no cut meets the \`doneWhen\`.`;
+
 // A verify claim blocks only when it cites a changed line, so the seat must name the side of the line.
 const VERIFY_NEW_IN_DIFF = 'Report a new defect of the diff in `newInDiff` with its file and line. Use `side: "new"` for an added line and `side: "old"` for a removed line.';
 const VERIFY_REGRESSION_ANSWER = 'For each regression-check item, answer in `regression` with `holds` or `broken`, and evidence. An item with no answer counts as not met.';
@@ -409,7 +414,7 @@ export function buildPrompt(stage, ctx = {}) {
         regressionBlock(reg),
         deltaBlock(ctx.reReview),
         SEAT_RE_REVIEW_RULES,
-        normStage === 'VERIFY_SEAT' ? [reg.length > 0 ? VERIFY_REGRESSION_ANSWER : '', VERIFY_NEW_IN_DIFF].filter(Boolean).join('\n') : '',
+        normStage === 'VERIFY_SEAT' ? [reg.length > 0 ? VERIFY_REGRESSION_ANSWER : '', VERIFY_NEW_IN_DIFF].filter(Boolean).join('\n') : PATCH_SEAT_CUT,
         weak ? 'Answer rules 1 and 3 for one item at a time. Then apply rules 2, 4 and 5 once.' : '',
         weak ? exampleBlock(normStage) : '',
         budgetLine(6),
@@ -421,7 +426,7 @@ export function buildPrompt(stage, ctx = {}) {
           ? `${normStage === 'VERIFY_JUDGE' ? 'This is the final regression pass. ' : ''}Rule only on the seat reviews of the regression-check items.`
           : 'You ruled on this work in an earlier round. Your earlier demands are below, per open item.\nRule on each earlier demand: met or not-met.',
         'A new demand on an open item blocks only if a seat objection in this round names the same open item.\nA new demand outside the open items blocks only if a seat in this round reports it with a cited delta line, and you verify that the line appears in the DELTA block.\nPut every other new demand in advisory.',
-        normStage === 'VERIFY_JUDGE' ? VERIFY_JUDGE_NEW_IN_DIFF : '',
+        normStage === 'VERIFY_JUDGE' ? VERIFY_JUDGE_NEW_IN_DIFF : PATCH_JUDGE_CUT,
         openItemsBlock(open),
         reg.length > 0 ? regressionBlock(reg) : '',
         deltaBlock(ctx.reReview),
@@ -564,6 +569,7 @@ export function buildPrompt(stage, ctx = {}) {
       '2. Does the patch break your lens? (breaks-my-lens)',
       '3. Do two items collide? (collides)',
       '4. Is the patch bigger than the finding? (oversized)',
+      PATCH_SEAT_CUT,
       stageBudgetLine,
       UNTRUSTED_TEXT,
     ]
@@ -579,6 +585,7 @@ export function buildPrompt(stage, ctx = {}) {
       `=== SEAT REVIEWS ===\n${responsesText}`,
       'Decide whether the plan may be applied (APPLY) or requires revision (REVISE). If REVISE, list what must be revised and its doneWhen condition.',
       'Fill `itemId` of each revise entry with the C<n> label of its closing item, or with `cross` for the cross-cutting section.',
+      PATCH_JUDGE_CUT,
       stageBudgetLine,
       UNTRUSTED_TEXT,
     ]
