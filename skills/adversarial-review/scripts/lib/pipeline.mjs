@@ -13,7 +13,8 @@ import { buildPrompt } from './prompts.mjs';
 import { findingEvent } from './contain.mjs';
 import { compareSift } from './sift.mjs';
 import { loadSeats } from './seats.mjs';
-import { normalizeId, itemIdsOf, parsePlan, sectionDelta, normalizePlanText } from './plan-sections.mjs';
+import { normalizeId, normalizeItemIds, itemIdsOf, parsePlan, sectionDelta, normalizePlanText } from './plan-sections.mjs';
+import { diffRanges, interdiff, isChangedLine, normalizeSeatPath } from './verify-diff.mjs';
 import { deriveLedger, applyRound, selectRegression, countsAsRound, versionAtLeast, closingListHashOf } from './ledger.mjs';
 import { ENGINE_VERSION } from './version.mjs';
 
@@ -676,80 +677,228 @@ export async function runPatchReview({ state = {}, plan = '', runAgent, records 
   };
 }
 
-export async function runVerify({ state = {}, diff = '', runAgent }) {
+const VERIFY_DELTA_CAP = 12000;
+const RETRY_REASONS = new Set(['seat-dead', 'no-answer', 'no-regression-answer']);
+
+function capDelta(text) {
+  const s = String(text ?? '');
+  return s.length > VERIFY_DELTA_CAP ? { delta: `${s.slice(0, VERIFY_DELTA_CAP - 9)}\n...(cut)`, deltaCut: true } : { delta: s, deltaCut: false };
+}
+
+// A verify record counts when it is 3.1 or later, has a judge answer and items, and the judge did not die.
+export function countsAsVerify(r) {
+  return Boolean(r && versionAtLeast(r.engineVersion) && r.items && r.judge && !r.judgeDead);
+}
+
+export async function runVerify({ state = {}, diffParts, recollect = null, runAgent, records = [] }) {
   const closingList = state.ruling?.closingList || [];
   const findings = state.findings || [];
+  const { ids, byId } = itemIdsOf(closingList);
+  const known = new Map(findings.map((f) => [normalizeId(f.id), f]));
+  const prior = records.filter(countsAsVerify).at(-1) || null;
+  const round = prior ? prior.round + 1 : 1;
+  const seatsMap = loadSeats();
 
-  const seatFindingsMap = new Map();
-  for (const f of findings) {
-    const owner = normalizeId(f.id).split('-')[0] || f.seat;
-    if (!seatFindingsMap.has(owner)) {
-      seatFindingsMap.set(owner, []);
+  // owners: item id -> [{ seat, findingIds, itemOnly }]
+  const owners = new Map();
+  for (const id of ids) {
+    const srcs = (byId[id].sources || []).map(normalizeId).filter((s) => known.has(s));
+    if (srcs.length === 0) {
+      owners.set(id, [{ seat: 'skeptic', findingIds: [], itemOnly: true }]);
+      continue;
     }
-    seatFindingsMap.get(owner).push(f);
+    const bySeat = new Map();
+    for (const s of srcs) {
+      const seat = known.get(s).seat || s.split('-')[0];
+      if (!bySeat.has(seat)) bySeat.set(seat, []);
+      bySeat.get(seat).push(s);
+    }
+    owners.set(id, [...bySeat].map(([seat, findingIds]) => ({ seat, findingIds, itemOnly: false })));
   }
 
-  const seatsMap = loadSeats();
+  // Which items to ask, and with which pass.
+  let targetIds = ids;
+  let pass = 'first';
+  let deltaText = diffParts.diff;
+  let reasked = null;
+  if (prior) {
+    const notMet = ids.filter((id) => prior.items[id]?.status !== 'met');
+    if (prior.diffHash === diffParts.diffHash) {
+      const retry = notMet.filter((id) => RETRY_REASONS.has(prior.items[id]?.reason));
+      if (notMet.length > 0 && (retry.length === 0 || prior.reasked === diffParts.diffHash)) {
+        return { verdict: 'BLOCK', exitCode: 1, record: null, message: `Verify stopped: nothing changed since the last verify. Open: ${notMet.join(', ')}` };
+      }
+      targetIds = notMet.length > 0 ? retry : [];
+      reasked = diffParts.diffHash;
+    } else {
+      targetIds = notMet;
+    }
+    pass = 're-review';
+    deltaText = interdiff(prior, diffParts) || diffParts.diff;
+  }
+  const { delta, deltaCut } = capDelta(deltaText);
+
+  const items = {};
+  for (const id of ids) items[id] = prior?.items[id] && !targetIds.includes(id) ? prior.items[id] : { status: 'not-met', evidence: '', reason: 'no-answer' };
+
+  const perSeat = new Map();
+  for (const id of targetIds) {
+    for (const o of owners.get(id)) {
+      if (!perSeat.has(o.seat)) perSeat.set(o.seat, []);
+      perSeat.get(o.seat).push({ id, ...o });
+    }
+  }
+  const newInDiffRaw = [];
   const seatResponses = await Promise.all(
-    Array.from(seatFindingsMap.entries()).map(async ([ownerKey, ownFindings]) => {
-      const seat = seatsMap.get(ownerKey) || { key: ownerKey, body: '', lens: '' };
-      const prompt = buildPrompt('VERIFY_SEAT', {
-        seat,
-        diff,
-        findings: ownFindings,
-        state,
-      });
+    [...perSeat].map(async ([seatKey, list]) => {
+      const seat = seatsMap.get(seatKey) || { key: seatKey, body: '', lens: '' };
+      const ctx = pass === 'first'
+        ? { diff: delta, findings: list.flatMap((o) => (o.itemOnly ? [{ id: o.id, title: byId[o.id].item, doneWhen: byId[o.id].doneWhen }] : o.findingIds.map((f) => known.get(f)))) }
+        : {
+            reReview: {
+              pass: 're-review',
+              openItems: list.map((o) => ({ id: o.id, item: byId[o.id].item || '', doneWhen: byId[o.id].doneWhen || '', priorDemands: [prior.items[o.id]?.evidence || ''].filter(Boolean), sectionText: '' })),
+              regressionList: [],
+              delta,
+              deltaCut,
+              round,
+            },
+          };
+      const prompt = buildPrompt('VERIFY_SEAT', { seat, ...ctx, state });
       const res = await runAgent({ stage: 'VERIFY_SEAT', seat, prompt, schema: VERIFY_SEAT });
-      return {
-        seat: ownerKey,
-        items: res?.ok && Array.isArray(res.value?.items) ? res.value.items : [],
-        newInDiff: res?.ok && Array.isArray(res.value?.newInDiff) ? res.value.newInDiff : [],
-        error: res?.ok ? null : res?.error,
-      };
+      const ok = res?.ok && Array.isArray(res.value?.items);
+      if (ok && Array.isArray(res.value.newInDiff)) newInDiffRaw.push(...res.value.newInDiff.map((e) => ({ ...e, seat: seatKey })));
+      return { seat: seatKey, list, items: ok ? res.value.items : null, error: ok ? null : res?.error || 'no-answer' };
     })
   );
 
-  const judgeSeat = seatsMap.get('judge') || { key: 'judge', body: '', lens: 'adjudicator' };
-  const judgePrompt = buildPrompt('VERIFY_JUDGE', {
-    seat: judgeSeat,
-    diff,
-    seatResponses,
-    closingList,
-    state,
-  });
+  const answerFor = (sr, o, w) =>
+    sr.items.find((a) => (o.itemOnly ? normalizeItemIds(a.id, ids).includes(w) : normalizeId(a.id) === w));
 
-  const judgeRes = await runAgent({
-    stage: 'VERIFY_JUDGE',
-    seat: judgeSeat,
-    prompt: judgePrompt,
-    schema: VERIFY_JUDGE,
-  });
-
-  if (!judgeRes || !judgeRes.ok || !judgeRes.value) {
-    return {
-      verdict: 'BLOCK',
-      exitCode: 3,
-      record: {
-        stage: 'verify',
-        diff,
-        seatResponses,
-        judge: null,
-        error: judgeRes?.error || 'judge failed',
-      },
-    };
+  for (const id of targetIds) {
+    let met = true;
+    let reason = null;
+    const evidence = [];
+    for (const o of owners.get(id)) {
+      const sr = seatResponses.find((r) => r.seat === o.seat);
+      if (!sr || sr.error) {
+        met = false;
+        reason = 'seat-dead';
+        continue;
+      }
+      for (const w of o.itemOnly ? [id] : o.findingIds) {
+        const ans = answerFor(sr, o, w);
+        if (!ans) {
+          met = false;
+          reason = reason || 'no-answer';
+        } else {
+          evidence.push(ans.evidence);
+          if (ans.status !== 'met') {
+            met = false;
+            reason = reason || 'not-met';
+          }
+        }
+      }
+    }
+    items[id] = { status: met ? 'met' : 'not-met', evidence: evidence.join(' | '), reason: met ? null : reason };
   }
 
-  const verdict = judgeRes.value.verdict === 'PASS' ? 'PASS' : 'BLOCK';
-  const exitCode = verdict === 'PASS' ? 0 : 1;
+  // Final regression pass: every item of each owner seat, explicit `holds` required.
+  let finalPass = null;
+  if (ids.every((id) => items[id].status === 'met')) {
+    const bySeat = new Map();
+    for (const id of ids) {
+      for (const o of owners.get(id)) {
+        if (!bySeat.has(o.seat)) bySeat.set(o.seat, []);
+        if (!bySeat.get(o.seat).includes(id)) bySeat.get(o.seat).push(id);
+      }
+    }
+    const full = capDelta(diffParts.diff);
+    finalPass = {};
+    await Promise.all(
+      [...bySeat].map(async ([seatKey, list]) => {
+        const seat = seatsMap.get(seatKey) || { key: seatKey, body: '', lens: '' };
+        const reReview = {
+          pass: 're-review',
+          openItems: [],
+          regressionList: list.map((id) => ({ id, doneWhen: byId[id].doneWhen || '', sectionText: '', reason: 'final-pass' })),
+          delta: full.delta,
+          deltaCut: full.deltaCut,
+          round,
+        };
+        const prompt = buildPrompt('VERIFY_SEAT', { seat, reReview, state });
+        const res = await runAgent({ stage: 'VERIFY_SEAT', seat, prompt, schema: VERIFY_SEAT });
+        const reg = res?.ok && Array.isArray(res.value?.regression) ? res.value.regression : null;
+        if (res?.ok && Array.isArray(res.value?.newInDiff)) newInDiffRaw.push(...res.value.newInDiff.map((e) => ({ ...e, seat: seatKey })));
+        for (const id of list) {
+          const a = reg?.find((x) => normalizeItemIds(x.id, ids).includes(id));
+          const holds = a?.status === 'holds';
+          const status = holds ? 'holds' : a?.status === 'broken' ? 'broken' : 'no-regression-answer';
+          finalPass[id] = { seat: seatKey, status, evidence: a?.evidence || '' };
+          if (!holds) items[id] = { status: 'not-met', evidence: a?.evidence || '', reason: status === 'broken' ? 'regression' : 'no-regression-answer' };
+        }
+      })
+    );
+  }
 
+  // Two seats that report the same claim on the same line give one entry.
+  const claimKey = (e) => JSON.stringify([e.claim, normalizeSeatPath(e.file), Number(e.line), e.side]);
+  const uniqueClaims = [...new Map(newInDiffRaw.map((e) => [claimKey(e), e])).values()];
+  const ranges = diffRanges(diffParts.diff);
+  const candidates = uniqueClaims.filter((e) => isChangedLine({ ranges, untracked: diffParts.untracked, entry: e }));
+  const advisory = uniqueClaims.filter((e) => !candidates.includes(e));
+  // The judge rules only on blocking candidates, shown under the seat that reported each one.
+  const judgeResponses = seatResponses.map((sr) => ({ seat: sr.seat, items: sr.items, newInDiff: [] }));
+  for (const c of candidates) {
+    let sr = judgeResponses.find((r) => r.seat === c.seat);
+    if (!sr) judgeResponses.push((sr = { seat: c.seat, items: [], newInDiff: [] }));
+    sr.newInDiff.push(c);
+  }
+
+  const judgeSeat = seatsMap.get('judge') || { key: 'judge', body: '', lens: 'adjudicator' };
+  const judgeCtx = pass === 'first'
+    ? { diff: delta }
+    : { reReview: { pass: 're-review', openItems: targetIds.map((id) => ({ id, item: byId[id].item || '', doneWhen: byId[id].doneWhen || '', priorDemands: [prior.items[id]?.evidence || ''].filter(Boolean), sectionText: '' })), regressionList: finalPass ? ids.map((id) => ({ id, doneWhen: byId[id].doneWhen || '', sectionText: '', reason: 'final-pass' })) : [], delta, deltaCut, round } };
+  if (judgeCtx.reReview && judgeCtx.reReview.openItems.length === 0 && judgeCtx.reReview.regressionList.length === 0) {
+    judgeCtx.reReview.regressionList = ids.map((id) => ({ id, doneWhen: byId[id].doneWhen || '', sectionText: '', reason: 'status-only' }));
+  }
+  const judgePrompt = buildPrompt('VERIFY_JUDGE', { seat: judgeSeat, ...judgeCtx, seatResponses: judgeResponses, closingList, state });
+  const judgeRes = await runAgent({ stage: 'VERIFY_JUDGE', seat: judgeSeat, prompt: judgePrompt, schema: VERIFY_JUDGE });
+  const record = {
+    stage: 'verify',
+    round,
+    baseSha: diffParts.baseSha,
+    diff: diffParts.diff,
+    untracked: diffParts.untracked,
+    diffHash: diffParts.diffHash,
+    pass,
+    reasked,
+    items,
+    finalPass,
+    newInDiff: { candidates, advisory, judged: judgeRes?.value?.newInDiff || [] },
+    seatResponses,
+    closingListHash: closingListHashOf(closingList),
+    engineVersion: ENGINE_VERSION,
+  };
+  if (!judgeRes?.ok || !judgeRes.value) {
+    return { verdict: 'BLOCK', exitCode: 3, record: { ...record, judge: null, judgeDead: true, verdict: 'BLOCK' }, message: 'The judge died during verify. The round does not count.' };
+  }
+
+  // Tree change during verify: the seats saw a diff that is no longer the working tree.
+  let treeChanged = false;
+  if (typeof recollect === 'function') {
+    const again = await recollect();
+    treeChanged = again.diffHash !== diffParts.diffHash;
+  }
+  const accepted = (judgeRes.value.newInDiff || []).filter((j) => j.verdict === 'accepted' && candidates.some((c) => c.claim === j.claim));
+  const allMet = ids.every((id) => items[id].status === 'met');
+  const verdict = allMet && accepted.length === 0 && !treeChanged ? 'PASS' : 'BLOCK';
+  const lines = ids.map((id) => `${id} ${items[id].status}${items[id].reason ? ` (${items[id].reason})` : ''}`);
+  if (treeChanged) lines.push('The tree changed during verify. Run verify again.');
   return {
     verdict,
-    exitCode,
-    record: {
-      stage: 'verify',
-      diff,
-      seatResponses,
-      judge: judgeRes.value,
-    },
+    exitCode: verdict === 'PASS' ? 0 : 1,
+    record: { ...record, judge: judgeRes.value, verdict, treeChanged },
+    message: lines.join('\n'),
   };
 }

@@ -177,7 +177,33 @@ export const VERIFY_SEAT = {
         required: ['id', 'evidence', 'status'],
       },
     },
-    newInDiff: { type: 'array', items: { type: 'string' } },
+    newInDiff: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          claim: { type: 'string' },
+          file: { type: 'string' },
+          line: { type: 'number' },
+          side: { type: 'string', enum: ['new', 'old'] },
+        },
+        required: ['claim', 'file', 'line', 'side'],
+      },
+    },
+    regression: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string' },
+          status: { type: 'string', enum: ['holds', 'broken'] },
+          evidence: { type: 'string' },
+        },
+        required: ['id', 'status', 'evidence'],
+      },
+    },
   },
   required: ['items', 'newInDiff'],
 };
@@ -193,11 +219,21 @@ export const VERIFY_JUDGE = {
       items: {
         type: 'object',
         additionalProperties: false,
+        properties: { item: { type: 'string' }, why: { type: 'string' } },
+        required: ['item', 'why'],
+      },
+    },
+    newInDiff: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
         properties: {
-          item: { type: 'string' },
+          claim: { type: 'string' },
+          verdict: { type: 'string', enum: ['accepted', 'rejected'] },
           why: { type: 'string' },
         },
-        required: ['item', 'why'],
+        required: ['claim', 'verdict', 'why'],
       },
     },
   },

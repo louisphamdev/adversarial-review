@@ -116,7 +116,7 @@ if (behavior === 'hang') {
     canned = {
       items: [
         {
-          id: 'breaker-1',
+          id: 'C1',
           reason: 'Sound approach',
           plan: 'sound',
         },
@@ -138,6 +138,7 @@ if (behavior === 'hang') {
         },
       ],
       newInDiff: [],
+      regression: [{ id: 'C1', status: 'holds', evidence: 'test.js:1 still fixed' }],
     };
   } else if (stage === 'VERIFYJUDGE') {
     canned = {

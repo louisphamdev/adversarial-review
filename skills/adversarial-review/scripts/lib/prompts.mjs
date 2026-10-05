@@ -84,7 +84,11 @@ export const EXAMPLES = {
       { id: 'cross', reason: 'Example: the shared change also moves the check of item 2.', plan: 'collides', affects: ['2'] },
     ],
   },
-  VERIFY_SEAT: { items: [{ id: 'example-1', evidence: 'example/path.js:12', status: 'met' }], newInDiff: [] },
+  VERIFY_SEAT: {
+    items: [{ id: 'example-1', evidence: 'example/path.js:12', status: 'met' }],
+    newInDiff: [{ claim: 'Example: the guard for an empty value was removed.', file: 'example/path.js', line: 15, side: 'old' }],
+    regression: [{ id: 'C1', status: 'holds', evidence: 'example/path.js:12 still rejects an empty value' }],
+  },
 };
 
 const EXAMPLE_INTRO = 'Example of the JSON shape. The values are not a finding. Do not copy them.';
@@ -199,7 +203,9 @@ function judgeResponsesText(step, responses, known) {
       ? `  [${idText(i.id, known)}] plan: ${enumText('plan', i.plan)}, reason: ${fenced(i.reason)}`
       : `  [${idText(i.id, known)}] status: ${enumText('status', i.status)}, evidence: ${fenced(i.evidence)}`));
     const extra = step === 'VERIFY_JUDGE' && r.newInDiff && r.newInDiff.length
-      ? ['  New in diff:', ...r.newInDiff.map((n) => `    - ${fenced(n)}`)]
+      ? ['  New in diff:', ...r.newInDiff.map((n) => (n && typeof n === 'object'
+        ? `    - ${flat(n.file)}:${flat(n.line)} (${flat(n.side)} side) ${fenced(n.claim)}`
+        : `    - ${fenced(n)}`))]
       : [];
     return [`rt-${flat(r.seat)}:`, ...items, ...extra].join('\n');
   }).join('\n\n');
@@ -246,6 +252,11 @@ const SEAT_RE_REVIEW_RULES = [
   '4. Report a new defect only if it cites a line of the delta. Put that delta line in the evidence.',
   '5. A new defect with no delta line is advisory. It never blocks.',
 ].join('\n');
+
+// A verify claim blocks only when it cites a changed line, so the seat must name the side of the line.
+const VERIFY_NEW_IN_DIFF = 'Report a new defect of the diff in `newInDiff` with its file and line. Use `side: "new"` for an added line and `side: "old"` for a removed line.';
+const VERIFY_REGRESSION_ANSWER = 'For each regression-check item, answer in `regression` with `holds` or `broken`, and evidence. An item with no answer counts as not met.';
+const VERIFY_JUDGE_NEW_IN_DIFF = 'Rule on each "New in diff" entry in `newInDiff`: accepted (a real defect on that changed line) or rejected, with the reason.';
 
 function schemaForStage(stageName) {
   switch (stageName) {
@@ -385,6 +396,7 @@ export function buildPrompt(stage, ctx = {}) {
         regressionBlock(reg),
         deltaBlock(ctx.reReview),
         SEAT_RE_REVIEW_RULES,
+        normStage === 'VERIFY_SEAT' ? [reg.length > 0 ? VERIFY_REGRESSION_ANSWER : '', VERIFY_NEW_IN_DIFF].filter(Boolean).join('\n') : '',
         weak ? 'Answer rules 1 and 3 for one item at a time. Then apply rules 2, 4 and 5 once.' : '',
         weak ? exampleBlock(normStage) : '',
         budgetLine(6),
@@ -396,12 +408,13 @@ export function buildPrompt(stage, ctx = {}) {
           ? 'This is the final regression pass. Rule only on the seat reviews of the regression-check items.'
           : 'You ruled on this work in an earlier round. Your earlier demands are below, per open item.\nRule on each earlier demand: met or not-met.',
         'A new demand on an open item blocks only if a seat objection in this round names the same open item.\nA new demand outside the open items blocks only if a seat in this round reports it with a cited delta line, and you verify that the line appears in the DELTA block.\nPut every other new demand in advisory.',
+        normStage === 'VERIFY_JUDGE' ? VERIFY_JUDGE_NEW_IN_DIFF : '',
         openItemsBlock(open),
         deltaBlock(ctx.reReview),
         `=== SEAT REVIEWS ===\n${judgeResponsesText(normStage, ctx.seatResponses || [], known)}`,
         stageBudgetLine,
         UNTRUSTED_TEXT,
-      ].join('\n\n');
+      ].filter(Boolean).join('\n\n');
     }
   } else if (normStage === 'FIND') {
     stageSpecific = [
@@ -576,7 +589,8 @@ export function buildPrompt(stage, ctx = {}) {
     stageSpecific = [
       `=== YOUR FINDINGS TO VERIFY ===\n${findingsText}`,
       `=== DIFF (CHANGES MADE) ===\n${diffText}`,
-      'Check whether the changed lines meet your `doneWhen` condition. Answer with `met` or `not-met` and evidence (file:line). Report any new bugs introduced by the diff in `newInDiff`.',
+      'Check whether the changed lines meet your `doneWhen` condition. Answer with `met` or `not-met` and evidence (file:line).',
+      VERIFY_NEW_IN_DIFF,
       stageBudgetLine,
       UNTRUSTED_TEXT,
     ]
@@ -590,6 +604,7 @@ export function buildPrompt(stage, ctx = {}) {
       `=== DIFF ===\n${diffText}`,
       `=== SEAT VERIFICATION RESULTS ===\n${responsesText}`,
       'Rule on whether the verification passes (PASS) or is blocked (BLOCK). List any open items.',
+      VERIFY_JUDGE_NEW_IN_DIFF,
       stageBudgetLine,
       UNTRUSTED_TEXT,
     ]

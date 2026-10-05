@@ -2,7 +2,9 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { assertRunDir, readState, readCheckpoint, writeIndexed, nextRound, appendEvent } from '../rundir.mjs';
-import { runPatchReview, runVerify } from '../pipeline.mjs';
+import { runPatchReview, runVerify, countsAsVerify } from '../pipeline.mjs';
+import { closingListHashOf } from '../ledger.mjs';
+import { collectDiff, resolveBase, validateBase } from '../verify-diff.mjs';
 import { runSeatCall } from '../backends/index.mjs';
 import { loadConfig } from '../config.mjs';
 import { runChild } from '../proc.mjs';
@@ -10,7 +12,6 @@ import { acquireLockWithCleanup } from '../cleanup.mjs';
 import { readLock, pidAlive } from '../lockfile.mjs';
 import { writeFileAtomic } from '../fsx.mjs';
 import { makeJevRouter } from '../jev.mjs';
-import { normalizeDiff } from '../material.mjs';
 import { ConfigError, RunError } from '../errors.mjs';
 
 // Part C rule C8: never take over a lock whose owner pid is alive, whatever the age of the lock.
@@ -182,7 +183,9 @@ export async function verifyCommand(
     throw new ConfigError('Run directory is required: verify <run-dir> [--base <ref>]');
   }
   const runDir = assertRunDir(env, positionals[0]);
+  if (flags.base !== undefined) validateBase(flags.base);
 
+  // Every record and the diff are read under the lock.
   await refuseLiveOwner(runDir);
   const lock = await acquireLockWithCleanup(runDir, { stderr });
 
@@ -195,47 +198,58 @@ export async function verifyCommand(
     }
 
     const repoRoot = state.request?.repoRoot || cwd;
-    const baseRef = flags.base || 'HEAD';
-
-    const diffRes = await runChild({
-      cmd: 'git',
-      args: ['diff', '--no-color', baseRef],
-      cwd: repoRoot,
-    });
-    if (diffRes.code !== 0) {
-      throw new ConfigError(`git diff failed: ${diffRes.stderr || 'exit ' + diffRes.code}`);
+    const records = await readRecords(runDir, 'verify');
+    const prior = records.filter(countsAsVerify).at(-1) || null;
+    if (prior?.closingListHash && prior.closingListHash !== closingListHashOf(ruling.closingList || [])) {
+      throw new ConfigError(`The ruling changed after verify round ${prior.round}. Start a new run with \`adversarial-review run\`.`);
     }
-
-    const normDiff = normalizeDiff(diffRes.stdout);
-    if (!normDiff.trim()) {
-      throw new ConfigError('Empty diff: nothing to verify');
+    // The base is pinned in round 1, so a commit of the fix between rounds does not change the diff.
+    let baseSha;
+    if (prior?.baseSha) {
+      baseSha = prior.baseSha;
+      if (flags.base) {
+        const asked = await resolveBase(repoRoot, flags.base, runChild);
+        if (asked !== baseSha) {
+          throw new ConfigError(`This run verifies against ${baseSha}. Start a new run to change the base.`);
+        }
+      }
+    } else {
+      baseSha = await resolveBase(repoRoot, flags.base || state.request?.material?.commit || 'HEAD', runChild);
     }
+    const diffParts = { ...(await collectDiff(repoRoot, baseSha, runChild)), baseSha };
 
     const { config } = loadConfig({ env, flags, stderr });
     const findCheckpoint = await readCheckpoint(runDir, 'find');
     const findings = state.result?.raw?.findings || state.result?.findings || findCheckpoint?.findings || [];
 
+    // The call-file round counts record files, so a judge-dead retry never overwrites a call file.
     const round = await nextRound(runDir, 'verify');
     const runAgent = createClosingAgent({ config, env, runDir, repoRoot, round });
     const res = await runVerify({
       state: { ...state, ruling, findings },
-      diff: normDiff,
+      diffParts,
+      recollect: () => collectDiff(repoRoot, baseSha, runChild),
       runAgent,
+      records,
     });
 
-    const recordPath = await writeIndexed(runDir, 'verify', res.record);
+    let recordPath = null;
+    if (res.record) {
+      recordPath = await writeIndexed(runDir, 'verify', res.record);
+      await appendEvent(runDir, { event: 'stage_end', stage: 'VERIFY', round: res.record.round, verdict: res.verdict });
+    }
 
     if (flags.json) {
-      stdout.write(JSON.stringify({ verdict: res.verdict, recordPath, ...res.record }, null, 2) + '\n');
+      stdout.write(JSON.stringify({ ...(res.record || {}), verdict: res.verdict, exitCode: res.exitCode, message: res.message, recordPath }, null, 2) + '\n');
     } else {
-      stdout.write(`Verdict: ${res.verdict}\nSaved to: ${recordPath}\n`);
+      stdout.write(`Verdict: ${res.verdict}\n${res.message}\n`);
+      if (recordPath) stdout.write(`Saved to: ${recordPath}\n`);
     }
 
     if (res.exitCode === 3) {
       throw new RunError(res.record?.error || 'Judge failed during verify', 'judge-dead');
     }
-
-    return res.verdict === 'PASS' ? 0 : 1;
+    return res.exitCode;
   } finally {
     await lock.release();
   }

@@ -1020,116 +1020,182 @@ describe('pipeline module', () => {
   });
 
   describe('runVerify', () => {
-    it('runs owner seats with own findings, judge PASS -> exitCode 0', async () => {
-      const seatCalls = [];
-      const runAgent = async ({ stage, seat, prompt }) => {
+    const state = {
+      request: { stage: 'code', lane: { tools: ['read', 'glob', 'grep'] } },
+      ruling: {
+        closingList: [
+          { n: 1, item: 'guard', doneWhen: 'guard exists', sources: ['breaker-1'] },
+          { n: 2, item: 'no source', doneWhen: 'docs updated', sources: [] },
+        ],
+      },
+      findings: [{ id: 'breaker-1', seat: 'breaker', title: 't', doneWhen: 'guard exists' }],
+    };
+    const diffA = { diff: 'diff --git a/lib/a.mjs b/lib/a.mjs\n--- a/lib/a.mjs\n+++ b/lib/a.mjs\n@@ -10,2 +10,2 @@\n keep\n-if (!ok) throw x;\n+work();', untracked: [], diffHash: 'h1', baseSha: 'b1' };
+    const diffB = { ...diffA, diff: `${diffA.diff}\n diff2`, diffHash: 'h2' };
+    const agent = ({ seatItems, regression, newInDiff = [], judgeNew = [], judgeDead = false }) => {
+      const calls = [];
+      const fn = async ({ stage, seat, prompt }) => {
+        calls.push({ stage, seat: seat.key, prompt });
         if (stage === 'VERIFY_SEAT') {
-          seatCalls.push({ seat: seat?.key || seat, prompt });
-          return {
-            ok: true,
-            value: {
-              items: [{ id: `${seat.key || seat}-1`, evidence: 'verified', status: 'met' }],
-              newInDiff: [],
-            },
-          };
+          const finalPass = /final-pass/.test(prompt);
+          if (finalPass) return { ok: true, value: { items: [], newInDiff: [], regression: regression(seat.key) } };
+          const answer = seatItems(seat.key);
+          if (answer === null) return { ok: false, error: 'seat died' };
+          return { ok: true, value: { items: answer, newInDiff } };
         }
-        if (stage === 'VERIFY_JUDGE') {
-          return {
-            ok: true,
-            value: {
-              reasons: ['all met'],
-              verdict: 'PASS',
-              open: [],
-            },
-          };
-        }
+        if (stage === 'VERIFY_JUDGE') return judgeDead ? { ok: false, error: 'dead' } : { ok: true, value: { reasons: [], verdict: 'PASS', open: [], newInDiff: judgeNew } };
         return { ok: false };
       };
+      fn.calls = calls;
+      return fn;
+    };
+    const metAll = (seat) => (seat === 'breaker' ? [{ id: 'breaker-1', status: 'met', evidence: 'a.mjs:10' }] : [{ id: 'C2', status: 'met', evidence: 'docs' }]);
+    const holdsAll = (seat) => (seat === 'breaker' ? [{ id: 'C1', status: 'holds', evidence: 'e' }] : [{ id: 'C2', status: 'holds', evidence: 'e' }]);
 
-      const state = {
-
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        findings: [
-          { id: 'breaker-1', seat: 'breaker', title: 'b1', doneWhen: 'w1' },
-          { id: 'edge-1', seat: 'edge', title: 'e1', doneWhen: 'w2' },
-        ],
-        ruling: {
-          closingList: [
-            { n: 1, sources: ['breaker-1'] },
-            { n: 2, sources: ['edge-1'] },
-          ],
-        },
-      };
-
-      const res = await runVerify({
-        state,
-        diff: 'diff --git a/foo b/foo...',
-        runAgent,
-      });
-
+    it('PASS needs explicit met and explicit holds for every item', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: holdsAll }) });
       assert.equal(res.verdict, 'PASS');
       assert.equal(res.exitCode, 0);
-      assert.equal(seatCalls.length, 2);
     });
 
-    it('judge BLOCK -> exitCode 1', async () => {
-      const runAgent = async ({ stage }) => {
-        if (stage === 'VERIFY_SEAT') {
-          return {
-            ok: true,
-            value: { items: [], newInDiff: ['introduced new bug'] },
-          };
-        }
-        if (stage === 'VERIFY_JUDGE') {
-          return {
-            ok: true,
-            value: {
-              reasons: ['new bug in diff'],
-              verdict: 'BLOCK',
-              open: [{ item: 'New bug', why: 'unhandled exception' }],
-            },
-          };
-        }
-        return { ok: false };
-      };
-
-      const state = {
-
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        ruling: { closingList: [{ n: 1, sources: ['breaker-1'] }] },
-      };
-
-      const res = await runVerify({
-        state,
-        diff: 'git diff...',
-        runAgent,
-      });
-
+    it('an item with no source is answered by skeptic and never passes on silence', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? metAll(s) : []), regression: holdsAll }) });
       assert.equal(res.verdict, 'BLOCK');
-      assert.equal(res.exitCode, 1);
+      assert.equal(res.record.items.C2.status, 'not-met');
     });
 
-    it('judge dead -> exitCode 3', async () => {
-      const runAgent = async ({ stage }) => {
-        if (stage === 'VERIFY_SEAT') return { ok: true, value: { items: [], newInDiff: [] } };
-        if (stage === 'VERIFY_JUDGE') return { ok: false, error: 'judge crashed' };
-        return { ok: false };
-      };
+    it('a missing regression array gives BLOCK', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: () => undefined }) });
+      assert.equal(res.verdict, 'BLOCK');
+    });
 
-      const state = {
+    it('round 2 sends only not-met items and the interdiff', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'no guard' }] : metAll(s)), regression: holdsAll }) });
+      assert.equal(r1.verdict, 'BLOCK');
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent, records: [r1.record] });
+      const seatCalls = runAgent.calls.filter((c) => c.stage === 'VERIFY_SEAT' && !/final-pass/.test(c.prompt));
+      assert.deepEqual(seatCalls.map((c) => c.seat), ['breaker']);
+      assert.equal(r2.verdict, 'PASS');
+      const finalCalls = runAgent.calls.filter((c) => /final-pass/.test(c.prompt));
+      assert.ok(finalCalls.some((c) => /C2/.test(c.prompt)), 'final pass lists every item of the seat');
+    });
 
-        request: { lane: { tools: ['read', 'glob', 'grep'] } },
-        ruling: { closingList: [{ n: 1, sources: ['breaker-1'] }] },
-      };
+    it('an equal diff hash with open items exits 1 with no call', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'x' }] : metAll(s)), regression: holdsAll }) });
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      const r2 = await runVerify({ state, diffParts: diffA, runAgent, records: [r1.record] });
+      assert.equal(r2.exitCode, 1);
+      assert.equal(runAgent.calls.length, 0);
+      assert.match(r2.message, /nothing changed/);
+    });
 
+    it('a newInDiff entry on a removed line is a blocking candidate', async () => {
       const res = await runVerify({
         state,
-        diff: 'diff',
-        runAgent,
+        diffParts: diffA,
+        runAgent: agent({
+          seatItems: metAll,
+          regression: holdsAll,
+          newInDiff: [{ claim: 'guard removed', file: 'lib/a.mjs', line: 11, side: 'old' }, { claim: 'vague', file: 'lib/zz.mjs', line: 1, side: 'new' }],
+          judgeNew: [{ claim: 'guard removed', verdict: 'accepted', why: 'real' }],
+        }),
       });
-
-      assert.equal(res.exitCode, 3);
+      assert.equal(res.record.newInDiff.candidates.length, 1);
+      assert.equal(res.record.newInDiff.advisory.length, 1);
       assert.equal(res.verdict, 'BLOCK');
+    });
+
+    it('a judge-dead verify does not count: the rerun on the same diff calls the seats and the judge', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: holdsAll, judgeDead: true }) });
+      assert.equal(r1.exitCode, 3);
+      assert.equal(r1.record.judgeDead, true);
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      const r2 = await runVerify({ state, diffParts: diffA, runAgent, records: [r1.record] });
+      assert.equal(r2.record.round, 1);
+      assert.ok(runAgent.calls.some((c) => c.stage === 'VERIFY_SEAT'));
+      assert.ok(runAgent.calls.some((c) => c.stage === 'VERIFY_JUDGE'));
+    });
+
+    it('re-asks a dead seat once per diff hash, then exits 1', async () => {
+      const breakerDies = (s) => (s === 'breaker' ? null : metAll(s));
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: breakerDies, regression: holdsAll }) });
+      assert.equal(r1.record.items.C1.reason, 'seat-dead');
+      const runAgent2 = agent({ seatItems: breakerDies, regression: holdsAll });
+      const r2 = await runVerify({ state, diffParts: diffA, runAgent: runAgent2, records: [r1.record] });
+      assert.ok(runAgent2.calls.some((c) => c.stage === 'VERIFY_SEAT' && c.seat === 'breaker'));
+      assert.equal(r2.record.reasked, 'h1');
+      const runAgent3 = agent({ seatItems: metAll, regression: holdsAll });
+      const r3 = await runVerify({ state, diffParts: diffA, runAgent: runAgent3, records: [r1.record, r2.record] });
+      assert.equal(r3.exitCode, 1);
+      assert.equal(runAgent3.calls.length, 0);
+    });
+
+    it('an untracked-only edit changes the hash and calls the seats', async () => {
+      const r1 = await runVerify({ state, diffParts: { ...diffA, untracked: [{ path: 'n.mjs', sha256: 'x' }], diffHash: 'u1' }, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'e' }] : metAll(s)), regression: holdsAll }) });
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      await runVerify({ state, diffParts: { ...diffA, untracked: [{ path: 'n.mjs', sha256: 'y' }], diffHash: 'u2' }, runAgent, records: [r1.record] });
+      const seatCall = runAgent.calls.find((c) => c.stage === 'VERIFY_SEAT' && !/final-pass/.test(c.prompt));
+      assert.ok(seatCall);
+      assert.match(seatCall.prompt, /untracked changed: n\.mjs/);
+    });
+
+    it('a tree change during verify gives BLOCK', async () => {
+      const res = await runVerify({ state, diffParts: diffA, recollect: async () => ({ diffHash: 'other' }), runAgent: agent({ seatItems: metAll, regression: holdsAll }) });
+      assert.equal(res.verdict, 'BLOCK');
+      assert.equal(res.record.treeChanged, true);
+      assert.match(res.message, /tree changed/);
+    });
+
+    it('stores baseSha and closingListHash in the record', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: holdsAll }) });
+      assert.equal(res.record.baseSha, 'b1');
+      assert.match(res.record.closingListHash, /^[0-9a-f]{64}$/);
+    });
+
+    it('a reverted file is in the interdiff and the seat is called', async () => {
+      const blockB = 'diff --git a/lib/b.mjs b/lib/b.mjs\n--- a/lib/b.mjs\n+++ b/lib/b.mjs\n@@ -1,1 +1,1 @@\n-x\n+y';
+      const both = { ...diffA, diff: `${diffA.diff}\n${blockB}`, diffHash: 'hb' };
+      const r1 = await runVerify({ state, diffParts: both, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'e' }] : metAll(s)), regression: holdsAll }) });
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      await runVerify({ state, diffParts: diffA, runAgent, records: [r1.record] });
+      const seatCall = runAgent.calls.find((c) => c.stage === 'VERIFY_SEAT' && !/final-pass/.test(c.prompt));
+      assert.ok(seatCall);
+      assert.match(seatCall.prompt, /reverted: lib\/b\.mjs/);
+    });
+
+    it('the judge sees each blocking candidate with its file, line, and side', async () => {
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll, newInDiff: [{ claim: 'guard removed', file: 'lib/a.mjs', line: 11, side: 'old' }] });
+      await runVerify({ state, diffParts: diffA, runAgent });
+      const judge = runAgent.calls.find((c) => c.stage === 'VERIFY_JUDGE');
+      assert.match(judge.prompt, /guard removed/);
+      assert.match(judge.prompt, /lib\/a\.mjs:11 \(old side\)/);
+      assert.equal(/\[object Object\]/.test(judge.prompt), false);
+    });
+
+    it('a broken final-pass answer makes the item not-met', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: (s) => (s === 'breaker' ? [{ id: 'C1', status: 'broken', evidence: 'guard gone' }] : holdsAll(s)) }) });
+      assert.equal(res.verdict, 'BLOCK');
+      assert.equal(res.record.items.C1.reason, 'regression');
+    });
+
+    it('after a BLOCK from newInDiff only, the next verify runs the final pass on the new diff', async () => {
+      const r1 = await runVerify({
+        state,
+        diffParts: diffA,
+        runAgent: agent({ seatItems: metAll, regression: holdsAll, newInDiff: [{ claim: 'guard removed', file: 'lib/a.mjs', line: 11, side: 'old' }], judgeNew: [{ claim: 'guard removed', verdict: 'accepted', why: 'real' }] }),
+      });
+      assert.equal(r1.verdict, 'BLOCK');
+      assert.ok(Object.values(r1.record.items).every((i) => i.status === 'met'));
+      const runAgent = agent({ seatItems: metAll, regression: holdsAll });
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent, records: [r1.record] });
+      assert.equal(r2.verdict, 'PASS');
+      assert.ok(runAgent.calls.some((c) => /final-pass/.test(c.prompt)));
+    });
+
+    it('a 3.0.2 verify record is ignored (round 1 again)', async () => {
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: metAll, regression: holdsAll }), records: [{ diff: 'x', verdict: 'BLOCK' }] });
+      assert.equal(res.record.round, 1);
     });
   });
 

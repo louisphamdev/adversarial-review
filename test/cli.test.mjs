@@ -373,6 +373,39 @@ describe('cli unit and command tests', () => {
       }
     });
 
+    it('verify with --base --output=x returns exit 2', async () => {
+      const iso = await makeIsolatedEnv();
+      try {
+        const dummyRun = await makeRunDirWithRuling(iso.home);
+        const io = createMockIO();
+        assert.equal(await main(['verify', dummyRun, '--base', '--output=x'], { env: iso.env, ...io }), 2);
+        const io2 = createMockIO();
+        assert.equal(await main(['verify', dummyRun, '--base=--output=x'], { env: iso.env, ...io2 }), 2);
+      } finally {
+        await iso.cleanup();
+      }
+    });
+
+    it('verify refuses a --base in round 2 that resolves to another commit than round 1', async () => {
+      const iso = await makeIsolatedEnv();
+      const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+      try {
+        await fs.writeFile(path.join(repo.root, 'a.js'), 'x = 2;\n');
+        repo.git(['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-q', '-am', 'second']);
+        const dummyRun = await makeRunDirWithRuling(iso.home);
+        await fs.writeFile(path.join(dummyRun, 'request.json'), JSON.stringify({ repoRoot: repo.root }));
+        const first = repo.git(['rev-parse', 'HEAD~1']).trim();
+        const record = { round: 1, baseSha: first, items: {}, judge: { verdict: 'BLOCK' }, diffHash: 'h', engineVersion: ENGINE_VERSION };
+        await fs.writeFile(path.join(dummyRun, 'stages', 'verify-1.json'), JSON.stringify(record));
+        const io = createMockIO();
+        assert.equal(await main(['verify', dummyRun, '--base', 'HEAD'], { env: iso.env, ...io }), 2);
+        assert.match(io.stderr.text, /verifies against/);
+      } finally {
+        await iso.cleanup();
+        await repo.cleanup();
+      }
+    });
+
     it('verify on directory without ruling returns exit 2', async () => {
       const iso = await makeIsolatedEnv();
       const io = createMockIO();
