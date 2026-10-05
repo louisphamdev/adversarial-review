@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 import { loadConfig } from './config.mjs';
-import { resolveMaterial } from './material.mjs';
+import { resolveMaterial, materialSizeWarning } from './material.mjs';
 import { resolveSeats } from './seats.mjs';
 import { readQuota } from './quota.mjs';
 import { decideRoute } from './route.mjs';
@@ -101,7 +101,8 @@ export async function resolveRunPlan(flags = {}, { env = process.env, cwd = proc
     seatsFlag: flags.seats,
     projectSeats: config.projectSeats,
   });
-  for (const w of [...configWarnings, ...seatWarnings]) {
+  const sizeWarning = materialSizeWarning(material);
+  for (const w of [...configWarnings, ...seatWarnings, ...(sizeWarning ? [sizeWarning] : [])]) {
     if (stderr?.write) stderr.write(`Warning: ${w}\n`);
   }
 
@@ -177,5 +178,6 @@ export async function resolveRunPlan(flags = {}, { env = process.env, cwd = proc
     swarmAvailable,
     judge: hostJudge(hostBackend, config.stages?.ruling?.model || null),
     siftOn: config.sift?.enabled !== false,
+    warnings: sizeWarning ? [sizeWarning] : [],
   };
 }

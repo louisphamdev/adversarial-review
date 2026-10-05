@@ -21,6 +21,10 @@ Convene the table when mistakes carry high cost:
 
 Do not convene the table for a one-line change, a rename, or trivial edits.
 
+A material with more than 4000 changed lines or more than 30 files is large.
+For a large material, `preflight` and `run` write a warning with the line count of each top-level directory.
+The warning does not stop the run. One table for each subsystem gives a better review.
+
 ## Route Choice
 
 The engine picks the route of the seats: `spawn` (host agents) or `swarm` (free models).

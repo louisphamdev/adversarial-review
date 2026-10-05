@@ -7,6 +7,7 @@ import {
   resolveMaterial,
   hashMaterial,
   normalizeDiff,
+  materialSizeWarning,
 } from '../skills/adversarial-review/scripts/lib/material.mjs';
 import { ConfigError } from '../skills/adversarial-review/scripts/lib/errors.mjs';
 import { canonicalPath } from '../skills/adversarial-review/scripts/lib/paths.mjs';
@@ -195,5 +196,43 @@ describe('material module', () => {
     } finally {
       await rm(nonGitDir, { recursive: true, force: true });
     }
+  });
+
+  it('a diff measures its changed lines per top-level directory, untracked files included', async () => {
+    const { root, cleanup } = await makeTempRepo({
+      git: true,
+      files: { 'src/a.js': 'a\nb\n', 'test/b.js': 'x\n', 'top.md': 't\n' },
+    });
+    try {
+      await writeFile(path.join(root, 'src', 'a.js'), 'a\nB\nc\n');
+      await writeFile(path.join(root, 'top.md'), 'T\n');
+      await mkdir(path.join(root, 'docs'));
+      await writeFile(path.join(root, 'docs', 'new.md'), '1\n2\n3\n4\n');
+      const mat = await resolveMaterial({ cwd: root });
+      assert.deepEqual(mat.subsystems, [{ dir: 'docs', lines: 4 }, { dir: 'src', lines: 3 }, { dir: '.', lines: 2 }]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('a directory target measures its lines per top-level directory', async () => {
+    const { root, cleanup } = await makeTempRepo({ git: true, files: { 'src/a/x.js': '1\n2\n', 'src/b.js': '3\n' } });
+    try {
+      const mat = await resolveMaterial({ target: 'src', cwd: root });
+      assert.deepEqual(mat.subsystems, [{ dir: 'a', lines: 2 }, { dir: '.', lines: 1 }]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('materialSizeWarning splits a large material by subsystem and stays silent below the limits', () => {
+    const subsystems = [{ dir: 'src', lines: 3000 }, { dir: 'test', lines: 1200 }];
+    assert.equal(
+      materialSizeWarning({ kind: 'diff', files: 12, subsystems }),
+      'The material is large: 4200 changed lines in 12 files (limits: 4000 lines, 30 files). Run one table per subsystem: src 3000 lines, test 1200 lines.'
+    );
+    assert.match(materialSizeWarning({ kind: 'dir', files: 31, subsystems: [{ dir: 'src', lines: 40 }] }), /: 40 lines in 31 files/);
+    assert.equal(materialSizeWarning({ files: 30, subsystems: [{ dir: 'src', lines: 4000 }] }), null);
+    assert.equal(materialSizeWarning({ files: 1 }), null);
   });
 });

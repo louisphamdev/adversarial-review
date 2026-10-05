@@ -195,6 +195,28 @@ test('preflight --json writes a bundle, starts no seat, and refuses an existing 
   }
 });
 
+test('preflight and a plain run warn about a large material and do not block', async () => {
+  const { iso, repo, cleanup } = await setupRepo();
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    for (const dir of ['api', 'web']) {
+      await mkdir(path.join(repo.root, dir));
+      for (let i = 0; i < 16; i++) await writeFile(path.join(repo.root, dir, `f${i}.js`), dir === 'api' ? 'a\nb\n' : 'c\n');
+    }
+    const pre = await runCli(['preflight', '--route', 'spawn', '--backend', 'custom', '--seats', 'breaker', '--json'], { env: iso.env, cwd: repo.root });
+    assert.equal(pre.code, 0, pre.stderr);
+    const { bundle } = JSON.parse(pre.stdout);
+    assert.equal(bundle.warnings.length, 1);
+    assert.match(bundle.warnings[0], /in 33 files .*Run one table per subsystem: api 32 lines, web 16 lines, \. 2 lines\.$/);
+    assert.match(pre.stderr, /Warning: The material is large/);
+    const run = await runCli(['run', '--route', 'spawn', '--backend', 'custom', '--seats', 'breaker', '--until', 'find'], { env: iso.env, cwd: repo.root });
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stderr, /Warning: The material is large/);
+  } finally {
+    await cleanup();
+  }
+});
+
 test('run --from-preflight: unanswered exits 2, drift exits 2, an answered bundle is the request', async () => {
   const { iso, repo, cleanup } = await setupRepo();
   try {

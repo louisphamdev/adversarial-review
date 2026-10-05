@@ -226,6 +226,7 @@ export function buildBundle(plan, flags = {}, { config = plan.config || {}, now 
     judge: plan.judge || null,
     sift: { enabled: siftOn },
     discoveryErrors: plan.discoveryErrors || [],
+    warnings: plan.warnings || [],
     dataLeaves,
     estimateSec: estimateSec(seatModels, plan.latencies),
     decisions: decisionsFor(plan, config, dataLeaves, flags),

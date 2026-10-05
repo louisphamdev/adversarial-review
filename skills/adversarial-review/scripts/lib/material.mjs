@@ -18,6 +18,48 @@ function countLines(text) {
   return text.endsWith('\n') || text.endsWith('\r') ? lines.length - 1 : lines.length;
 }
 
+export const LARGE_MATERIAL = { lines: 4000, files: 30 };
+
+// Line counts per top-level directory, largest first. A file at the top level counts under ".".
+function bySubsystem(entries) {
+  const totals = new Map();
+  for (const { relPath, lines } of entries) {
+    const parts = relPath.split('/');
+    const dir = parts.length > 1 ? parts[0] : '.';
+    totals.set(dir, (totals.get(dir) || 0) + lines);
+  }
+  return [...totals].map(([dir, lines]) => ({ dir, lines })).sort((a, b) => b.lines - a.lines || (a.dir < b.dir ? -1 : 1));
+}
+
+// Added and removed lines per file of a git diff. Header lines before the first hunk never count.
+function diffLineEntries(diffText) {
+  const entries = [];
+  let cur = null;
+  for (const line of diffText.split('\n')) {
+    const head = /^diff --git a\/.* b\/(.*)$/.exec(line);
+    if (head) {
+      cur = { relPath: head[1], lines: 0, inHunk: false };
+      entries.push(cur);
+    } else if (cur && line.startsWith('@@')) {
+      cur.inHunk = true;
+    } else if (cur?.inHunk && (line.startsWith('+') || line.startsWith('-'))) {
+      cur.lines += 1;
+    }
+  }
+  return entries;
+}
+
+// A warning that names the split, or null. A large material never blocks a run.
+export function materialSizeWarning(material = {}) {
+  const subsystems = material.subsystems || [];
+  const lines = subsystems.reduce((n, s) => n + s.lines, 0);
+  const files = material.files || 0;
+  if (lines <= LARGE_MATERIAL.lines && files <= LARGE_MATERIAL.files) return null;
+  const split = subsystems.map((s) => `${s.dir} ${s.lines} lines`).join(', ');
+  const what = material.kind === 'diff' ? 'changed lines' : 'lines';
+  return `The material is large: ${lines} ${what} in ${files} files (limits: ${LARGE_MATERIAL.lines} lines, ${LARGE_MATERIAL.files} files). Run one table per subsystem: ${split}.`;
+}
+
 function hashDiff(diffText, commit) {
   const norm = normalizeDiff(diffText);
   const c = (commit || '').trim();
@@ -55,6 +97,7 @@ async function walkDir(dir) {
     files: entries.length,
     lines: totalLines,
     hash: hasher.digest('hex'),
+    subsystems: bySubsystem(entries),
   };
 }
 
@@ -117,7 +160,7 @@ async function getDiffMaterial(root, base, runChild) {
   const commit = commitRes.code === 0 ? commitRes.stdout.trim() : '';
   const hash = hashDiff(fullText, commit);
 
-  return { text: fullText, files, lines, hash, commit };
+  return { text: fullText, files, lines, hash, commit, untrackedFiles };
 }
 
 // Resolves review material from a file, directory, or working tree git diff.
@@ -134,6 +177,10 @@ export async function resolveMaterial({
     }
     const root = canonicalPath(topRes.stdout.trim());
     const diffMat = await getDiffMaterial(root, base, runChild);
+    const untracked = await Promise.all(diffMat.untrackedFiles.map(async (relPath) => ({
+      relPath,
+      lines: await fs.readFile(path.join(root, relPath), 'utf8').then(countLines, () => 0),
+    })));
     return {
       kind: 'diff',
       root,
@@ -144,6 +191,7 @@ export async function resolveMaterial({
       lines: diffMat.lines,
       hash: diffMat.hash,
       base,
+      subsystems: bySubsystem([...diffLineEntries(normalizeDiff(diffMat.text)), ...untracked]),
     };
   }
 
@@ -178,6 +226,7 @@ export async function resolveMaterial({
       files: 1,
       lines: countLines(text),
       hash,
+      subsystems: [{ dir: '.', lines: countLines(text) }],
     };
   }
 
@@ -191,6 +240,7 @@ export async function resolveMaterial({
       files: dirInfo.files,
       lines: dirInfo.lines,
       hash: dirInfo.hash,
+      subsystems: dirInfo.subsystems,
     };
   }
 

@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Idle failover: `timeouts.idle.find` and `timeouts.idle.other` stop a silent streaming call
   and move it to the next model of the seat.
 - `status` shows the model, the attempt, and the idle time of each call, and a hung owner.
+- `preflight` and `run` measure the material. Above 4000 changed lines or 30 files, they write a warning with the line count of each top-level directory and the advice to run one table per subsystem. The bundle keeps it in `warnings`. The warning does not stop the run.
 - `patch-review` and `verify` records carry `converging`. It is false when a round has as many blocking items as the round before, or more. The command then prints a `Not converging` line that tells the host to stop and cut scope.
 
 ### Fixed
