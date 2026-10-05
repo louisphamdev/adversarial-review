@@ -217,6 +217,24 @@ test('a tracked path whose parent directory became a link out of the repository 
   }
 });
 
+test('a path through a link to .git inside the repository is refused by its resolved path', async (t) => {
+  const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+  try {
+    try {
+      await symlink(path.join(repo.root, '.git'), path.join(repo.root, 'lnk'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (err) {
+      t.skip(`cannot create a directory link here: ${err.code}`);
+      return;
+    }
+    const text = 'diff --git a/lnk/config b/lnk/config\n--- a/lnk/config\n+++ b/lnk/config\n@@ -1 +1 @@\n-x\n+y\n';
+    const plan = await planSandbox({ repoRoot: repo.root, material: { kind: 'diff', text } });
+    assert.ok(!plan.files.includes('lnk/config'), plan.files.join(','));
+    assert.ok(plan.files.includes('a.js'));
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test('createSandbox reports a cap breach before copying anything', async () => {
   const repo = await makeTempRepo({ files: { 'a.js': '1', 'b.js': '2' } });
   const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));

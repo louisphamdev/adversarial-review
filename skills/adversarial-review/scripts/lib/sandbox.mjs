@@ -51,8 +51,10 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
   let skippedMissing = 0;
   let skippedReserved = 0;
   let skippedOutside = 0;
+  const realRoot = await fs.realpath(repoRoot);
+  const isReserved = (p) => p.split('/')[0].toLowerCase() === '.ar-review';
   for (const rel of all) {
-    if (rel.split('/')[0].toLowerCase() === '.ar-review') { skippedReserved++; continue; }
+    if (isReserved(rel)) { skippedReserved++; continue; }
     if (isSecretRel(rel)) { skippedSecrets++; continue; }
     let st;
     try {
@@ -62,7 +64,12 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
       continue;
     }
     if (!st.isFile()) { skippedMissing++; continue; }
-    if (!(await containedPath(repoRoot, rel))) { skippedOutside++; continue; }
+    const real = await containedPath(repoRoot, rel);
+    if (!real) { skippedOutside++; continue; }
+    // A link inside the repository can point at .git or a secret file: the filters read both names.
+    const realRel = fwd(path.relative(realRoot, real));
+    if (isReserved(realRel)) { skippedReserved++; continue; }
+    if (isSecretRel(realRel)) { skippedSecrets++; continue; }
     files.push(rel);
     bytes += st.size;
   }
