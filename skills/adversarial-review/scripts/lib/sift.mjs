@@ -117,12 +117,13 @@ export async function buildExcerpt(finding = {}, { scope = { files: [], runMater
       // A missing root cannot contain the file.
     }
   }
-  // 4. Scope membership: the cited path, or, when a link sits anywhere on the path, its realpath.
+  // 4. Root containment of the realpath. It comes first: a temp directory under a link (macOS /var)
+  // or an 8.3 name (Windows) makes the realpath differ, and the scope check would hide the reason.
+  if (!roots.some((r) => real === r || real.startsWith(`${r}/`))) return { text: '', action: 'outside_root' };
+  // 5. Scope membership: the cited path, or, when a link sits anywhere on the path, its realpath.
   const inScope = (p) => p === scope.runMaterial || scope.files.includes(p);
   const linked = st.isSymbolicLink() || !viaRoot.concat(real).includes(cited);
   if (linked ? !(inScope(real) || viaRoot.some(inScope)) : !inScope(cited)) return { text: '', action: 'not_in_material' };
-  // 5. Root containment of the realpath.
-  if (!roots.some((r) => real === r || real.startsWith(`${r}/`))) return { text: '', action: 'outside_root' };
   // 6. Size, then 7. read the realpath that was tested.
   const rst = await fs.stat(real);
   if (rst.size > MAX_FILE_BYTES) return { text: '', action: 'too_large' };

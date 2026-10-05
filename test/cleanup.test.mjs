@@ -16,7 +16,7 @@ import {
 } from '../skills/adversarial-review/scripts/lib/cleanup.mjs';
 import { acquireLock } from '../skills/adversarial-review/scripts/lib/lockfile.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
-import { makeIsolatedEnv } from './helpers/isolated-env.mjs';
+import { makeIsolatedEnv, makeFakeBins } from './helpers/isolated-env.mjs';
 
 // A stub lane: one tracked child that starts a grandchild. A plain kill of the child leaves the
 // grandchild running, which is exactly the leak this cleanup exists to stop.
@@ -231,6 +231,9 @@ const LANE_COMMANDS = [
 for (const { argv, exitCode } of LANE_COMMANDS) {
   test(`${argv.join(' ')} sweeps the lanes it opened before it exits`, async () => {
     const { env, home, cleanup } = await makeIsolatedEnv();
+    // A fixed backend set: doctor exits 1 when the configured swarm backend is missing, so the real PATH must not decide.
+    const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)', opencode: '2.0.8' });
+    env[bins.pathKey] = bins.pathEnv;
     const sink = { write: () => true };
     const stub = await startLaneStub();
     try {
@@ -239,6 +242,7 @@ for (const { argv, exitCode } of LANE_COMMANDS) {
       assert.equal(isPidAlive(stub.pid), false, 'the lane process is gone');
       assert.equal(isPidAlive(stub.grandchildPid), false, 'the process the lane started is gone');
     } finally {
+      await bins.cleanup();
       await cleanup();
     }
   });

@@ -62,7 +62,8 @@ test('doctor reports the opencode exe, isolation, and fails on an opencode major
       text,
       /lanes: standalone, isolated config \(no global MCP, instructions, or plugins\)/
     );
-    assert.match(text, /os-isolation: none/);
+    // The probe reads PATH, and the git directory on a CI runner can also hold docker.
+    assert.match(text, /os-isolation: (none|docker|wsl)$/m);
     assert.match(text, /opencode: major version 1 is not supported \(need 2\.x\)/);
     // The old v1 seat agent file is absent here, so the line must not appear at all.
     assert.doesNotMatch(text, /opencode seat agent/);
