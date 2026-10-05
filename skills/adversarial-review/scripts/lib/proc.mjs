@@ -36,11 +36,37 @@ export const trackedChildren = new Set();
 // pids: a pid kept past that point can name an unrelated process by the time the sweep runs.
 export const trackedPids = new Set();
 
+// Every pid this process spawned, with the time window of its spawn() call, kept until the next
+// sweep ends. On Windows a lane leader that exited leaves no tree to kill, so the sweep finds its
+// survivors by parent pid, and the window tells the lane apart from a later process with its pid.
+export const everTracked = new Map();
+
 export const CLEANUP_WAIT_MS = 5000;
 
-// The signal path runs the same cleanup, so this window must outlast CLEANUP_WAIT_MS plus the
-// EBUSY retries of the sandbox removal. A shorter one exits while lanes are still being killed.
-export const EXIT_HOOK_GRACE_MS = 8000;
+// The measured scan takes about 0.5 s; this bound only matters when WMI hangs.
+export const WIN_SCAN_TIMEOUT_MS = 3000;
+export const DESCENDANT_WAIT_MS = 1000;
+
+// The signal path runs the same cleanup, so this window must outlast all of it:
+// CLEANUP_WAIT_MS (5000) + WIN_SCAN_TIMEOUT_MS (3000) + DESCENDANT_WAIT_MS (1000) + 3000 for the
+// taskkill calls and the xdg removal retries (3 x 500 ms) = 12000.
+export const EXIT_HOOK_GRACE_MS = CLEANUP_WAIT_MS + WIN_SCAN_TIMEOUT_MS + DESCENDANT_WAIT_MS + 3000;
+
+// Set once the exit sweep starts, and never cleared in production: a seat retry loop that is
+// still running must not start a lane the sweep has already passed.
+let closing = false;
+
+export function beginClosing() {
+  closing = true;
+}
+
+export function isClosing() {
+  return closing;
+}
+
+export function resetClosingForTests() {
+  closing = false;
+}
 
 /**
  * Read an env value by case-insensitive key name.
@@ -219,6 +245,14 @@ export async function spawnResolved(resolvedPath, args = [], options = {}) {
     }
   }
 
+  // Checked after the last await: a sweep that began during resolveNpmShim has already copied
+  // the tracked pids, so a lane started now would outlive it.
+  if (closing) {
+    const err = new Error('aborted: the exit sweep has begun');
+    err.code = 'ABORTED';
+    throw err;
+  }
+  const pre = Date.now();
   const child = spawn(command, finalArgs, {
     cwd: options.cwd,
     env: options.env,
@@ -227,9 +261,17 @@ export async function spawnResolved(resolvedPath, args = [], options = {}) {
     windowsHide: true,
     detached: platform !== 'win32',
   });
+  const post = Date.now();
 
   trackedChildren.add(child);
-  if (child.pid) trackedPids.add(child.pid);
+  if (child.pid) {
+    trackedPids.add(child.pid);
+    const lane = { pre, post };
+    everTracked.set(child.pid, lane);
+    child.once('exit', () => {
+      lane.end = Date.now();
+    });
+  }
   const cleanup = () => {
     trackedChildren.delete(child);
     if (child.pid && !isPidTreeAlive(child.pid)) trackedPids.delete(child.pid);
@@ -364,35 +406,142 @@ export function killPidTree(pid, platform = process.platform) {
   }
 }
 
+const WIN_SCAN_SCRIPT =
+  'Get-CimInstance Win32_Process | ForEach-Object { $c = if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }; "$($_.ProcessId),$($_.ParentProcessId),$c" }';
+
+/**
+ * Read the Windows process table as pid -> { ppid, created } (epoch ms), or null when it fails.
+ * A raw spawnSync on purpose: it runs after the closing flag is set and on the exit path.
+ *
+ * @param {{ spawnSyncFn?: Function, timeoutMs?: number }} [options]
+ * @returns {Map<number, { ppid: number, created: number }>|null}
+ */
+export function readWinProcessTable({ spawnSyncFn = spawnSync, timeoutMs = WIN_SCAN_TIMEOUT_MS } = {}) {
+  let res;
+  try {
+    res = spawnSyncFn(
+      system32Path('WindowsPowerShell/v1.0/powershell.exe'),
+      ['-NoProfile', '-NonInteractive', '-Command', WIN_SCAN_SCRIPT],
+      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+  } catch {
+    return null;
+  }
+  if (!res || res.status !== 0 || typeof res.stdout !== 'string') return null;
+  const table = new Map();
+  for (const line of res.stdout.split(/\r?\n/)) {
+    const m = line.trim().match(/^(\d+),(\d+),(\d+)$/);
+    if (m) table.set(Number(m[1]), { ppid: Number(m[2]), created: Number(m[3]) });
+  }
+  return table;
+}
+
+/**
+ * The live processes that belong to a lane: the lane itself while its pid still names it, and
+ * every descendant. A pid holder started outside the lane's spawn window is another process, and
+ * a child started before its recorded parent, or after the lane exited, hangs from a reused pid;
+ * neither is followed.
+ *
+ * @param {Map<number, { ppid: number, created: number }>} table
+ * @param {Map<number, { pre: number, post: number, end?: number }>} lanes
+ * @param {number} [selfPid]
+ * @returns {Set<number>}
+ */
+export function laneProcesses(table, lanes, selfPid = process.pid) {
+  const children = new Map();
+  for (const [pid, p] of table) {
+    if (pid === p.ppid) continue;
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(pid);
+  }
+  const out = new Set();
+  for (const [lane, { pre, post, end = Infinity }] of lanes) {
+    const holder = table.get(lane);
+    if (holder && (holder.created < pre || holder.created > post)) continue;
+    if (holder && lane !== selfPid) out.add(lane);
+    const stack = [[lane, holder ? holder.created : pre]];
+    while (stack.length) {
+      const [pid, created] = stack.pop();
+      for (const child of children.get(pid) || []) {
+        const c = table.get(child);
+        if (child === selfPid || out.has(child) || c.created < created) continue;
+        if (pid === lane && c.created > end) continue;
+        out.add(child);
+        stack.push([child, c.created]);
+      }
+    }
+  }
+  return out;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * Kill the process tree of every tracked pid, then wait for them to disappear.
  * A pid that survives the wait is reported, never hidden: the caller names it to the user.
  *
- * @param {{ waitMs?: number, kill?: (pid: number) => void }} [options]
- * @returns {Promise<{ killed: number, stillAlive: number[] }>}
+ * @param {{ waitMs?: number, kill?: (pid: number) => void, isAlive?: (pid: number) => boolean,
+ *   platform?: string, spawnSyncFn?: Function, descendantWaitMs?: number }} [options]
+ * @returns {Promise<{ killed: number, stillAlive: number[], scanFailed?: boolean }>}
  */
-export async function cleanupTracked({ waitMs = CLEANUP_WAIT_MS, kill = killPidTree } = {}) {
-  const pids = [...trackedPids];
-  // The attempt never reads the pid's own liveness. A pid that exited can still lead a group
-  // that holds a live lane server, and that pid is the only handle on it: skipping it would
-  // leave the leak running and still report a clean sweep. Liveness only counts the kill.
-  const killed = pids.filter((pid) => isPidAlive(pid)).length;
-  for (const pid of pids) {
-    kill(pid);
-  }
-  trackedChildren.clear();
-
+export async function cleanupTracked({
+  waitMs = CLEANUP_WAIT_MS,
+  kill = killPidTree,
+  isAlive = isPidAlive,
+  platform = process.platform,
+  spawnSyncFn = spawnSync,
+  descendantWaitMs = DESCENDANT_WAIT_MS,
+} = {}) {
   const deadline = Date.now() + Math.max(0, waitMs);
-  let alive = pids.filter((pid) => isPidAlive(pid));
-  while (alive.length > 0 && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 100));
-    alive = alive.filter((pid) => isPidAlive(pid));
+  const swept = new Set();
+  let killed = 0;
+  let alive = [];
+  // A seat retry loop can track a new lane while this waits, so each pass sweeps the pids that
+  // appeared since the last one, and the loop ends only on a pass that finds nothing new.
+  for (;;) {
+    const fresh = [...trackedPids].filter((pid) => !swept.has(pid));
+    // The attempt never reads the pid's own liveness. A pid that exited can still lead a group
+    // that holds a live lane server, and that pid is the only handle on it: skipping it would
+    // leave the leak running and still report a clean sweep. Liveness only counts the kill.
+    for (const pid of fresh) {
+      swept.add(pid);
+      if (isAlive(pid)) killed++;
+      kill(pid);
+    }
+    trackedChildren.clear();
+    alive = [...swept].filter((pid) => isAlive(pid));
+    if (Date.now() >= deadline || (fresh.length === 0 && alive.length === 0)) break;
+    await sleep(100);
   }
 
-  for (const pid of pids) {
+  let scanFailed = false;
+  if (platform === 'win32' && everTracked.size > 0) {
+    const table = readWinProcessTable({ spawnSyncFn });
+    if (!table) {
+      scanFailed = true;
+    } else {
+      const targets = [...laneProcesses(table, everTracked)].filter((pid) => !swept.has(pid) && isAlive(pid));
+      for (const pid of targets) {
+        killed++;
+        kill(pid);
+      }
+      const until = Date.now() + Math.max(0, descendantWaitMs);
+      let left = targets.filter((pid) => isAlive(pid));
+      while (left.length > 0 && Date.now() < until) {
+        await sleep(100);
+        left = left.filter((pid) => isAlive(pid));
+      }
+      alive.push(...left);
+    }
+  }
+
+  for (const pid of swept) {
     if (!alive.includes(pid)) trackedPids.delete(pid);
   }
-  return { killed, stillAlive: alive };
+  for (const pid of [...everTracked.keys()]) {
+    if (!alive.includes(pid)) everTracked.delete(pid);
+  }
+  return scanFailed ? { killed, stillAlive: alive, scanFailed } : { killed, stillAlive: alive };
 }
 
 /**
@@ -440,6 +589,7 @@ export function installSignalHandlers(onExit) {
   const handleExit = async (exitCode, err) => {
     if (exiting) return;
     exiting = true;
+    beginClosing();
 
     try {
       killAllTrackedSync();
@@ -543,7 +693,7 @@ function collectTailStream(child, which, maxBytes = RUN_CHILD_MAX_BYTES) {
  * @param {number} [options.idleMs] Kill the child after this long with no stdout or stderr chunk.
  * @param {Function} [options.onSpawn]
  * @param {Function} [options.onStdout]
- * @returns {Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, idled: boolean, spawnError: Error|null }>}
+ * @returns {Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, idled: boolean, spawnError: Error|null, aborted?: boolean }>}
  */
 export async function runChild({
   cmd,
@@ -600,7 +750,8 @@ export async function runChild({
       stderr: '',
       timedOut: false,
       idled: false,
-      spawnError: err,
+      spawnError: err?.code === 'ABORTED' ? null : err,
+      ...(err?.code === 'ABORTED' ? { aborted: true } : {}),
     };
   }
 

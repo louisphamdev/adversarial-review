@@ -6,7 +6,7 @@ import path from 'node:path';
 import { mkdtemp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { spawnResolved, isPidAlive } from '../skills/adversarial-review/scripts/lib/proc.mjs';
+import { spawnResolved, isPidAlive, isClosing, resetClosingForTests } from '../skills/adversarial-review/scripts/lib/proc.mjs';
 import {
   acquireLockWithCleanup,
   makeExitHandler,
@@ -21,6 +21,8 @@ import { makeIsolatedEnv } from './helpers/isolated-env.mjs';
 // A stub lane: one tracked child that starts a grandchild. A plain kill of the child leaves the
 // grandchild running, which is exactly the leak this cleanup exists to stop.
 async function startLaneStub() {
+  // Every sweep in this file leaves the process closing, as it does at the end of a command.
+  resetClosingForTests();
   const stub = [
     "const { spawn } = require('node:child_process');",
     "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
@@ -174,6 +176,22 @@ test('acquireLockWithCleanup takes the run lock and names the run directory for 
   } finally {
     setActiveRunDir(null);
     await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+// A seat retry loop can outlive the command body. The sweep closes the process to new lanes
+// before it reads the tracked pids, and keeps it closed (3.1 review C4).
+test('runExitCleanup closes the process to new lanes and keeps it closed', async () => {
+  resetClosingForTests();
+  try {
+    await runExitCleanup({ waitMs: 0 });
+    assert.equal(isClosing(), true);
+    await assert.rejects(
+      spawnResolved(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }),
+      (err) => err.code === 'ABORTED'
+    );
+  } finally {
+    resetClosingForTests();
   }
 });
 

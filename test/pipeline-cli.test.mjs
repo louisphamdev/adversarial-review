@@ -487,6 +487,8 @@ describe('pipeline-cli e2e tests', () => {
       assert.equal(res.status, 0, `run --detach should exit 0. stderr: ${res.stderr}`);
       const runDir = res.stdout.trim().split(/\r?\n/)[0];
       assert.ok(existsSync(runDir), `run directory ${runDir} should exist`);
+      const lockRaw = await fs.readFile(path.join(runDir, 'lock'), 'utf8').catch(() => '{}');
+      const ownerPid = JSON.parse(lockRaw).pid;
 
       // Immediately check status
       const statusRes = spawnSync(
@@ -499,7 +501,8 @@ describe('pipeline-cli e2e tests', () => {
         }
       );
       assert.equal(statusRes.status, 0);
-      assert.ok(statusRes.stdout.includes('alive') || statusRes.stdout.includes('owner'));
+      // A fast owner can finish before this runs, and status then prints `Owner: none`.
+      assert.match(statusRes.stdout, /owner/i);
 
       // Wait up to 15s for result.json
       const resultPath = path.join(runDir, 'result.json');
@@ -513,6 +516,19 @@ describe('pipeline-cli e2e tests', () => {
         await new Promise((r) => setTimeout(r, 200));
       }
       assert.ok(finished, 'result.json should be written by detached worker');
+      // result.json comes before the exit sweep, and the owner holds the repository as its cwd
+      // until it exits, so removing the repository now fails with EBUSY on Windows. A fast owner
+      // has released its lock already; its last writes are the sweep record and the release.
+      if (ownerPid) {
+        assert.ok(await waitForOwnerExit(ownerPid), 'the detached owner did not finish');
+      } else {
+        const until = Date.now() + 30000;
+        const swept = async () => JSON.parse(await fs.readFile(resultPath, 'utf8').catch(() => '{}')).cleanup;
+        while (Date.now() < until && (!(await swept()) || existsSync(path.join(runDir, 'lock')))) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
     } finally {
       await cleanup();
     }

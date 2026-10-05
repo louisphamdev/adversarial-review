@@ -2,7 +2,7 @@
 // and the isolated lane config is gone, before the command returns on any path.
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { CLEANUP_WAIT_MS, cleanupTracked, installSignalHandlers } from './proc.mjs';
+import { CLEANUP_WAIT_MS, beginClosing, cleanupTracked, installSignalHandlers } from './proc.mjs';
 import { acquireLock } from './lockfile.mjs';
 import { removeSandbox } from './sandbox.mjs';
 import { appendEvent } from './rundir.mjs';
@@ -46,6 +46,8 @@ async function mergeResultCleanup(runDir, cleanup) {
  * @returns {Promise<{ killed: number, stillAlive: number[] }>}
  */
 export async function runExitCleanup({ runDir = active.runDir, stderr, waitMs = CLEANUP_WAIT_MS } = {}) {
+  // Set before the sweep reads the tracked pids, and left set: the command is ending.
+  beginClosing();
   const record = await cleanupTracked({ waitMs });
 
   if (runDir) {

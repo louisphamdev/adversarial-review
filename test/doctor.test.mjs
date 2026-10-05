@@ -6,6 +6,14 @@ import path from 'node:path';
 import { makeIsolatedEnv, makeFakeBins } from './helpers/isolated-env.mjs';
 import { writeSwarmBin } from './helpers/run-fixture.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
+import { resetClosingForTests } from '../skills/adversarial-review/scripts/lib/proc.mjs';
+
+// Each command ends with the exit sweep, which leaves the process closed to new lanes. This
+// file runs many commands in one process, so each one starts open, as a real command does.
+function runMain(argv, io) {
+  resetClosingForTests();
+  return main(argv, io);
+}
 
 function sink() {
   let text = '';
@@ -27,7 +35,7 @@ test('doctor reads host installs from the manifest, not from guessed paths', asy
       },
     }));
     const stdout = sink();
-    const code = await main(['doctor'], { env, cwd: home, stdout, stderr: sink() });
+    const code = await runMain(['doctor'], { env, cwd: home, stdout, stderr: sink() });
     assert.equal(code, 0);
     assert.match(stdout.text, /opencode: installed \(user\)/);
     assert.match(stdout.text, /codex: installed \(user\)/);
@@ -45,7 +53,7 @@ test('doctor reports the opencode exe, isolation, and fails on an opencode major
   env[bins.pathKey] = bins.pathEnv;
   try {
     const stdout = sink();
-    const code = await main(['doctor'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor'], { env, stdout, stderr: sink() });
     const text = stdout.text;
     assert.match(text, /isolation: sandbox copy \+ permission profile/);
     // A lane that reads the user's global config starts one set of MCP servers per lane
@@ -71,7 +79,7 @@ test('doctor keeps exit 0 when the opencode version string holds no dotted tripl
   env[bins.pathKey] = bins.pathEnv;
   try {
     const stdout = sink();
-    const code = await main(['doctor'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor'], { env, stdout, stderr: sink() });
     const text = stdout.text;
     // The exe was found and its version was read, so the parse branch really ran.
     assert.match(text, /opencode: .*\[some garbage\]/);
@@ -93,7 +101,7 @@ test('doctor lists the v1 seat agent only when the old file is on disk', async (
     await mkdir(agents, { recursive: true });
     await writeFile(path.join(agents, 'adversarial-review-seat.md'), '# old\n');
     const stdout = sink();
-    const code = await main(['doctor'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor'], { env, stdout, stderr: sink() });
     assert.equal(code, 0);
     assert.match(stdout.text, /opencode seat agent \(v1, unused\): present/);
   } finally {
@@ -119,7 +127,7 @@ test('doctor removes sandbox/xdg of a run with no live lock and keeps the one a 
     await writeFile(path.join(held, 'lock'), JSON.stringify({ pid: process.pid, token: 't', createdAt: Date.now() }));
 
     const stdout = sink();
-    const code = await main(['doctor'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor'], { env, stdout, stderr: sink() });
     assert.equal(code, 0);
     assert.match(stdout.text, /stale sandbox\/xdg removed: 1/);
     assert.equal(existsSync(path.join(stale, 'sandbox', 'xdg')), false);
@@ -138,7 +146,7 @@ test('doctor --probe says so instead of throwing when no callable model is store
   env[bins.pathKey] = bins.pathEnv;
   try {
     const stdout = sink();
-    const code = await main(['doctor', '--probe'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor', '--probe'], { env, stdout, stderr: sink() });
     assert.equal(code, 0);
     assert.match(stdout.text, /canary: no callable model stored/);
   } finally {
@@ -163,7 +171,7 @@ test('doctor --probe runs the canary on the fastest stored callable model and re
     }, null, 2));
 
     const stdout = sink();
-    const code = await main(['doctor', '--probe'], { env, stdout, stderr: sink() });
+    const code = await runMain(['doctor', '--probe'], { env, stdout, stderr: sink() });
     assert.equal(code, 0);
     assert.match(stdout.text, /canary: failed \(opencode\/fast\)/);
   } finally {

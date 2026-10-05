@@ -19,7 +19,14 @@ import {
   forceKill,
   trackedChildren,
   trackedPids,
+  everTracked,
   cleanupTracked,
+  beginClosing,
+  isClosing,
+  resetClosingForTests,
+  killPidTree,
+  CLEANUP_WAIT_MS,
+  EXIT_HOOK_GRACE_MS,
   isPidAlive,
   isPidTreeAlive,
   killAllTrackedSync,
@@ -909,5 +916,207 @@ describe('shared process helpers (v2 ported)', () => {
     const stderr = await captured;
     assert.equal(stderr.includes(MARKER), false);
     assert.equal(scanner.hit(), true);
+  });
+});
+
+// The exit sweep and a seat retry loop run at the same time. Once the sweep starts, nothing may
+// start a new lane, a lane tracked during the wait is swept too, and on Windows the descendants of
+// an exited lane leader are found through the process table (3.1 review C4 and C6).
+describe('closing sweep', () => {
+  // Fake pids never reach the real machine: every test injects kill, isAlive, and the table.
+  const borrow = () => {
+    const pids = [...trackedPids];
+    const lanes = [...everTracked];
+    trackedPids.clear();
+    everTracked.clear();
+    return () => {
+      trackedPids.clear();
+      everTracked.clear();
+      for (const p of pids) trackedPids.add(p);
+      for (const [k, v] of lanes) everTracked.set(k, v);
+    };
+  };
+  const table = (rows) => ({
+    status: 0,
+    stdout: rows.map(([pid, ppid, created]) => `${pid},${ppid},${created}`).join('\r\n') + '\r\n',
+  });
+
+  it('runChild spawns nothing and returns aborted once closing has begun', async () => {
+    const before = trackedPids.size;
+    beginClosing();
+    try {
+      assert.equal(isClosing(), true);
+      const res = await runChild({ cmd: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] });
+      assert.equal(res.aborted, true);
+      assert.equal(trackedPids.size, before, 'no process was started');
+    } finally {
+      resetClosingForTests();
+    }
+    assert.equal(isClosing(), false);
+  });
+
+  it('a pid tracked during the cleanup wait gets killed', async () => {
+    const restore = borrow();
+    try {
+      const A = 2_000_000_001;
+      const B = 2_000_000_002;
+      const asked = [];
+      let aliveUntil = 0;
+      trackedPids.add(A);
+      const res = await cleanupTracked({
+        waitMs: 3000,
+        platform: 'linux',
+        isAlive: (pid) => pid === A && Date.now() < aliveUntil,
+        kill: (pid) => {
+          asked.push(pid);
+          if (pid === A) {
+            aliveUntil = Date.now() + 300;
+            setTimeout(() => trackedPids.add(B), 50);
+          }
+        },
+      });
+      assert.deepEqual(asked, [A, B], 'each pid is killed once, the late one included');
+      assert.deepEqual(res.stillAlive, []);
+      assert.equal(trackedPids.has(B), false, 'a swept dead pid is dropped');
+    } finally {
+      restore();
+    }
+  });
+
+  it('the process-table scan runs while closing is set, with a bounded raw powershell call', async () => {
+    const restore = borrow();
+    beginClosing();
+    try {
+      everTracked.set(2_000_000_011, { pre: 1000, post: 1010 });
+      const calls = [];
+      await cleanupTracked({
+        waitMs: 0,
+        platform: 'win32',
+        isAlive: () => false,
+        kill: () => {},
+        spawnSyncFn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts });
+          return table([]);
+        },
+      });
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].cmd.replace(/\\/g, '/'), /System32\/WindowsPowerShell\/v1\.0\/powershell\.exe$/);
+      assert.deepEqual(calls[0].args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-Command']);
+      assert.ok(Number.isFinite(calls[0].opts.timeout) && calls[0].opts.timeout > 0, 'an explicit timeout');
+      assert.ok(EXIT_HOOK_GRACE_MS >= CLEANUP_WAIT_MS + calls[0].opts.timeout, 'the exit hook outlasts the wait and the scan');
+      assert.equal(everTracked.size, 0, 'the lane record ends with the sweep');
+    } finally {
+      resetClosingForTests();
+      restore();
+    }
+  });
+
+  it('on win32 the sweep kills descendants of an exited lane and nothing that only shares a pid', async () => {
+    const restore = borrow();
+    try {
+      const LANE = 2_000_000_021; // exited leader, started in [1000, 1010]
+      const REUSED = 2_000_000_022; // lane pid now held by a process started after the lane
+      const rows = [
+        [2_000_000_031, LANE, 1500], // child of the lane: killed
+        [2_000_000_032, 2_000_000_031, 1600], // grandchild: killed
+        [2_000_000_033, 2_000_000_031, 1200], // older than its "parent": a reused ppid, kept
+        [2_000_000_034, LANE, 500], // orphan of an older process that held the lane pid: kept
+        [REUSED, 4, 90_000], // reused lane pid outside [pre, post]: kept
+        [2_000_000_035, REUSED, 95_000], // child of the reused holder: kept
+        [2_000_000_036, LANE, 9000], // started after the lane exited, by a later holder of its pid: kept
+      ];
+      everTracked.set(LANE, { pre: 1000, post: 1010, end: 8000 });
+      everTracked.set(REUSED, { pre: 2000, post: 2010 });
+      const asked = [];
+      const dead = new Set();
+      const res = await cleanupTracked({
+        waitMs: 0,
+        platform: 'win32',
+        isAlive: (pid) => rows.some((r) => r[0] === pid) && !dead.has(pid),
+        kill: (pid) => { asked.push(pid); dead.add(pid); },
+        spawnSyncFn: () => table(rows),
+      });
+      assert.deepEqual(asked.sort(), [2_000_000_031, 2_000_000_032]);
+      assert.equal(res.killed, 2);
+      assert.deepEqual(res.stillAlive, []);
+    } finally {
+      restore();
+    }
+  });
+
+  it('on win32 a descendant that cannot be killed is reported, and a failed scan is recorded', async () => {
+    const restore = borrow();
+    try {
+      everTracked.set(2_000_000_041, { pre: 1000, post: 1010 });
+      const res = await cleanupTracked({
+        waitMs: 0,
+        platform: 'win32',
+        isAlive: (pid) => pid === 2_000_000_042,
+        kill: () => {},
+        spawnSyncFn: () => table([[2_000_000_042, 2_000_000_041, 1500]]),
+        descendantWaitMs: 0,
+      });
+      assert.deepEqual(res.stillAlive, [2_000_000_042]);
+
+      everTracked.set(2_000_000_041, { pre: 1000, post: 1010 });
+      const failed = await cleanupTracked({
+        waitMs: 0, platform: 'win32', isAlive: () => false, kill: () => {},
+        spawnSyncFn: () => ({ status: null, stdout: '', error: new Error('ETIMEDOUT') }),
+      });
+      assert.equal(failed.scanFailed, true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('on POSIX the sweep reads no process table', async () => {
+    const restore = borrow();
+    try {
+      everTracked.set(2_000_000_051, { pre: 1000, post: 1010 });
+      let scanned = false;
+      await cleanupTracked({ waitMs: 0, platform: 'linux', isAlive: () => false, kill: () => {}, spawnSyncFn: () => { scanned = true; return table([]); } });
+      assert.equal(scanned, false);
+    } finally {
+      restore();
+    }
+  });
+
+  it('on win32 the child of a lane leader that exited is killed by the sweep', { skip: process.platform !== 'win32' && 'Windows process table only' }, async () => {
+    const stub = [
+      "const { spawn } = require('node:child_process');",
+      "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true });",
+      'g.unref();',
+      'process.stdout.write(g.pid + String.fromCharCode(10));',
+    ].join('');
+    let childPid = 0;
+    try {
+      const leader = await spawnResolved(process.execPath, ['-e', stub], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      leader.stdout.on('data', (d) => { out += d.toString(); });
+      await new Promise((r) => leader.once('close', r));
+      childPid = Number(out.trim());
+      assert.ok(Number.isInteger(childPid) && childPid > 0, `no child pid: ${out}`);
+      assert.equal(trackedPids.has(leader.pid), false, 'the exited leader is no longer a kill handle');
+      assert.ok(isPidAlive(childPid), 'the orphan outlived its leader');
+
+      const res = await cleanupTracked({ waitMs: 2000 });
+      assert.ok(!isPidAlive(childPid) || res.stillAlive.includes(childPid), 'the orphan is dead or reported');
+    } finally {
+      if (childPid && isPidAlive(childPid)) killPidTree(childPid);
+    }
+  });
+
+  it('handleExit begins closing before it kills the tracked children', async () => {
+    const script = `
+      import { installSignalHandlers, isClosing } from './skills/adversarial-review/scripts/lib/proc.mjs';
+      installSignalHandlers(async () => { process.stdout.write('closing=' + isClosing() + '\\n'); });
+      setTimeout(() => { throw new Error('boom'); }, 50);
+    `;
+    const proc = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    const code = await new Promise((res) => proc.on('close', res));
+    assert.equal(code, 1);
+    assert.match(out, /closing=true/);
   });
 });

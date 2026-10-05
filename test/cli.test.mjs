@@ -1,11 +1,12 @@
 import { join } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { parseArgs } from '../skills/adversarial-review/scripts/lib/cli/args.mjs';
 import { main } from '../skills/adversarial-review/scripts/lib/cli/main.mjs';
+import { resetClosingForTests } from '../skills/adversarial-review/scripts/lib/proc.mjs';
 import { modelsCommand } from '../skills/adversarial-review/scripts/lib/cli/models.mjs';
 import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 import { ENGINE_VERSION } from '../skills/adversarial-review/scripts/lib/version.mjs';
@@ -52,6 +53,9 @@ function createMockIO({ stdinData = '' } = {}) {
 }
 
 describe('cli unit and command tests', () => {
+  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
+  // file runs many commands in one process, so each one starts open, as a real command does.
+  beforeEach(resetClosingForTests);
   describe('args.mjs parseArgs', () => {
     it('parses command, flags, and positionals with camelCase and kebab-case', () => {
       const res = parseArgs(['run', '--route', 'spawn', '--allow-gaps', '--stage', 'spec', 'extra']);
@@ -422,6 +426,9 @@ describe('cli unit and command tests', () => {
 });
 
 describe('recommend picks a measured swarm model', () => {
+  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
+  // file runs many commands in one process, so each one starts open, as a real command does.
+  beforeEach(resetClosingForTests);
   it('quota at 85% with a measured top model on the swarm backend routes to swarm', async () => {
     const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
     const bins = await makeFakeBins({
@@ -515,6 +522,9 @@ describe('recommend picks a measured swarm model', () => {
 });
 
 describe('status per seat (3.1 part C, task 8)', () => {
+  // Each command ends with the exit sweep, which leaves the process closed to new lanes. This
+  // file runs many commands in one process, so each one starts open, as a real command does.
+  beforeEach(resetClosingForTests);
   async function statusJson(runDir, env) {
     const io = createMockIO();
     const code = await main(['status', runDir, '--json'], { env, ...io });

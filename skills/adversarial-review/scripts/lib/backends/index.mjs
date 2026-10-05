@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 
-import { runChild as defaultRunChild, resolveExecutable } from '../proc.mjs';
+import { runChild as defaultRunChild, resolveExecutable, isClosing } from '../proc.mjs';
 import { parseStructured } from '../validate.mjs';
 import { writeFileAtomic as defaultWriteFileAtomic } from '../fsx.mjs';
 import { isValidModel } from '../config.mjs';
@@ -278,6 +278,11 @@ export async function runSeatCall(call, options = {}) {
   };
 
   while (attempts < MAX_ATTEMPTS && modelIdx < models.length) {
+    // The exit sweep has copied the tracked pids, so a lane started now would outlive the run.
+    if (isClosing()) {
+      lastError = 'aborted';
+      break;
+    }
     attempts++;
     const model = models[modelIdx];
     const n = await reserveAttempt(callsDir, base, (call.attemptBase || 0) + attempts);
@@ -375,6 +380,12 @@ export async function runSeatCall(call, options = {}) {
     if (parser) parser.end();
     await new Promise((resolve) => live.end(resolve));
     await writeAttemptLogAt(callsDir, base, n, attemptLogContent(spawnCmd, spawnArgs, childRes));
+    // A lane the sweep killed returns an exit code, not `aborted`, so the flag is read too:
+    // a failover here would announce a lane that never starts.
+    if (childRes.aborted || isClosing()) {
+      lastError = 'aborted';
+      break;
+    }
 
     const summary = typeof adapter.summarizeEvents === 'function' ? adapter.summarizeEvents(events) : {};
     const extra = {

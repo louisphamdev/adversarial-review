@@ -19,6 +19,7 @@ import * as customBackend from '../skills/adversarial-review/scripts/lib/backend
 
 import { FINDINGS, strictify } from '../skills/adversarial-review/scripts/lib/schemas.mjs';
 import { ConfigError } from '../skills/adversarial-review/scripts/lib/errors.mjs';
+import { beginClosing, resetClosingForTests } from '../skills/adversarial-review/scripts/lib/proc.mjs';
 
 test('backends module: BACKEND_NAMES', () => {
   assert.deepEqual(BACKEND_NAMES, ['claude', 'codex', 'opencode', 'gemini', 'custom']);
@@ -1528,6 +1529,61 @@ test('runSeatCall: idle on model 1 fails over to model 2', async () => {
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+});
+
+// The exit sweep has begun: a failover would start the next lane after the sweep copied its
+// pids, and that lane would outlive the run (3.1 review C4).
+async function closingCall(runChild) {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const failover = [];
+    const res = await runSeatCall(
+      { callId: 'ab', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['m1', 'm2'] },
+      { backend: { name: 'claude', exe: '/mock/bin/claude' }, runChild, onFailover: (f) => failover.push(f) }
+    );
+    return { res, failover };
+  } finally {
+    resetClosingForTests();
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+test('runSeatCall: closing already begun -> zero spawns, no failover, error aborted', async () => {
+  let spawns = 0;
+  beginClosing();
+  const { res, failover } = await closingCall(async () => { spawns++; return { code: 1, stdout: '', stderr: '' }; });
+  assert.equal(spawns, 0);
+  assert.deepEqual(failover, []);
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'aborted');
+});
+
+test('runSeatCall: closing begins during the call and the child reports aborted -> one spawn, no failover', async () => {
+  let spawns = 0;
+  const { res, failover } = await closingCall(async () => {
+    spawns++;
+    beginClosing();
+    return { aborted: true, code: null, signal: null, stdout: '', stderr: '', timedOut: false, idled: false, spawnError: null };
+  });
+  assert.equal(spawns, 1);
+  assert.deepEqual(failover, []);
+  assert.equal(res.error, 'aborted');
+});
+
+// A lane the sweep killed comes back with an exit code, not with `aborted`.
+test('runSeatCall: closing begins during the call and the sweep kills the lane -> one spawn, no failover', async () => {
+  let spawns = 0;
+  const { res, failover } = await closingCall(async () => {
+    spawns++;
+    beginClosing();
+    return { code: 1, signal: null, stdout: '', stderr: '', timedOut: false, idled: false, spawnError: null };
+  });
+  assert.equal(spawns, 1);
+  assert.deepEqual(failover, []);
+  assert.equal(res.error, 'aborted');
 });
 
 test('runSeatCall: contract failure moves to the next model when one exists', async () => {
