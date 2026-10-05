@@ -413,3 +413,72 @@ describe('recommend picks a measured swarm model', () => {
     }
   });
 });
+
+describe('status per seat (3.1 part C, task 8)', () => {
+  async function statusJson(runDir, env) {
+    const io = createMockIO();
+    const code = await main(['status', runDir, '--json'], { env, ...io });
+    assert.equal(code, 0, io.stderr.text);
+    return JSON.parse(io.stdout.text);
+  }
+
+  async function makeRunDir(home) {
+    const runDir = path.join(home, '.adversarial-review', 'runs', 'repo-key', '20261004T000000Z-bbbbbbbb');
+    await fs.mkdir(path.join(runDir, 'stages'), { recursive: true });
+    return runDir;
+  }
+
+  it('status: per-call model, attempt, idleFor, and owner state', async () => {
+    const iso = await makeIsolatedEnv();
+    try {
+      const runDir = await makeRunDir(iso.home);
+      await fs.writeFile(path.join(runDir, 'lock'), JSON.stringify({ pid: process.pid, token: 't', createdAt: Date.now() }));
+      const now = Date.now();
+      await fs.writeFile(
+        path.join(runDir, 'events.jsonl'),
+        [
+          { event: 'call_start', stage: 'FIND', seat: 'edge', callId: 'find-edge', model: 'opencode/a', attempt: 1, ts: now - 50000 },
+          { event: 'seat_output', callId: 'find-edge', seat: 'edge', bytes: 10, lastOutputAt: now - 20000, ts: now - 20000 },
+          { event: 'call_start', stage: 'FIND', seat: 'edge', callId: 'find-edge', model: 'opencode/b', attempt: 2, ts: now - 10000 },
+          { event: 'seat_done', stage: 'FIND', seat: 'breaker', callId: 'find-breaker', findings: [], findingCount: 0, ts: now - 5000 },
+        ]
+          .map((e) => JSON.stringify(e))
+          .join('\n') + '\n'
+      );
+      const out = await statusJson(runDir, iso.env);
+      const edge = out.calls.find((c) => c.callId === 'find-edge');
+      assert.equal(edge.model, 'opencode/b');
+      assert.equal(edge.attempt, 2);
+      assert.equal(edge.status, 'running');
+      assert.ok(edge.idleFor >= 9 && edge.idleFor <= 12, String(edge.idleFor));
+      const breaker = out.calls.find((c) => c.callId === 'find-breaker');
+      assert.equal(breaker.status, 'done');
+      assert.equal(breaker.idleFor, null);
+      assert.equal(out.eventCount, 4);
+      assert.equal(out.owner, 'alive');
+      assert.equal(out.finished, false);
+    } finally {
+      await iso.cleanup();
+    }
+  });
+
+  it('status: a per-seat FIND file is not the current stage, and a hung owner reads hung', async () => {
+    const iso = await makeIsolatedEnv();
+    try {
+      const runDir = await makeRunDir(iso.home);
+      await fs.writeFile(path.join(runDir, 'stages', 'find-seat-edge.json'), JSON.stringify({ seat: 'edge', findings: [] }));
+      await fs.writeFile(
+        path.join(runDir, 'events.jsonl'),
+        JSON.stringify({ event: 'call_start', stage: 'FIND', seat: 'breaker', callId: 'find-breaker', model: null, attempt: 1, ts: Date.now() }) + '\n'
+      );
+      await fs.writeFile(path.join(runDir, 'lock'), JSON.stringify({ pid: process.pid, token: 't', createdAt: Date.now() }));
+      const old = new Date(Date.now() - 700000);
+      await fs.utimes(path.join(runDir, 'lock'), old, old);
+      const out = await statusJson(runDir, iso.env);
+      assert.equal(out.stage, 'FIND');
+      assert.equal(out.owner, 'hung');
+    } finally {
+      await iso.cleanup();
+    }
+  });
+});

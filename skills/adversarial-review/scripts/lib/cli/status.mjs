@@ -5,6 +5,7 @@ import { assertRunDir, readState } from '../rundir.mjs';
 import { runsDir, canonicalPath } from '../paths.mjs';
 import { runChild } from '../proc.mjs';
 import { ConfigError } from '../errors.mjs';
+import { ownerState } from './watch.mjs';
 
 async function findLatestRun(env, cwd) {
   let root = cwd;
@@ -75,47 +76,65 @@ export async function statusCommand(
   }
 
   const state = await readState(runDir);
+  const owner = await ownerState(runDir);
+  const ownerLive = owner === 'alive';
 
   const callsMap = new Map();
+  const entryOf = (cid, ev) =>
+    callsMap.get(cid) || { callId: cid, seat: ev.seat, stage: ev.stage, model: null, attempt: null, lastAt: null };
   for (const ev of state.events || []) {
     if (!ev || typeof ev !== 'object') continue;
     const cid = ev.callId || `${ev.stage || ''}-${ev.seat || ''}`;
     if (ev.event === 'call_start') {
-      callsMap.set(cid, {
-        callId: cid,
+      const existing = entryOf(cid, ev);
+      Object.assign(existing, {
         seat: ev.seat,
         stage: ev.stage,
-        status: state.ownerAlive ? 'running' : 'orphaned',
+        model: ev.model ?? null,
+        attempt: ev.attempt ?? null,
+        lastAt: ev.ts ?? null,
+        status: ownerLive ? 'running' : 'orphaned',
       });
-    } else if (ev.event === 'call_end') {
-      const existing = callsMap.get(cid) || { callId: cid, seat: ev.seat, stage: ev.stage };
-      existing.status = ev.ok === false ? 'dead' : 'done';
+      callsMap.set(cid, existing);
+    } else if (ev.event === 'seat_output') {
+      const existing = callsMap.get(cid);
+      if (existing) existing.lastAt = ev.lastOutputAt ?? ev.ts ?? existing.lastAt;
+    } else if (ev.event === 'call_end' || ev.event === 'seat_done') {
+      const existing = entryOf(cid, ev);
+      existing.status = ev.event === 'call_end' && ev.ok === false ? 'dead' : 'done';
       callsMap.set(cid, existing);
     } else if (ev.event === 'seat_dead') {
-      const existing = callsMap.get(cid) || { callId: cid, seat: ev.seat, stage: ev.stage };
+      const existing = entryOf(cid, ev);
       existing.status = 'dead';
       callsMap.set(cid, existing);
     }
   }
 
-  const calls = Array.from(callsMap.values());
+  const nowMs = Date.now();
+  const calls = Array.from(callsMap.values()).map(({ lastAt, ...c }) => ({
+    ...c,
+    idleFor: c.status === 'running' && typeof lastAt === 'number' ? Math.round((nowMs - lastAt) / 1000) : null,
+  }));
   const finished = Boolean(state.result);
   const verdict = state.result?.gateVerdict || null;
   const exitCode = state.result?.exitCode ?? null;
 
+  // A per-seat FIND file is part of the FIND stage, not a stage of its own.
+  const stageCheckpoints = (state.checkpoints || []).filter((n) => !n.startsWith('find-seat-'));
   let currentStage = 'unknown';
   if (finished) {
     currentStage = 'finished';
-  } else if (state.checkpoints?.length > 0) {
-    currentStage = state.checkpoints[state.checkpoints.length - 1];
+  } else if (stageCheckpoints.length > 0) {
+    currentStage = stageCheckpoints[stageCheckpoints.length - 1];
   } else if (calls.length > 0) {
     currentStage = calls[calls.length - 1].stage;
   }
 
-  const owner = state.ownerAlive ? 'alive' : 'dead';
   let next = null;
   if (!finished) {
-    if (!state.ownerAlive) {
+    if (owner === 'hung') {
+      next = `the owner pid ${state.lock?.pid} is alive but its lock is old; stop it before you resume`;
+    } else if (!ownerLive) {
       next = `run --resume "${runDir}"`;
     } else {
       next = 'wait for completion or inspect events.jsonl';
@@ -129,6 +148,7 @@ export async function statusCommand(
     verdict,
     exitCode,
     owner,
+    eventCount: (state.events || []).length,
     calls,
     checkpoints: state.checkpoints,
     next,
@@ -146,7 +166,10 @@ export async function statusCommand(
     if (calls.length > 0) {
       stdout.write('Calls:\n');
       for (const c of calls) {
-        stdout.write(`  - ${c.callId} [${c.stage}]: ${c.status}\n`);
+        const detail = [c.model, c.attempt ? `attempt ${c.attempt}` : null, c.idleFor !== null ? `idle ${c.idleFor} s` : null]
+          .filter(Boolean)
+          .join(', ');
+        stdout.write(`  - ${c.callId} [${c.stage}]: ${c.status}${detail ? ` (${detail})` : ''}\n`);
       }
     }
     if (next) {
