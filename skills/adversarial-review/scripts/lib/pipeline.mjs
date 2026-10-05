@@ -776,8 +776,10 @@ export async function runVerify({ state = {}, diffParts, recollect = null, runAg
     })
   );
 
-  const answerFor = (sr, o, w) =>
-    sr.items.find((a) => (o.itemOnly ? normalizeItemIds(a.id, ids).includes(w) : normalizeId(a.id) === w));
+  // A seat may answer with its finding id or with the item id the prompt shows; the finding id wins.
+  const answerFor = (sr, o, w, id) =>
+    (o.itemOnly ? undefined : sr.items.find((a) => normalizeId(a.id) === w)) ??
+    sr.items.find((a) => normalizeItemIds(a.id, ids).includes(id));
 
   for (const id of targetIds) {
     let met = true;
@@ -791,7 +793,7 @@ export async function runVerify({ state = {}, diffParts, recollect = null, runAg
         continue;
       }
       for (const w of o.itemOnly ? [id] : o.findingIds) {
-        const ans = answerFor(sr, o, w);
+        const ans = answerFor(sr, o, w, id);
         if (!ans) {
           met = false;
           reason = reason || 'no-answer';

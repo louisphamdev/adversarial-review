@@ -1143,6 +1143,43 @@ describe('pipeline module', () => {
       assert.ok(finalCalls.some((c) => /C2/.test(c.prompt)), 'final pass lists every item of the seat');
     });
 
+    const breakerOpen = (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'no guard' }] : metAll(s));
+    it('round 2 counts an item-id answer taken from the rendered prompt for the owner findings', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: breakerOpen, regression: holdsAll }) });
+      let shown = null;
+      const runAgent = async (call) => {
+        if (call.stage === 'VERIFY_SEAT' && !/final-pass/.test(call.prompt)) {
+          shown = /=== OPEN ITEMS ===\n\[([^\]]+)\]/.exec(call.prompt)[1];
+          return { ok: true, value: { items: [{ id: shown, status: 'met', evidence: 'a.mjs:10' }], newInDiff: [] } };
+        }
+        return agent({ seatItems: metAll, regression: holdsAll })(call);
+      };
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent, records: [r1.record] });
+      assert.equal(shown, 'C1');
+      assert.equal(r2.verdict, 'PASS');
+    });
+
+    it('round 2 counts a finding-id answer of the owner seat', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: breakerOpen, regression: holdsAll }) });
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent: agent({ seatItems: metAll, regression: holdsAll }), records: [r1.record] });
+      assert.equal(r2.verdict, 'PASS');
+    });
+
+    it('the first pass counts an item-id answer of the owner seat', async () => {
+      const seatItems = (s) => (s === 'breaker' ? [{ id: 'c1', status: 'met', evidence: 'a.mjs:10' }] : metAll(s));
+      const res = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems, regression: holdsAll }) });
+      assert.equal(res.record.items.C1.status, 'met');
+      assert.equal(res.verdict, 'PASS');
+    });
+
+    it('a finding id with a number never counts as an item answer', async () => {
+      const seatItems = (s) => (s === 'breaker' ? metAll(s) : [{ id: 'breaker-2', status: 'met', evidence: 'docs' }]);
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems, regression: holdsAll }) });
+      assert.deepEqual([r1.record.items.C2.status, r1.record.items.C2.reason], ['not-met', 'no-answer']);
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent: agent({ seatItems, regression: holdsAll }), records: [r1.record] });
+      assert.deepEqual([r2.record.items.C2.status, r2.record.items.C2.reason], ['not-met', 'no-answer']);
+    });
+
     it('an equal diff hash with open items exits 1 with no call', async () => {
       const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: (s) => (s === 'breaker' ? [{ id: 'breaker-1', status: 'not-met', evidence: 'x' }] : metAll(s)), regression: holdsAll }) });
       const runAgent = agent({ seatItems: metAll, regression: holdsAll });
