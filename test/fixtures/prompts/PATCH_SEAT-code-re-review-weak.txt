@@ -114,16 +114,16 @@ Example of the JSON shape. The values are not a finding. Do not copy them.
 {
   "items": [
     {
-      "id": "1",
+      "id": "C1",
       "reason": "Example reason.",
       "plan": "sound"
     },
     {
       "id": "cross",
-      "reason": "Example: the shared change also moves the check of item 2.",
+      "reason": "Example: the shared change also moves the check of item C2.",
       "plan": "collides",
       "affects": [
-        "2"
+        "C2"
       ]
     }
   ]

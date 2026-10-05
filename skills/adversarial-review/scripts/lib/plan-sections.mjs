@@ -24,12 +24,16 @@ export function itemIdsOf(closingList = []) {
   return { ids, byId, renumbered: !ok && closingList.length > 0 };
 }
 
+// With letters in the id, a bare number never binds: `breaker-2` is a finding id, not item 2.
+const PREFIXED_REF = /(?:^|[^0-9A-Za-z])(?:C|Item\s*|#)0*([1-9]\d*)(?![0-9])/gi;
+const ANY_REF = /(?:^|[^0-9A-Za-z])(?:C|Item\s*|#)?0*([1-9]\d*)(?![0-9])/gi;
+
 export function normalizeItemIds(raw, itemIds = []) {
   const s = String(raw ?? '');
   if (/^\s*cross(-cutting)?\s*$/i.test(s)) return ['cross'];
   const known = new Set(itemIds);
   const out = [];
-  for (const m of s.matchAll(/(?:^|[^0-9A-Za-z])(?:C|Item\s*|#)?0*([1-9]\d*)(?![0-9])/gi)) {
+  for (const m of s.matchAll(/[A-Za-z]/.test(s) ? PREFIXED_REF : ANY_REF)) {
     const id = `C${Number(m[1])}`;
     if (known.has(id) && !out.includes(id)) out.push(id);
   }

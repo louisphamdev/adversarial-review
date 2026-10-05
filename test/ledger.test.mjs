@@ -166,6 +166,33 @@ describe('applyRound demands', () => {
     assert.equal(l.last.blocking.length, 0);
     assert.equal(l.last.advisory[0].note, 'unknown-item');
   });
+
+  const three = [1, 2, 3].map((n) => ({ n, item: `item ${n}`, doneWhen: `d${n}`, sources: [] }));
+  const all = ['C1', 'C2', 'C3'];
+  const round2 = (objectOn, revise) => {
+    const l0 = applyRound(initLedger(three, [], 'code'), rec(1,
+      [{ seat: 'skeptic', askedFor: all, items: all.map((id) => ({ id, plan: 'oversized', reason: 'r1' })), error: null }], [], { reviewedIds: all }));
+    const items = all.map((id) => ({ id, plan: objectOn.includes(id) ? 'breaks-my-lens' : 'sound', reason: 'r2' }));
+    return applyRound(l0, rec(2, [{ seat: 'skeptic', askedFor: all, items, error: null }], revise, { reviewedIds: all }));
+  };
+  it('an empty or missing itemId falls back to a leading C<n> label of the item text only', () => {
+    for (const d of [
+      { itemId: '', item: 'C2: also cover item 3', doneWhen: 'x' },
+      { itemId: '  ', item: 'C2: x', doneWhen: 'x' },
+      { item: 'C2: x', doneWhen: 'x' },
+    ]) {
+      const l = round2(['C2', 'C3'], [d]);
+      assert.deepEqual(l.last.blocking.map((b) => b.itemId), ['C2'], JSON.stringify(d));
+      assert.ok(!l.items.C3.demands.some((x) => x.text === d.item.trim()), JSON.stringify(d));
+    }
+    const control = round2(['C3'], [{ itemId: '', item: 'C2: also cover item 3', doneWhen: 'x' }]);
+    assert.equal(control.last.blocking.length, 0);
+    assert.deepEqual(control.last.advisory.map((a) => [a.itemId, a.note]), [['C2', 'no-objection']]);
+  });
+  it('a numeric itemId maps to its item', () => {
+    const l = round2(['C2'], [{ itemId: 2, item: 'cover the empty case', doneWhen: 'x' }]);
+    assert.deepEqual(l.last.blocking.map((b) => b.itemId), ['C2']);
+  });
 });
 
 describe('deriveLedger', () => {

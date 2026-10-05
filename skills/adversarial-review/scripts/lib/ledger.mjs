@@ -107,6 +107,12 @@ export function countsAsRound(record) {
   return Boolean(record && versionAtLeast(record.engineVersion) && record.judge && !record.judgeDead && !record.skipped);
 }
 
+// The item text can name other items ("C2: also cover item 3"), so only its leading label binds.
+function leadingItemId(text, ids) {
+  const m = /^C0*([1-9]\d*)(?![0-9])/i.exec(text);
+  return m && ids.includes(`C${Number(m[1])}`) ? [`C${Number(m[1])}`] : [];
+}
+
 export function applyRound(ledger, record) {
   const next = structuredClone(ledger);
   const ids = Object.keys(next.items);
@@ -160,7 +166,8 @@ export function applyRound(ledger, record) {
   const seen = new Set();
   for (const d of record.judge?.revise || []) {
     const text = String(d.item ?? '').trim();
-    const named = normalizeItemIds(d.itemId ?? d.item, ids);
+    const rawId = String(d.itemId ?? '').trim();
+    const named = rawId ? normalizeItemIds(rawId, ids) : leadingItemId(text, ids);
     if (named.length === 0) {
       advisory.push({ round, itemId: null, text, note: 'unknown-item' });
       continue;

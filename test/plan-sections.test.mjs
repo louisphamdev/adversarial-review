@@ -39,6 +39,16 @@ describe('normalizeItemIds', () => {
     assert.deepEqual(normalizeItemIds('advisory-log', IDS), []);
     assert.deepEqual(normalizeItemIds('pin the 8191-character limit', IDS), []);
   });
+  it('binds a number after letters only through a C, Item, or # prefix', () => {
+    for (const raw of ['breaker-2', 'edge-1', 'fix after 2 attempts']) {
+      assert.deepEqual(normalizeItemIds(raw, IDS), [], raw);
+    }
+    for (const raw of ['C2', '2', '#2', 'Item 2', 2]) {
+      assert.deepEqual(normalizeItemIds(raw, IDS), ['C2'], String(raw));
+    }
+    assert.deepEqual(normalizeItemIds('C1, C3', IDS), ['C1', 'C3']);
+    assert.deepEqual(normalizeItemIds('1, 3', IDS), ['C1', 'C3']);
+  });
 });
 
 describe('parsePlan', () => {

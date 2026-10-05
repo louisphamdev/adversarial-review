@@ -949,6 +949,14 @@ describe('pipeline module', () => {
       assert.ok(runAgent.calls.some((c) => c.seat === 'breaker'));
     });
 
+    it('a seat asked for part of a renumbered closing list sees the ledger ids', async () => {
+      const renumbered = { ...state, ruling: { closingList: state.ruling.closingList.map((c) => ({ ...c, n: 0 })) } };
+      const runAgent = agent(allSound);
+      await runPatchReview({ state: renumbered, plan: plan1, runAgent });
+      const edge = runAgent.calls.find((c) => c.seat === 'edge');
+      assert.ok(edge.prompt.includes('[C2] ') && !edge.prompt.includes('[C1] '));
+    });
+
     it('a plan without C<n> sections throws a ConfigError (exit 2)', async () => {
       await assert.rejects(() => runPatchReview({ state, plan: 'free text', runAgent: agent(allSound) }), (e) => e.exitCode === 2);
     });

@@ -618,7 +618,11 @@ export async function runPatchReview({ state = {}, plan = '', runAgent, records 
   // Round 1 (no baseline) is a first pass. Later rounds pass ctx.reReview (Part D renders it).
   const ctxFor = (forIds) =>
     !baseline
-      ? { plan: planText, closingList: closingList.filter((_, i) => forIds.includes(ids[i])) }
+      ? {
+          plan: planText,
+          // n carries the ledger id, so a subset keeps the labels of a renumbered list.
+          closingList: closingList.flatMap((c, i) => (forIds.includes(ids[i]) ? [{ ...c, n: Number(ids[i].slice(1)) }] : [])),
+        }
       : {
           reReview: {
             pass: 're-review',
