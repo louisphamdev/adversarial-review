@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route sends the material to one stops with exit code 2, unless the user config sets
   `swarm.acknowledgeTraining: true`. With `preflight`, the user answers the `privacy` decision.
 - CAUTION: Schema version 2. A 3.0.2 run paused with `--until find` cannot resume under 3.1.
+- CAUTION: The command file moved from `bin/adversarial-review.js` to `cli/adversarial-review.js`,
+  because claude.ai refuses a plugin with a top-level `bin/` directory. The command names do not
+  change. A script that calls the file by its path must use the new path.
+- CAUTION: The swarm sandbox copies only the files that `git ls-files` lists. If `git ls-files`
+  fails, for example outside a git repository, the swarm route stops with exit code 2.
 - A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
 - Patch review keeps a state for each closing item. A settled item is not sent again. A plan change that touches a settled item sends it back. A judge demand blocks only with a seat objection on the same item in the same round. Patch review stops after `patchReview.maxRounds` rounds (default 3).
 - The patch plan has one `## C<n>` section per closing item and an optional `## Cross-cutting` section. A plan with another shape stops with exit code 2.
@@ -28,6 +33,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A run with patch-review records from 3.0.2 cannot continue patch review. Start a new run.
 
 ### Added
+- Swarm lanes on opencode 2. Each lane runs with `--standalone` in a sandbox copy of the
+  repository, with its own configuration directory. A lane cannot edit a file, run a shell
+  command, use the web, start a subagent, or read outside its sandbox. A canary run tests the
+  profile before FIND.
+- The engine records a baseline of the tracked files. If a tracked file changes during the run,
+  the run stops with exit code 3.
+- Free models come from price data, not from the model name. The swarm uses the free opencode
+  zen models by default. Another model runs only when the user names it.
+- The lane count follows free memory, logical cores, and the rate limit of each provider.
+- Each seat gets a context pack of excerpts. Secret files, for example `.env` and credential
+  files, stay out of the pack, the sandbox, and the sift.
+- Seat prompts differ by stage (code, spec, plan, debug), by pass (first pass, re-review), and by
+  model capability (strong, weak).
+- Patch seats and the patch judge propose a cut before an addition.
+- Exit cleanup. Every exit path of `run`, `patch-review`, and `verify` stops the lane process
+  trees, removes the lane configuration, and records the sweep in `events.jsonl` and in
+  `result.json` (`cleanup`). On Windows, the sweep also stops the children of a lane that exited.
+- Claude seats stream their output and keep `--strict-mcp-config`.
+- CI runs `claude plugin validate --strict`. The plugin manifest has a display name, a license,
+  a homepage, and a repository.
+- On Linux and macOS, the opencode lookup also tries `~/.opencode/bin/opencode`.
 - Live seat events in `events.jsonl`: `stage_start`, `call_start` with model and attempt,
   `seat_output`, `seat_stalled`, `seat_failover`, `seat_done` per FIND seat with its findings,
   `stage_end`, and `run_end`.
@@ -37,13 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Idle failover: `timeouts.idle.find` and `timeouts.idle.other` stop a silent streaming call
   and move it to the next model of the seat.
 - `status` shows the model, the attempt, and the idle time of each call, and a hung owner.
-- `preflight` and `run` measure the material. Above 4000 changed lines or 30 files, they write a warning with the line count of each top-level directory and the advice to run one table per subsystem. The bundle keeps it in `warnings`. The warning does not stop the run.
+- `preflight` and `run` measure the material. Above 4000 changed lines or 30 files, they write a warning. The warning gives the line count of each top-level directory and advises one table per subsystem. The bundle keeps it in `warnings`. The warning does not stop the run.
 - `patch-review` and `verify` records carry `converging`. It is false when a round has as many blocking items as the round before, or more. The command then prints a `Not converging` line that tells the host to stop and cut scope.
 
 ### Fixed
 - `run --resume` never takes over a lock whose pid is alive, also when the lock is old.
   `run --resume --detach` returns 0 only after the new owner holds the lock.
 - `run --detach --until find` now stops at FIND: the run stores `until` in `request.json`.
+- A line inside a diff hunk could name a file outside the repository, and the sandbox copied it.
+  Paths now come from the diff headers only, and each path must stay inside the repository.
+- A command that found the run lock busy removed the lane configuration and the result of the
+  run that held the lock.
+- A seat retry could start a new lane after the exit sweep began.
+- A finding id such as `breaker-2` was read as item 2. An id with letters now names an item only
+  as `C<n>`, `Item <n>`, or `#<n>`.
+- A `verify` re-review did not accept an answer that used the item id.
+- The re-review judge did not see the regression list.
 
 ## [3.0.2] - 2026-09-24
 

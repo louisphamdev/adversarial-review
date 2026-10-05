@@ -471,7 +471,7 @@ describe('pipeline-cli e2e tests', () => {
     }
   });
 
-  it('run --detach -> prints a dir; status <dir> immediately shows owner: alive; wait for result.json', async () => {
+  it('run --detach -> prints a dir; status <dir> shows an owner line; wait for result.json', async () => {
     const { iso, repo, cleanup } = await setupEnvAndRepo();
     try {
       const res = spawnSync(
