@@ -7,7 +7,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 import { runCli } from './helpers/run-cli.mjs';
 import { writeSwarmBin, seedModelStore } from './helpers/run-fixture.mjs';
-import { modelsForSeat } from '../skills/adversarial-review/scripts/lib/cli/run.mjs';
+import { modelsForSeat, assertResumeFlags } from '../skills/adversarial-review/scripts/lib/cli/run.mjs';
+import { canonicalPath } from '../skills/adversarial-review/scripts/lib/paths.mjs';
 
 const CLI_PATH = path.resolve('skills/adversarial-review/scripts/adversarial-review.mjs');
 const FAKE_SEAT_PATH = path.resolve('test/fixtures/fake-seat.mjs');
@@ -761,6 +762,98 @@ describe('live seat events (3.1 part C, task 6)', () => {
       await repo.cleanup();
       await cleanup();
       await bins.cleanup();
+    }
+  });
+});
+
+// Resume rules (3.1 part C, task 9).
+// The detached owner holds the repository as its cwd until it exits, so a test waits for the
+// process itself, not for the lock: the exit sweep runs after the lock is released.
+async function waitForOwnerExit(pid, ms = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+describe('resume rules (3.1 part C, task 9)', () => {
+  it('resume: refuses while the lock pid is alive, even with an old lock', async () => {
+    const { iso, repo, r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      // The test runner is a live process that is not the resuming owner.
+      await fs.writeFile(path.join(runDir, 'lock'), JSON.stringify({ pid: process.pid, token: 't', createdAt: Date.now() }));
+      const old = new Date(Date.now() - 700000);
+      await fs.utimes(path.join(runDir, 'lock'), old, old);
+      const r2 = await runCli(['run', '--resume', runDir], { env: iso.env, cwd: repo.root });
+      assert.equal(r2.code, 3, `${r2.stdout}\n${r2.stderr}`);
+      assert.match(r2.stderr, new RegExp(`owner still alive \\(pid ${process.pid}\\)`));
+      assert.equal(existsSync(path.join(runDir, 'result.json')), false);
+      await fs.rm(path.join(runDir, 'lock'), { force: true });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('resume: accepts --detach and reads until from request.json', async () => {
+    const { r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      const req = JSON.parse(await fs.readFile(path.join(runDir, 'request.json'), 'utf8'));
+      assert.equal(req.until, 'find');
+      assert.equal(req.schemaVersion, 2);
+      assert.doesNotThrow(() => assertResumeFlags({ resume: runDir, detach: true, until: 'find', json: true }));
+      assert.throws(() => assertResumeFlags({ resume: runDir, stage: 'spec' }), /--stage/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('resume after a partial events line: the old next index still finds the first new event', async () => {
+    const { iso, repo, r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      const before = (await readEventsFile(runDir)).length;
+      await fs.appendFile(path.join(runDir, 'events.jsonl'), '{"event":"call_start","se');
+      const r2 = await runCli(['run', '--resume', runDir], { env: iso.env, cwd: repo.root });
+      assert.ok(r2.code === 0 || r2.code === 1, `${r2.code}: ${r2.stderr}`);
+      const text = await fs.readFile(path.join(runDir, 'events.jsonl'), 'utf8');
+      const after = text.split('\n').filter(Boolean).flatMap((l) => {
+        try {
+          return [JSON.parse(l)];
+        } catch {
+          return [];
+        }
+      });
+      assert.ok(after.length > before);
+      assert.equal(typeof after[before].event, 'string');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('resume --detach over a dead-pid lock returns only after a new owner took the lock', async () => {
+    const { iso, repo, r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      await fs.writeFile(path.join(runDir, 'lock'), JSON.stringify({ pid: 2147480000, token: 'dead', createdAt: Date.now() }));
+      const r2 = await runCli(['run', '--resume', runDir, '--detach', '--until', 'find'], { env: iso.env, cwd: repo.root });
+      assert.equal(r2.code, 0, `${r2.stdout}\n${r2.stderr}`);
+      assert.equal(canonicalPath(r2.stdout.trim()), canonicalPath(runDir));
+      const raw = await fs.readFile(path.join(runDir, 'lock'), 'utf8').catch(() => '{"token":"released"}');
+      const lock = JSON.parse(raw);
+      assert.notEqual(lock.token, 'dead');
+      // The worker log names no pid, so a lock that is already released leaves only the event log.
+      if (lock.pid) assert.ok(await waitForOwnerExit(lock.pid), 'the detached owner did not finish');
+      else await new Promise((r) => setTimeout(r, 2000));
+    } finally {
+      await cleanup();
     }
   });
 });

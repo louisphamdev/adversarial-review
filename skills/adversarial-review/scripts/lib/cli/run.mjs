@@ -61,7 +61,7 @@ import {
 } from '../rundir.mjs';
 import { findingEvent } from '../contain.mjs';
 import { computeDataLeaves, hostJudge, seatEntries } from '../bundle.mjs';
-import { acquireLock, readLock } from '../lockfile.mjs';
+import { acquireLock, readLock, pidAlive } from '../lockfile.mjs';
 import { runTable, normalizeId } from '../pipeline.mjs';
 import { siftFindings } from '../sift.mjs';
 import { stateDir, isInside, homeDir } from '../paths.mjs';
@@ -84,21 +84,7 @@ export async function runCommand(
   // Branch A: --resume <dir>
   // -------------------------------------------------------------------------
   if (flags.resume) {
-    const allowed = new Set([
-      'resume',
-      'until',
-      'allow-drift',
-      'allowDrift',
-      'json',
-      // Read from the current command line only: it must never be inherited from the request.
-      'allow-repo-change',
-      'allowRepoChange',
-    ]);
-    for (const key of Object.keys(flags)) {
-      if (!allowed.has(key)) {
-        throw new ConfigError(`Flag "--${key}" is not allowed with --resume.`);
-      }
-    }
+    assertResumeFlags(flags);
 
     const runDir = assertRunDir(env, flags.resume);
 
@@ -112,6 +98,21 @@ export async function runCommand(
         throw new ConfigError(`Run directory does not exist: ${runDir}`);
       }
       throw err;
+    }
+
+    // A lock whose pid is alive belongs to an owner that may only be slow. Taking it over, even
+    // when it is old, would give the run two owners.
+    const holder = await readLock(path.join(runDir, 'lock'));
+    if (holder && pidAlive(holder.pid) && holder.pid !== process.pid) {
+      throw new RunError(`owner still alive (pid ${holder.pid}); stop it before you resume`, 'owner-alive');
+    }
+
+    if (flags.detach) {
+      const extraArgs = [];
+      if (flags.until) extraArgs.push('--until', flags.until);
+      if (flags['allow-drift'] || flags.allowDrift) extraArgs.push('--allow-drift');
+      if (flags['allow-repo-change'] || flags.allowRepoChange) extraArgs.push('--allow-repo-change');
+      return await spawnDetachedOwner({ runDir, env, stdout, stderr, extraArgs });
     }
 
     // First action on resume: acquire lock
@@ -347,6 +348,7 @@ export async function runCommand(
     requirements: requirementsText,
     allowGaps: Boolean(flags['allow-gaps'] || flags.allowGaps),
     allowDrift: Boolean(flags['allow-drift'] || flags.allowDrift),
+    until: flags.until || null,
     route: null,
     backend: hostBackend,
     swarmBackend,
@@ -550,41 +552,7 @@ export async function runCommand(
     // lock. The parent must sweep only the processes it started itself, so it clears the run
     // directory. Every exit path below reads it when it fires, the signal handler included.
     setActiveRunDir(null);
-    const logPath = path.join(runDir, 'worker.log');
-    const fd = fsSync.openSync(logPath, 'a');
-    const scriptPath = fileURLToPath(new URL('../../adversarial-review.mjs', import.meta.url));
-
-    const child = spawn(process.execPath, [scriptPath, 'run', '--resume', runDir], {
-      detached: true,
-      windowsHide: true,
-      stdio: ['ignore', fd, fd],
-      env,
-    });
-    child.unref();
-    fsSync.closeSync(fd);
-
-    const startWait = Date.now();
-    let locked = false;
-    while (Date.now() - startWait < 10000) {
-      const currentLock = await readLock(path.join(runDir, 'lock'));
-      if (currentLock && currentLock.pid) {
-        locked = true;
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
-    if (!locked) {
-      let logTail = '';
-      try {
-        logTail = await fs.readFile(logPath, 'utf8');
-      } catch {}
-      stderr.write(`Detached run failed to take lock within 10s:\n${logTail}\n`);
-      return 3;
-    }
-
-    stdout.write(`${runDir}\n`);
-    return 0;
+    return await spawnDetachedOwner({ runDir, env, stdout, stderr, extraArgs: [] });
   }
 
   // Direct run mode. The exit handler is already installed above; this hands it the lock.
@@ -610,6 +578,80 @@ export async function runCommand(
   } finally {
     await lock.release();
   }
+}
+
+// Flags a resume may carry. Everything else was decided at create and lives in request.json.
+const RESUME_FLAGS = new Set([
+  'resume',
+  'until',
+  'allow-drift',
+  'allowDrift',
+  'json',
+  'detach',
+  // Read from the current command line only: it must never be inherited from the request.
+  'allow-repo-change',
+  'allowRepoChange',
+]);
+
+export function assertResumeFlags(flags = {}) {
+  for (const key of Object.keys(flags)) {
+    if (!RESUME_FLAGS.has(key)) {
+      throw new ConfigError(`Flag "--${key}" is not allowed with --resume.`);
+    }
+  }
+}
+
+/**
+ * Start a detached owner (`run --resume`) and report success only for that owner: within 10 s
+ * the lock must hold a token other than the one read before the spawn, or the child pid.
+ */
+async function spawnDetachedOwner({ runDir, env, stdout, stderr, extraArgs }) {
+  const lockPath = path.join(runDir, 'lock');
+  const oldToken = (await readLock(lockPath))?.token ?? null;
+  const logPath = path.join(runDir, 'worker.log');
+  const fd = fsSync.openSync(logPath, 'a');
+  const scriptPath = fileURLToPath(new URL('../../adversarial-review.mjs', import.meta.url));
+
+  const child = spawn(process.execPath, [scriptPath, 'run', '--resume', runDir, ...extraArgs], {
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', fd, fd],
+    env,
+  });
+  let exitCode = null;
+  child.on('exit', (code) => {
+    exitCode = code;
+  });
+  child.unref();
+  fsSync.closeSync(fd);
+
+  // A fast owner can take the lock and release it between two polls; its exit code 0 says it ran.
+  let owned = false;
+  const startWait = Date.now();
+  while (Date.now() - startWait < 10000) {
+    const current = await readLock(lockPath);
+    if (current && (current.token !== oldToken || current.pid === child.pid)) {
+      owned = true;
+      break;
+    }
+    if (exitCode !== null) {
+      owned = exitCode === 0;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  if (!owned) {
+    let logTail = '';
+    try {
+      logTail = (await fs.readFile(logPath, 'utf8')).slice(-4000);
+    } catch {}
+    stderr.write(`Detached run did not take the lock within 10s:\n${logTail}\n`);
+    return 3;
+  }
+
+  stdout.write(`${runDir}\n`);
+  return 0;
 }
 
 function emptyPrep() {
