@@ -157,6 +157,54 @@ export async function readCheckpoint(runDir, name) {
   return res.ok ? res.value : null;
 }
 
+const SEAT_KEY_RE = /^[a-z0-9-]+$/;
+
+function seatCheckpointName(seatKey) {
+  if (typeof seatKey !== 'string' || !SEAT_KEY_RE.test(seatKey)) {
+    throw new ConfigError(`Invalid seat key for a checkpoint: ${JSON.stringify(seatKey)}`);
+  }
+  return `find-seat-${seatKey}`;
+}
+
+// The FIND result of one seat, written the moment that seat returns.
+export async function writeSeatCheckpoint(runDir, seatKey, data) {
+  await writeCheckpoint(runDir, seatCheckpointName(seatKey), data);
+}
+
+// A file without an array `findings` counts as absent, so that seat runs again.
+export async function readSeatCheckpoint(runDir, seatKey) {
+  const data = await readCheckpoint(runDir, seatCheckpointName(seatKey));
+  return data && Array.isArray(data.findings) ? data : null;
+}
+
+const STAGE_CHECKPOINT_RE = /^(find|table|dispute|lastcall|sift|ruling)$/;
+
+// Resume can find a per-seat result or a checkpoint whose event was never written.
+export async function replayMissingEvents(runDir, { toEvent }) {
+  let events;
+  try {
+    events = await readJsonLines(path.join(runDir, 'events.jsonl'));
+  } catch {
+    process.stderr.write('warning: events not read, no replay\n');
+    return;
+  }
+  const done = new Set(events.filter((e) => e.event === 'seat_done').map((e) => e.seat));
+  const ended = new Set(events.filter((e) => e.event === 'stage_end').map((e) => e.stage));
+  const files = await fs.readdir(path.join(runDir, 'stages')).catch(() => []);
+  for (const name of [...files].sort()) {
+    const m = /^find-seat-([a-z0-9-]+)\.json$/.exec(name);
+    if (m) {
+      const data = await readSeatCheckpoint(runDir, m[1]);
+      if (data && !done.has(m[1])) await appendEvent(runDir, await toEvent({ ...data, seat: m[1] }));
+      continue;
+    }
+    const stage = name.replace(/\.json$/, '');
+    if (STAGE_CHECKPOINT_RE.test(stage) && !ended.has(stage)) {
+      await appendEvent(runDir, { event: 'stage_end', stage });
+    }
+  }
+}
+
 // Atomically writes sequential round records matching prefix-<n>.json.
 export async function writeIndexed(runDir, prefix, data) {
   let dir;

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
-import { loadConfig } from '../config.mjs';
+import { loadConfig, resolveIdleMs } from '../config.mjs';
 import { resolveMaterial, hashMaterial } from '../material.mjs';
 import { resolveSeats, loadSeats } from '../seats.mjs';
 import { readQuota } from '../quota.mjs';
@@ -50,11 +50,17 @@ import {
   createRun,
   writeMaterial,
   appendEvent,
+  repairEvents,
+  replayMissingEvents,
   writeCheckpoint,
   readCheckpoint,
+  writeSeatCheckpoint,
+  readSeatCheckpoint,
   writeResult,
   readState,
 } from '../rundir.mjs';
+import { findingEvent } from '../contain.mjs';
+import { computeDataLeaves, hostJudge, seatEntries } from '../bundle.mjs';
 import { acquireLock, readLock } from '../lockfile.mjs';
 import { runTable, normalizeId } from '../pipeline.mjs';
 import { siftFindings } from '../sift.mjs';
@@ -433,6 +439,24 @@ export async function runCommand(
   let routeDecision = decideRoute({ config, flags, material, quota, host, swarm: swarmOf() });
   let canary = null;
 
+  // The approval gate (spec G2-4). It sits before the canary because the canary lane is the first
+  // call that runs over the material; the probe and the bench read no material.
+  const dataLeaves = computeDataLeaves(
+    usesSwarm(routeDecision) ? prep.seatModels : {},
+    hostJudge(hostBackend),
+    config.sift?.enabled !== false
+  );
+  const training = dataLeaves.filter((r) => r.trains).map((r) => r.provider);
+  if (training.length > 0 && config.swarm?.acknowledgeTraining !== true) {
+    // Nothing of this run reached a seat, so the run directory goes with the refusal.
+    setActiveRunDir(null);
+    await fs.rm(runDir, { recursive: true, force: true });
+    throw new ConfigError(
+      `answer the decisions first: run preflight (a provider can train on the material: ${training.join(', ')})`
+    );
+  }
+  request.approval = { source: 'config', dataLeaves };
+
   if (usesSwarm(routeDecision) && prep.sandbox) {
     const profiles = [];
     for (const profileKey of ['weak-find', 'strong-find', 'short', 'canary']) {
@@ -804,6 +828,20 @@ async function executePipeline({
   sandbox = null,
   packText,
 }) {
+  // The owner holds the lock here. The repair must come before the first append of this owner.
+  await repairEvents(runDir);
+  await replayMissingEvents(runDir, {
+    toEvent: async (data) => ({
+      event: 'seat_done',
+      stage: 'FIND',
+      seat: data.seat,
+      callId: data.callId ?? `find-${data.seat}`,
+      model: data.model ?? null,
+      findingCount: data.findings.length,
+      findings: await Promise.all(data.findings.map((f) => findingEvent(f, request.repoRoot))),
+    }),
+  });
+
   const lanePool = createLanePool({
     readMachine,
     config,
@@ -857,6 +895,17 @@ async function executePipeline({
   };
 
   const usedModels = {};
+  const startedStages = new Set();
+  // Resolved once per stage class, so a config warning is printed once per run.
+  const idleByKey = new Map();
+  const idleFor = (stage) => {
+    const key = String(stage).toUpperCase();
+    if (!idleByKey.has(key)) idleByKey.set(key, resolveIdleMs(config, key, { warn: (m) => stderr?.write?.(m) }));
+    return idleByKey.get(key);
+  };
+  // A bad idle value fails the run here, before any seat starts.
+  idleFor('FIND');
+  idleFor('TABLE');
 
   const runAgent = async ({ stage, seat, prompt, schema, callId: explicitCallId, findingId }) => {
     const stgKey = stage.toLowerCase();
@@ -875,8 +924,6 @@ async function executePipeline({
     if (target.warning) stderr?.write?.(`warning: ${target.warning}\n`);
     usedModels[target.routeKey] = model ? `${backendName}:${model}` : backendName;
 
-    const release = await lanePool.acquire(laneProvider({ backendName, hostBackend, model }));
-
     let timeoutMs = config.timeouts?.other || 600000;
     if (stgKey === 'find') timeoutMs = config.timeouts?.find || 1200000;
     if (stgKey === 'ruling') timeoutMs = config.timeouts?.ruling || 900000;
@@ -887,20 +934,33 @@ async function executePipeline({
         ? `dispute-${seat.key}-${normalizeId(findingId)}`
         : `${stgKey}-${seat.key}`);
 
-    await appendEvent(runDir, {
-      event: 'call_start',
-      stage,
-      seat: seat.key,
-      callId,
-      ts: Date.now(),
-    });
+    if (!startedStages.has(stage)) {
+      startedStages.add(stage);
+      await appendEvent(runDir, { event: 'stage_start', stage });
+    }
+
+    // The failover list applies only when the call runs the seat's own swarm model; a config
+    // model for the stage or a host call has exactly one model.
+    const swarmSeat = backendName === swarmBackend && model && model === seatModels[seat.key]?.model;
+    const models = swarmSeat ? modelsForSeat(request, seat.key) : [model];
+    if (models.length === 0) {
+      const dead = { ok: false, value: null, raw: '', error: 'no-approved-model', attempts: 0 };
+      await appendEvent(runDir, { event: 'seat_dead', stage, seat: seat.key, callId, ok: false, error: dead.error, attempts: 0 });
+      return dead;
+    }
+
+    const release = await lanePool.acquire(laneProvider({ backendName, hostBackend, model }));
 
     // A swarm call never runs in the run cwd: it runs in the permission profile that matches
     // the stage class and the seat capability, over the sandbox tree.
-    const lane =
-      backendName === swarmBackend && model
-        ? await laneForCall({ runDir, treeDir, stage, model, capability: seatModels[seat.key]?.capability, env, namedConfigs, packText })
-        : null;
+    const laneFor = (m) =>
+      laneForCall({ runDir, treeDir, stage, model: m, capability: seatModels[seat.key]?.capability, env, namedConfigs, packText });
+    const lane = backendName === swarmBackend && model ? await laneFor(models[0]) : null;
+
+    let lastSeatOutput = 0;
+    const emit = (e) => {
+      appendEvent(runDir, { ...e, stage, seat: seat.key, callId });
+    };
 
     let res;
     try {
@@ -912,15 +972,27 @@ async function executePipeline({
           root: lane ? lane.cwd : request.repoRoot,
           runDir,
           cwd: lane ? lane.cwd : path.join(runDir, 'cwd'),
-          model,
+          model: models[0],
+          models,
           effort,
           timeoutMs,
+          idleMs: idleFor(stage),
           ...(lane ? { lane } : {}),
         },
         {
           backend: backendName,
           config,
           env,
+          ...(lane ? { laneFor } : {}),
+          onAttempt: ({ attempt, model: m }) => emit({ event: 'call_start', model: m ?? null, attempt }),
+          onStdout: ({ bytes }) => {
+            const now = Date.now();
+            if (now - lastSeatOutput < SEAT_OUTPUT_EVERY_MS) return;
+            lastSeatOutput = now;
+            emit({ event: 'seat_output', bytes, lastOutputAt: now });
+          },
+          onStalled: ({ model: m, idleMs, action }) => emit({ event: 'seat_stalled', model: m ?? null, idleMs, action }),
+          onFailover: ({ from, to, reason }) => emit({ event: 'seat_failover', from, to, reason }),
         }
       );
 
@@ -931,6 +1003,8 @@ async function executePipeline({
         callId,
         ok: res.ok,
         error: res.error,
+        model: res.model ?? null,
+        attempts: res.attempts,
         ts: Date.now(),
       });
 
@@ -985,15 +1059,21 @@ async function executePipeline({
       loadCheckpoint: async (name) => await readCheckpoint(runDir, name),
       checkpoint: async (name, data) => {
         await writeCheckpoint(runDir, name, data);
+        await appendEvent(runDir, { event: 'stage_end', stage: name });
         await checkIntegrity({ throwOnChange: true });
         if (name === 'find' && until === 'find') {
           throw new StopUntilFindError();
         }
       },
+      seatCheckpoint: (seatKey, data) =>
+        writeSeatCheckpoint(runDir, seatKey, { ...data, materialHash: request.materialHash ?? null }),
+      loadSeatCheckpoint: (seatKey) => readSeatCheckpoint(runDir, seatKey),
+      onSeatDone: (e) => appendEvent(runDir, { event: 'seat_done', stage: 'FIND', findingCount: e.findings.length, ...e }),
       sift: siftObj,
     });
   } catch (err) {
     if (err instanceof StopUntilFindError) {
+      await appendEvent(runDir, { event: 'run_end', gateVerdict: null, exitCode: 0, stopped: 'until-find' });
       if (flags.json) {
         stdout.write(JSON.stringify({ runDir, stage: 'find', status: 'stopped_until' }, null, 2) + '\n');
       } else {
@@ -1013,6 +1093,7 @@ async function executePipeline({
         gaps: { noSeat: [], deadSeats: [], notRead: [] },
         integrity: integrityReport,
       });
+      await appendEvent(runDir, { event: 'run_end', gateVerdict: 'BLOCK', exitCode: err.exitCode || 3 });
     }
     throw err;
   } finally {
@@ -1058,6 +1139,7 @@ async function executePipeline({
   };
 
   await writeResult(runDir, finalResult);
+  await appendEvent(runDir, { event: 'run_end', gateVerdict: finalResult.gateVerdict, exitCode: finalResult.exitCode });
 
   if (flags.json) {
     stdout.write(JSON.stringify(finalResult, null, 2) + '\n');
@@ -1071,6 +1153,24 @@ async function executePipeline({
   }
 
   return finalResult.exitCode;
+}
+
+// A seat that streams writes many chunks per second; the event log takes one line per 15 s.
+const SEAT_OUTPUT_EVERY_MS = 15000;
+
+/**
+ * The models one seat call may use: its primary and failover models whose provider the run
+ * approved. A run with no approval record keeps host models only, so a swarm seat gets none.
+ *
+ * @param {object} request
+ * @param {string} seatKey
+ * @returns {string[]}
+ */
+export function modelsForSeat(request, seatKey) {
+  const entries = seatEntries(request?.route?.seatModels?.[seatKey]);
+  const approved = request?.approval?.dataLeaves;
+  const allowed = new Set(Array.isArray(approved) ? approved.map((r) => r.provider) : ['host']);
+  return entries.filter((e) => allowed.has(e.provider)).map((e) => e.model);
 }
 
 const TIER_MODEL = { strong: 'opus', standard: 'sonnet', light: 'haiku' };

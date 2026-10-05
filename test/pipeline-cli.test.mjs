@@ -5,6 +5,9 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
+import { runCli } from './helpers/run-cli.mjs';
+import { writeSwarmBin, seedModelStore } from './helpers/run-fixture.mjs';
+import { modelsForSeat } from '../skills/adversarial-review/scripts/lib/cli/run.mjs';
 
 const CLI_PATH = path.resolve('skills/adversarial-review/scripts/adversarial-review.mjs');
 const FAKE_SEAT_PATH = path.resolve('test/fixtures/fake-seat.mjs');
@@ -631,6 +634,133 @@ describe('pipeline-cli e2e tests', () => {
       );
     } finally {
       await iso.cleanup();
+    }
+  });
+});
+
+// Live events (3.1 part C, task 6). The pipeline runs in its own process, so no signal handler
+// or tracked child of the run leaks into the test runner.
+async function readEventsFile(runDir) {
+  return (await fs.readFile(path.join(runDir, 'events.jsonl'), 'utf8'))
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+// The exit sweep appends `cleanup` after the run ends, so it never counts as the last event.
+const lastRunEvent = (events) => events.filter((e) => e.event !== 'cleanup').at(-1);
+
+async function runWithFakeSeats(args = []) {
+  const ctx = await setupEnvAndRepo();
+  const r = await runCli(['run', '--route', 'spawn', '--backend', 'custom', ...args], {
+    env: ctx.iso.env,
+    cwd: ctx.repo.root,
+  });
+  return { ...ctx, r, runDir: await soleRunDir(ctx.iso) };
+}
+
+describe('live seat events (3.1 part C, task 6)', () => {
+  it('run writes stage_start, seat_done per FIND seat, stage_end, call_start with model, run_end', async () => {
+    const { r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker,skeptic']);
+    try {
+      assert.ok(r.code === 0 || r.code === 1, `${r.code}: ${r.stderr}`);
+      const events = await readEventsFile(runDir);
+      const kinds = events.map((e) => e.event);
+      assert.ok(kinds.includes('stage_start'));
+      assert.ok(kinds.includes('stage_end'));
+      const end = lastRunEvent(events);
+      assert.equal(end.event, 'run_end');
+      assert.equal(end.exitCode, r.code);
+      const done = events.filter((e) => e.event === 'seat_done');
+      assert.deepEqual(done.map((e) => e.seat).sort(), ['breaker', 'skeptic']);
+      assert.ok(Array.isArray(done[0].findings));
+      assert.equal(done[0].findingCount, done[0].findings.length);
+      const cs = events.find((e) => e.event === 'call_start');
+      assert.ok('model' in cs && cs.attempt === 1, JSON.stringify(cs));
+      const ce = events.find((e) => e.event === 'call_end');
+      assert.equal(ce.attempts, 1);
+      const saved = JSON.parse(await fs.readFile(path.join(runDir, 'stages', `find-seat-${done[0].seat}.json`), 'utf8'));
+      assert.equal(saved.seat, done[0].seat);
+      assert.equal(saved.callId, `find-${done[0].seat}`);
+      assert.ok('model' in saved && typeof saved.materialHash === 'string');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('run --until find ends with run_end stopped until-find', async () => {
+    const { r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      const end = lastRunEvent(await readEventsFile(runDir));
+      assert.equal(end.event, 'run_end');
+      assert.equal(end.stopped, 'until-find');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('resume after the per-seat write and before seat_done gives exactly one seat_done', async () => {
+    const { iso, repo, r, runDir, cleanup } = await runWithFakeSeats(['--seats', 'breaker,skeptic', '--until', 'find']);
+    try {
+      assert.equal(r.code, 0, r.stderr);
+      const text = await fs.readFile(path.join(runDir, 'events.jsonl'), 'utf8');
+      const kept = text.split('\n').filter((l) => l && !l.includes('"seat_done"') && !l.includes('"stage_end"'));
+      await fs.writeFile(path.join(runDir, 'events.jsonl'), kept.join('\n') + '\n');
+      const r2 = await runCli(['run', '--resume', runDir, '--until', 'find'], { env: iso.env, cwd: repo.root });
+      assert.ok(r2.code === 0 || r2.code === 1, `${r2.code}: ${r2.stderr}`);
+      const evs = await readEventsFile(runDir);
+      const seats = evs.filter((e) => e.event === 'seat_done').map((e) => e.seat);
+      assert.deepEqual([...seats].sort(), ['breaker', 'skeptic']);
+      assert.equal(evs.filter((e) => e.event === 'stage_end' && e.stage === 'find').length, 1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('modelsForSeat keeps only approved providers, and a run with no approval keeps host models only', () => {
+    // Part A writes failover entries as model strings; a preflight bundle writes objects.
+    const request = {
+      route: { seatModels: { edge: { model: 'opencode/a', failover: ['x/b', 'opencode/c'] } } },
+      approval: { dataLeaves: [{ provider: 'opencode' }] },
+    };
+    assert.deepEqual(modelsForSeat(request, 'edge'), ['opencode/a', 'opencode/c']);
+    const objects = {
+      route: { seatModels: { edge: { model: 'opencode/a', provider: 'opencode', failover: [{ model: 'x/b', provider: 'x' }, { model: 'y/c', provider: 'y' }] } } },
+      approval: { dataLeaves: [{ provider: 'opencode' }, { provider: 'y' }] },
+    };
+    assert.deepEqual(modelsForSeat(objects, 'edge'), ['opencode/a', 'y/c']);
+    assert.deepEqual(modelsForSeat({ route: {} }, 'edge'), []);
+    assert.deepEqual(
+      modelsForSeat({ route: { seatModels: { edge: { model: 'opencode/a', provider: 'opencode', failover: [] } } } }, 'edge'),
+      []
+    );
+  });
+
+  it('plain run with a training swarm model and no acknowledgement exits 2 and starts no seat', async () => {
+    const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+    const { env, home, cleanup } = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+    const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+    try {
+      await writeSwarmBin({ dir: bins.dir, models: ['p/m1'] });
+      await seedModelStore({ home, model: 'p/m1', lenses: ['breaker', 'edge', 'attacker', 'medic', 'tester'], acknowledgeTraining: false });
+      await fs.writeFile(path.join(repo.root, 'a.js'), '2');
+      const res = await runCli(['run', '--route', 'swarm', '--model', 'p/m1', '--backend', 'claude', '--allow-gaps'], {
+        env,
+        cwd: repo.root,
+      });
+      assert.equal(res.code, 2, `${res.stdout}\n${res.stderr}`);
+      assert.match(res.stderr + res.stdout, /answer the decisions first/);
+      // The refused run leaves no run directory, so no seat can have started in one.
+      const runsBase = path.join(home, '.adversarial-review', 'runs');
+      const repoDirs = existsSync(runsBase) ? await fs.readdir(runsBase) : [];
+      let runCount = 0;
+      for (const rd of repoDirs) runCount += (await fs.readdir(path.join(runsBase, rd))).length;
+      assert.equal(runCount, 0);
+    } finally {
+      await repo.cleanup();
+      await cleanup();
+      await bins.cleanup();
     }
   });
 });

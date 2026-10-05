@@ -98,7 +98,13 @@ export async function runTable({
         }));
         const notReadSeat = Array.isArray(res.value.notRead) ? res.value.notRead : [];
         if (typeof seatCheckpoint === 'function') {
-          await seatCheckpoint(seat.key, { seat: seat.key, findings, notRead: notReadSeat });
+          await seatCheckpoint(seat.key, {
+            seat: seat.key,
+            callId: `find-${seat.key}`,
+            model: res.model ?? null,
+            findings,
+            notRead: notReadSeat,
+          });
         }
         if (typeof onSeatDone === 'function') {
           try {

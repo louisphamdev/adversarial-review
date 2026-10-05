@@ -173,6 +173,7 @@ const MAX_ATTEMPTS = 3;
  * @param {Function} [options.onStdout] ({ attempt, bytes }) per stdout chunk.
  * @param {Function} [options.onStalled] ({ attempt, model, idleMs, action }) after an idle kill.
  * @param {Function} [options.onFailover] ({ from, to, reason }) before an attempt with another model.
+ * @param {Function} [options.laneFor] async (model) => lane, called before each attempt.
  * @returns {Promise<{ ok: boolean, value: any, raw: string, error: string|null, attempts: number, costTotal?: number|null, tokensTotal?: number|null, costComplete?: boolean, toolRefusals?: number, stepCount?: number, errorType?: string|null, model?: string|null }>}
  */
 export async function runSeatCall(call, options = {}) {
@@ -263,6 +264,7 @@ export async function runSeatCall(call, options = {}) {
   let currentPromptFile = promptPath;
   let pendingPromptChange = false;
   let lastError = null;
+  const timeoutRetried = new Set();
   let lastRaw = '';
   let lastExtra = {
     costTotal: null,
@@ -286,8 +288,11 @@ export async function runSeatCall(call, options = {}) {
       pendingPromptChange = false;
     }
 
+    // A failover model of another provider needs its own lane home, so the lane follows the model.
+    const lane = typeof options.laneFor === 'function' ? await options.laneFor(model) : call.lane;
     const attemptCall = {
       ...call,
+      ...(lane ? { lane } : {}),
       model,
       prompt: currentPrompt,
       promptFile: currentPromptFile,
@@ -419,7 +424,12 @@ export async function runSeatCall(call, options = {}) {
           ? `exit-${childRes.code !== null ? childRes.code : childRes.signal || 1}`
           : kind;
       lastExtra = { ...extra, errorType: kind === 'exit' ? extra.errorType : kind };
-      moveOn(kind);
+      if (moveOn(kind)) continue;
+      // Each timeout costs the whole stage timeout, so one model gets one timeout retry at most.
+      if (kind === 'timeout') {
+        if (timeoutRetried.has(modelIdx)) break;
+        timeoutRetried.add(modelIdx);
+      }
       continue;
     }
 

@@ -700,7 +700,7 @@ test('runSeatCall: fake seat exits 1 then succeeds -> ok, attempts 2', async () 
   }
 });
 
-test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attempts: 3', async () => {
+test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attempts: 2', async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
   try {
     const runDir = path.join(tmp, 'run');
@@ -727,8 +727,8 @@ test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attem
     const res = await runSeatCall(call, { backend });
     assert.equal(res.ok, false);
     assert.equal(res.error, 'timeout');
-    // One model and no valid answer: the same model runs again while attempts remain.
-    assert.equal(res.attempts, 3);
+    // One model and a hard timeout: the same model gets one retry, not the whole attempt budget.
+    assert.equal(res.attempts, 2);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -1250,7 +1250,8 @@ test('runSeatCall: a timeout and a spawn failure keep the event fields and name 
     });
     assert.equal(timedOut.error, 'timeout');
     assert.equal(timedOut.errorType, 'timeout');
-    assert.equal(timedOut.attempts, 3);
+    // A hard timeout gives the same model one retry, not the whole attempt budget.
+    assert.equal(timedOut.attempts, 2);
     assert.equal(timedOut.costTotal, 0.5);
     assert.equal(timedOut.tokensTotal, 10);
     assert.equal(timedOut.model, 'gemini-3.8-flash');
@@ -1701,6 +1702,61 @@ test('runSeatCall: a custom command reads the prompt and schema files of the rou
     assert.ok(seenArgs[0].includes(path.join(calls, 'f8.r1.prompt.txt')));
     assert.ok(seenArgs[0].includes(path.join(calls, 'f8.r1.schema.json')));
     assert.ok(existsSync(path.join(calls, 'f8.r1.schema.json')));
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// A hard timeout costs the whole stage timeout per attempt, so one model gets at most one retry.
+function timeoutRunChild() {
+  const calls = [];
+  const fn = async (opts) => {
+    calls.push(opts);
+    return { code: null, signal: 'SIGTERM', stdout: '', stderr: '', timedOut: true, idled: false, spawnError: null };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+test('runSeatCall: a hard timeout on a one-model list retries that model once, then stops', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const runChild = timeoutRunChild();
+    const res = await runSeatCall(
+      { callId: 't1', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['okmodel'], timeoutMs: 1000 },
+      { backend: modelBackend(), runChild }
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'timeout');
+    assert.equal(res.attempts, 2);
+    assert.equal(runChild.calls.length, 2);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: a hard timeout moves to the next model at once; the last model gets one retry', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const seen = { attempts: [], failover: [] };
+    const res = await runSeatCall(
+      { callId: 't2', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['first', 'second'], timeoutMs: 1000 },
+      {
+        backend: modelBackend(),
+        runChild: timeoutRunChild(),
+        onAttempt: (a) => seen.attempts.push(a.model),
+        onFailover: (f) => seen.failover.push(f),
+      }
+    );
+    assert.equal(res.error, 'timeout');
+    assert.deepEqual(seen.attempts, ['first', 'second', 'second']);
+    assert.deepEqual(seen.failover, [{ from: 'first', to: 'second', reason: 'timeout' }]);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

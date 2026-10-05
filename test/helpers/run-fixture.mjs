@@ -164,10 +164,21 @@ export async function writeSwarmBin({ dir, models = [], logFile, escapeSandbox =
 }
 
 // A store that already holds a lens tier for every lens seat of the stage, so `research` has
-// nothing to measure and the run reaches the route decision without a bench call.
-export async function seedModelStore({ home, model, lenses, callable = true }) {
+// nothing to measure and the run reaches the route decision without a bench call. A swarm model
+// counts as training, so the user config acknowledges that unless the case measures the refusal.
+export async function seedModelStore({ home, model, lenses, callable = true, acknowledgeTraining = true }) {
   const stateDir = path.join(home, '.adversarial-review');
   await fs.mkdir(stateDir, { recursive: true });
+  const configPath = path.join(stateDir, 'config.json');
+  let config = { version: 3 };
+  try {
+    config = JSON.parse(await fs.readFile(configPath, 'utf8'));
+  } catch {
+    // No user config yet.
+  }
+  config.version = 3;
+  config.swarm = { ...(config.swarm || {}), acknowledgeTraining };
+  await fs.writeFile(configPath, JSON.stringify(config, null, 2));
   const entry = {
     backend: 'opencode',
     model,

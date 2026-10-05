@@ -7,6 +7,7 @@ import {
   isValidModel,
   DEFAULTS,
   loadConfig,
+  resolveIdleMs,
 } from '../skills/adversarial-review/scripts/lib/config.mjs';
 import { ConfigError } from '../skills/adversarial-review/scripts/lib/errors.mjs';
 import { makeIsolatedEnv, makeTempRepo } from './helpers/isolated-env.mjs';
@@ -463,5 +464,22 @@ test('config module', async (t) => {
       await c1();
       await c2();
     }
+  });
+  await t.test('resolveIdleMs: defaults, floor, and type check', () => {
+    const warnings = [];
+    const warn = (m) => warnings.push(m);
+    assert.equal(resolveIdleMs({}, 'FIND', { warn }), 300000);
+    assert.equal(resolveIdleMs({}, 'TABLE', { warn }), 180000);
+    assert.equal(resolveIdleMs({ timeouts: { idle: { find: 60000 } } }, 'FIND', { warn }), 120000);
+    assert.match(warnings.join(''), /timeouts\.idle\.find raised to 120000/);
+    assert.equal(resolveIdleMs({ timeouts: { idle: { other: 200000 } } }, 'RULING', { warn }), 200000);
+    assert.throws(() => resolveIdleMs({ timeouts: { idle: { other: 'x' } } }, 'TABLE', { warn }), ConfigError);
+  });
+
+  await t.test('resolveIdleMs: a value at or over the hard timeout of the stage warns', () => {
+    const warnings = [];
+    const config = { timeouts: { find: 1200000, idle: { find: 1500000 } } };
+    assert.equal(resolveIdleMs(config, 'FIND', { warn: (m) => warnings.push(m) }), 1500000);
+    assert.match(warnings.join(''), /hard timeout/);
   });
 });

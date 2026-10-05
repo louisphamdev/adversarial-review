@@ -57,6 +57,34 @@ export const DEFAULTS = Object.freeze({
   }),
 });
 
+const IDLE_DEFAULTS = Object.freeze({ find: 300000, other: 180000 });
+// A healthy free-model step was measured silent for 98.9 s, so a lower deadline kills good seats.
+const IDLE_FLOOR = 120000;
+
+// Idle deadline of a streaming seat call. Read from the user layer only: project config cannot set timeouts.
+export function resolveIdleMs(config, stage, { warn = (m) => process.stderr.write(m) } = {}) {
+  const upper = String(stage).toUpperCase();
+  const key = upper === 'FIND' ? 'find' : 'other';
+  const raw = config?.timeouts?.idle?.[key];
+  let idle = IDLE_DEFAULTS[key];
+  if (raw !== undefined) {
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      throw new ConfigError(`timeouts.idle.${key} must be a number`);
+    }
+    idle = raw;
+    if (raw < IDLE_FLOOR) {
+      warn(`warning: timeouts.idle.${key} raised to ${IDLE_FLOOR}\n`);
+      idle = IDLE_FLOOR;
+    }
+  }
+  const hardKey = upper === 'FIND' ? 'find' : upper === 'RULING' ? 'ruling' : 'other';
+  const hard = config?.timeouts?.[hardKey];
+  if (typeof hard === 'number' && idle >= hard) {
+    warn(`warning: timeouts.idle.${key} (${idle}) is not below the hard timeout timeouts.${hardKey} (${hard})\n`);
+  }
+  return idle;
+}
+
 // Merges defaults, user config, project config, and flags.
 export function loadConfig({ env = process.env, repoRoot, flags = {}, stderr } = {}) {
   const config = structuredClone(DEFAULTS);
