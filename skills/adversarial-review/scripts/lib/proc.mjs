@@ -30,6 +30,18 @@ export const ALLOWED_PLACEHOLDERS = new Set([
 // Set of all currently active spawned child processes.
 export const trackedChildren = new Set();
 
+// Every pid this process spawned, kept while a kill by that pid could still reach something. A
+// pid whose child object already closed can still own a live grandchild, which is the leak the
+// sweep removes. It is dropped as soon as nothing it could own is alive, because the OS reuses
+// pids: a pid kept past that point can name an unrelated process by the time the sweep runs.
+export const trackedPids = new Set();
+
+export const CLEANUP_WAIT_MS = 5000;
+
+// The signal path runs the same cleanup, so this window must outlast CLEANUP_WAIT_MS plus the
+// EBUSY retries of the sandbox removal. A shorter one exits while lanes are still being killed.
+export const EXIT_HOOK_GRACE_MS = 8000;
+
 /**
  * Read an env value by case-insensitive key name.
  *
@@ -217,7 +229,11 @@ export async function spawnResolved(resolvedPath, args = [], options = {}) {
   });
 
   trackedChildren.add(child);
-  const cleanup = () => trackedChildren.delete(child);
+  if (child.pid) trackedPids.add(child.pid);
+  const cleanup = () => {
+    trackedChildren.delete(child);
+    if (child.pid && !isPidTreeAlive(child.pid)) trackedPids.delete(child.pid);
+  };
   child.once('close', cleanup);
   child.once('error', cleanup);
 
@@ -285,6 +301,101 @@ export function forceKill(child) {
 }
 
 /**
+ * Whether a pid still names a running process.
+ * EPERM means the process exists and belongs to another user, so it is alive.
+ *
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function isPidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * Whether a kill by this pid can still reach a running process.
+ * POSIX: the process group of the pid, which outlives its leader while a member runs.
+ * Windows: the pid itself, because a tree kill by an exited pid reaches nothing (measured
+ * 2026-10-05: taskkill answers "process not found" and leaves the descendant running).
+ *
+ * @param {number} pid
+ * @param {string} [platform]
+ * @returns {boolean}
+ */
+export function isPidTreeAlive(pid, platform = process.platform) {
+  if (!pid) return false;
+  if (platform === 'win32') return isPidAlive(pid);
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * Kill a process tree by pid, with no child object.
+ *
+ * @param {number} pid
+ * @param {string} [platform]
+ */
+export function killPidTree(pid, platform = process.platform) {
+  if (!pid) return;
+  try {
+    if (platform === 'win32') {
+      spawnSync(system32Path('taskkill.exe'), ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      return;
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      process.kill(pid, 'SIGKILL');
+    }
+  } catch {
+    // The process is already gone.
+  }
+}
+
+/**
+ * Kill the process tree of every tracked pid, then wait for them to disappear.
+ * A pid that survives the wait is reported, never hidden: the caller names it to the user.
+ *
+ * @param {{ waitMs?: number, kill?: (pid: number) => void }} [options]
+ * @returns {Promise<{ killed: number, stillAlive: number[] }>}
+ */
+export async function cleanupTracked({ waitMs = CLEANUP_WAIT_MS, kill = killPidTree } = {}) {
+  const pids = [...trackedPids];
+  // The attempt never reads the pid's own liveness. A pid that exited can still lead a group
+  // that holds a live lane server, and that pid is the only handle on it: skipping it would
+  // leave the leak running and still report a clean sweep. Liveness only counts the kill.
+  const killed = pids.filter((pid) => isPidAlive(pid)).length;
+  for (const pid of pids) {
+    kill(pid);
+  }
+  trackedChildren.clear();
+
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let alive = pids.filter((pid) => isPidAlive(pid));
+  while (alive.length > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    alive = alive.filter((pid) => isPidAlive(pid));
+  }
+
+  for (const pid of pids) {
+    if (!alive.includes(pid)) trackedPids.delete(pid);
+  }
+  return { killed, stillAlive: alive };
+}
+
+/**
  * Kill all active tracked children synchronously.
  */
 export function killAllTrackedSync() {
@@ -342,7 +453,7 @@ export function installSignalHandlers(onExit) {
         await Promise.race([
           Promise.resolve().then(() => onExit(err)),
           new Promise((resolve) => {
-            timer = setTimeout(resolve, 2000);
+            timer = setTimeout(resolve, EXIT_HOOK_GRACE_MS);
           }),
         ]);
       } catch {
@@ -429,9 +540,10 @@ function collectTailStream(child, which, maxBytes = RUN_CHILD_MAX_BYTES) {
  * @param {object} [options.env]
  * @param {string|Buffer} [options.stdin]
  * @param {number} [options.timeoutMs]
+ * @param {number} [options.idleMs] Kill the child after this long with no stdout or stderr chunk.
  * @param {Function} [options.onSpawn]
  * @param {Function} [options.onStdout]
- * @returns {Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, spawnError: Error|null }>}
+ * @returns {Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, idled: boolean, spawnError: Error|null }>}
  */
 export async function runChild({
   cmd,
@@ -440,6 +552,7 @@ export async function runChild({
   env,
   stdin,
   timeoutMs,
+  idleMs,
   onSpawn,
   onStdout,
 }) {
@@ -453,6 +566,7 @@ export async function runChild({
       stdout: '',
       stderr: '',
       timedOut: false,
+      idled: false,
       spawnError: err,
     };
   }
@@ -466,6 +580,7 @@ export async function runChild({
       stdout: '',
       stderr: '',
       timedOut: false,
+      idled: false,
       spawnError: err,
     };
   }
@@ -484,6 +599,7 @@ export async function runChild({
       stdout: '',
       stderr: '',
       timedOut: false,
+      idled: false,
       spawnError: err,
     };
   }
@@ -507,23 +623,49 @@ export async function runChild({
     }
   }
 
-  // Attached synchronously before the collector so that no chunk is lost.
-  if (typeof onStdout === 'function' && child.stdout) {
-    child.stdout.on('data', (chunk) => {
-      try {
-        onStdout(chunk);
-      } catch {
-        // a listener error never breaks the child
-      }
-    });
-  }
-
-  const stdoutPromise = collectTailStream(child, 'stdout', RUN_CHILD_MAX_BYTES);
-  const stderrPromise = collectTailStream(child, 'stderr', RUN_CHILD_MAX_BYTES);
-
   let timeoutTimer = null;
   let timedOut = false;
   let spawnError = null;
+  let idled = false;
+  let idleTimer = null;
+
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  // The deadline restarts on every chunk, so a slow model that still reports stays alive while a
+  // silent one dies. A total timeout that already fired owns the kill, so this stands down then.
+  const armIdle = () => {
+    if (!(idleMs > 0) || timedOut || idled) return;
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      if (timedOut) return;
+      idled = true;
+      forceKill(child);
+    }, idleMs);
+  };
+  armIdle();
+
+  // Attached synchronously before the collector so that no chunk is lost.
+  if (child.stdout) {
+    child.stdout.on('data', (chunk) => {
+      armIdle();
+      if (typeof onStdout === 'function') {
+        try {
+          onStdout(chunk);
+        } catch {
+          // a report hook never breaks a call
+        }
+      }
+    });
+  }
+  if (child.stderr) child.stderr.on('data', armIdle);
+
+  const stdoutPromise = collectTailStream(child, 'stdout', RUN_CHILD_MAX_BYTES);
+  const stderrPromise = collectTailStream(child, 'stderr', RUN_CHILD_MAX_BYTES);
 
   child.once('error', (err) => {
     spawnError = err;
@@ -536,7 +678,9 @@ export async function runChild({
 
   if (timeoutMs != null && Number.isFinite(timeoutMs) && timeoutMs > 0) {
     timeoutTimer = setTimeout(() => {
+      if (idled) return;
       timedOut = true;
+      clearIdle();
       forceKill(child);
     }, timeoutMs);
   }
@@ -549,6 +693,7 @@ export async function runChild({
       clearTimeout(timeoutTimer);
       timeoutTimer = null;
     }
+    clearIdle();
   }
 
   const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
@@ -559,6 +704,7 @@ export async function runChild({
     stdout,
     stderr,
     timedOut,
+    idled,
     spawnError,
   };
 }

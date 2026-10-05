@@ -91,7 +91,7 @@ export async function runCanary({ runDir, repoRoot, treeDir, profiles, models, l
       await fs.writeFile(nonceFile, nonce);
       try {
         const prompt = canaryPrompt({ cwd: prof.cwd, runDir, treeDir, nonceFile, suffix });
-        const res = await laneCallFor({ cwd: prof.cwd, mode: prof.mode, prompt })(model);
+        const res = await laneCallFor({ cwd: prof.cwd, mode: prof.mode, xdgHome: prof.xdgHome, prompt })(model);
         const targetsFound = await findTargets([runDir, repoRoot], suffix);
         outcome = judgeCanary({ events: res?.events || [], stdout: res?.raw || '', nonce, targetsFound });
         usedModel = model;

@@ -18,6 +18,10 @@ import {
   runChild,
   forceKill,
   trackedChildren,
+  trackedPids,
+  cleanupTracked,
+  isPidAlive,
+  isPidTreeAlive,
   killAllTrackedSync,
   installSignalHandlers,
   runWithTimeout,
@@ -619,6 +623,43 @@ describe('runChild', () => {
     assert.ok(chunks.length >= 1);
   });
 
+  it('runChild: idleMs kills a silent child and reports idled', async () => {
+    const chunks = [];
+    const res = await runChild({
+      cmd: process.execPath,
+      args: [resolve('test/fixtures/backends/talk-then-silent-seat.mjs')],
+      idleMs: 1500,
+      timeoutMs: 30000,
+      onStdout: (c) => chunks.push(String(c)),
+    });
+    assert.equal(res.idled, true);
+    assert.equal(res.timedOut, false);
+    assert.match(chunks.join(''), /step_start/);
+  });
+
+  it('runChild: a throwing onStdout is ignored', async () => {
+    const res = await runChild({
+      cmd: process.execPath,
+      args: ['-e', 'console.log("x")'],
+      onStdout: () => {
+        throw new Error('boom');
+      },
+    });
+    assert.equal(res.code, 0);
+    assert.equal(res.idled, false);
+  });
+
+  it('runChild: timeoutMs still wins when it fires first', async () => {
+    const res = await runChild({
+      cmd: process.execPath,
+      args: [resolve('test/fixtures/backends/talk-then-silent-seat.mjs')],
+      idleMs: 30000,
+      timeoutMs: 1500,
+    });
+    assert.equal(res.timedOut, true);
+    assert.equal(res.idled, false);
+  });
+
   it('runChild invokes onSpawn callback', async () => {
     let capturedChild = null;
     const result = await runChild({
@@ -645,6 +686,89 @@ describe('Tracking and Signal Handlers', () => {
     assert.equal(trackedChildren.size, 0);
     const code = await new Promise((res) => child.on('close', res));
     assert.ok(code !== 0 || child.signalCode != null);
+  });
+
+  it('cleanupTracked kills the whole tree of every tracked pid and reports none still alive', async () => {
+    // The grandchild proves the tree kill: a plain child.kill() leaves it running, which is the
+    // leak this cleanup exists to stop.
+    const stub = [
+      "const { spawn } = require('node:child_process');",
+      "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      'process.stdout.write(g.pid + String.fromCharCode(10));',
+      'setInterval(() => {}, 1000);',
+    ].join('');
+    const child = await spawnResolved(process.execPath, ['-e', stub], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    const deadline = Date.now() + 10000;
+    while (!out.trim()  && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const grandchildPid = Number(out.trim());
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0, `no grandchild pid: ${out}`);
+    assert.ok(trackedPids.has(child.pid));
+    assert.ok(isPidAlive(child.pid));
+    assert.ok(isPidAlive(grandchildPid));
+
+    const res = await cleanupTracked({ waitMs: 5000 });
+
+    assert.ok(res.killed >= 1, `killed ${res.killed}`);
+    assert.deepEqual(res.stillAlive, []);
+    assert.equal(isPidAlive(child.pid), false, 'the tracked child is gone');
+    assert.equal(isPidAlive(grandchildPid), false, 'the grandchild is gone');
+    assert.equal(trackedChildren.size, 0);
+    assert.equal(trackedPids.has(child.pid), false, 'a dead pid is dropped, so it cannot be reused');
+  });
+
+  // The reason trackedPids exists is a pid whose own process exited while a process it started
+  // is still alive. Gating the kill attempt on that pid being alive skips exactly that case and
+  // then reports a clean sweep, so the attempt must never read the pid's own liveness.
+  it('cleanupTracked signals the tree of a tracked pid whose own process already exited', async () => {
+    // A pid another test still tracks must come back, or the final sweep never sees it.
+    const borrowed = [...trackedPids];
+    trackedPids.clear();
+    const child = await spawnResolved(process.execPath, ['-e', 'process.exit(0)'], {
+      stdio: 'ignore',
+    });
+    const pid = child.pid;
+    await new Promise((r) => child.once('close', r));
+    assert.equal(isPidAlive(pid), false, 'the tracked process itself is gone');
+    // The close handler prunes a settled pid, so put it back: this test is about the decision
+    // the sweep makes, not about the prune.
+    trackedPids.add(pid);
+
+    const asked = [];
+    const res = await cleanupTracked({ waitMs: 0, kill: (p) => asked.push(p) });
+
+    assert.deepEqual(asked, [pid], 'the sweep signals the group of a pid that may own a survivor');
+    assert.equal(res.killed, 0, 'a pid that was already gone is not counted as killed');
+    assert.deepEqual(res.stillAlive, []);
+    for (const p of borrowed) trackedPids.add(p);
+  });
+
+  // OS pids are a small, reused number space. A pid kept for the whole run can be recycled by an
+  // unrelated process before the final sweep, which would then kill that process.
+  it('a tracked pid is dropped as soon as nothing it could own is alive', async () => {
+    const child = await spawnResolved(process.execPath, ['-e', 'process.exit(0)'], {
+      stdio: 'ignore',
+    });
+    const pid = child.pid;
+    assert.ok(trackedPids.has(pid), 'a live pid is tracked');
+    await new Promise((r) => child.once('close', r));
+    assert.equal(trackedPids.has(pid), false, 'a settled pid cannot be confused with a recycled one');
+  });
+
+  it('isPidTreeAlive reports a running process and not an exited one', async () => {
+    const child = await spawnResolved(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    assert.equal(isPidTreeAlive(child.pid), true);
+    await cleanupTracked({ waitMs: 0 });
+    await new Promise((r) => child.once('close', r));
+    assert.equal(isPidTreeAlive(child.pid), false);
+    assert.equal(isPidTreeAlive(0), false);
   });
 
   it('installSignalHandlers cleans up tracked children on SIGINT and exits 130', { skip: process.platform === 'win32' && 'Windows cannot deliver SIGINT through process.kill' }, async () => {
@@ -691,6 +815,30 @@ describe('Tracking and Signal Handlers', () => {
     });
     const exitCode = await new Promise((res) => proc.on('close', res));
     assert.equal(exitCode, 1);
+  });
+
+  // The exit hook runs the same sweep as a normal end: a kill, a wait of up to CLEANUP_WAIT_MS,
+  // and the sandbox removal with its retries. A window of 2000 ms cut that off halfway.
+  it('installSignalHandlers lets an exit hook of 3 s finish before the process exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ar-hook-'));
+    try {
+      const marker = join(dir, 'done.txt').replace(/\\/g, '/');
+      const script = `
+        import { writeFileSync } from 'node:fs';
+        import { installSignalHandlers } from './skills/adversarial-review/scripts/lib/proc.mjs';
+        installSignalHandlers(async () => {
+          await new Promise((r) => setTimeout(r, 3000));
+          writeFileSync('${marker}', 'swept');
+        });
+        setTimeout(() => { throw new Error('boom'); }, 50);
+      `;
+      const proc = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
+      const exitCode = await new Promise((res) => proc.on('close', res));
+      assert.equal(exitCode, 1);
+      assert.equal(await readFile(marker, 'utf8'), 'swept', 'the exit hook was cut off');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

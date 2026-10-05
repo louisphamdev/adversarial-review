@@ -44,3 +44,34 @@ test('runCanary fails when a lane creates a target, and retries an unverified re
     assert.deepEqual(tried.slice(-2), ['quiet', 'good']);
   } finally { await rm(runDir, { recursive: true, force: true }); await rm(repoRoot, { recursive: true, force: true }); }
 });
+
+// The canary proves the boundary of the profile it is given. Without the isolated home it would
+// test a lane that reads the user's own config, which is not the lane the run then uses.
+test('runCanary gives the lane the isolated home of the profile under test', async () => {
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-can-'));
+  const repoRoot = await mkdtemp(path.join(tmpdir(), 'ar-repo-'));
+  try {
+    const cwd = path.join(runDir, 'sandbox', 'profiles', 'canary');
+    const xdgHome = path.join(runDir, 'sandbox', 'xdg', 'canary', 'zen');
+    await mkdir(cwd, { recursive: true });
+    const seen = [];
+    const laneCallFor = (input) => async () => {
+      seen.push(input);
+      return { ok: true, value: null, raw: '', events: [refused('read'), refused('shell')] };
+    };
+    const r = await runCanary({
+      runDir,
+      repoRoot,
+      treeDir: path.join(runDir, 'sandbox', 'tree'),
+      profiles: [{ profileKey: 'canary', cwd, xdgHome, mode: 'zen' }],
+      models: ['good'],
+      laneCallFor,
+    });
+    assert.equal(r.result, 'passed');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].xdgHome, xdgHome);
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});

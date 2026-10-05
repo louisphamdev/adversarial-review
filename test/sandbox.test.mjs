@@ -87,15 +87,37 @@ test('createSandbox reports a cap breach before copying anything', async () => {
   }
 });
 
-// `opencode debug config` lists `<cwd>/opencode.json` as a config document and `<cwd>/.opencode`
-// as a directory of agents, commands, and plugins only. A rule list under `.opencode/` is never
-// read, so the lane keeps the user's own permissions and the canary finds a real escape.
-test('writeProfileConfig writes the config where opencode reads it, not under .opencode', async () => {
+// A zen lane runs `--standalone` with its own XDG_CONFIG_HOME, so the only config it reads is
+// `<xdgHome>/opencode/opencode.json`. Nothing is written into the lane cwd: a config there would
+// be a second source, and `.opencode/` is a directory of agents and plugins that is never read
+// as a rule list.
+test('writeProfileConfig writes the isolated config under sandbox/xdg, and nothing in the lane cwd', async () => {
   const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
   try {
-    const { cwd } = await writeProfileConfig({ runDir, profileKey: 'probe', treeDir: 'C:\\r\\sandbox\\tree', steps: PROFILE_STEPS.probe });
-    assert.ok(existsSync(path.join(cwd, 'opencode.json')), 'the project config document');
-    assert.ok(!existsSync(path.join(cwd, '.opencode', 'opencode.json')), 'no rule list in the directory source');
+    const { cwd, xdgHome } = await writeProfileConfig({ runDir, profileKey: 'probe', treeDir: 'C:\\r\\sandbox\\tree', steps: PROFILE_STEPS.probe });
+    assert.equal(xdgHome, path.join(runDir, 'sandbox', 'xdg', 'probe', 'zen'));
+    assert.ok(existsSync(path.join(xdgHome, 'opencode', 'opencode.json')), 'the isolated config document');
+    assert.ok(existsSync(cwd), 'the lane cwd exists, so the lane process can spawn in it');
+    assert.ok(!existsSync(path.join(cwd, 'opencode.json')), 'no config in the lane cwd');
+    assert.ok(!existsSync(path.join(cwd, '.opencode')), 'no directory source in the lane cwd');
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+// The user's global config brings the MCP servers, the instructions, and the plugins with it.
+// A zen lane that inherits any of them starts one full set of MCP processes per lane directory.
+test('writeProfileConfig writes no instructions, mcp, plugin, or provider key', async () => {
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    const { xdgHome } = await writeProfileConfig({ runDir, profileKey: 'short', treeDir: 'C:\\r\\sandbox\\tree', steps: PROFILE_STEPS.short });
+    const cfg = JSON.parse(await readFile(path.join(xdgHome, 'opencode', 'opencode.json'), 'utf8'));
+    assert.deepEqual(Object.keys(cfg).sort(), ['$schema', 'agents']);
+    for (const key of ['instructions', 'mcp', 'plugin', 'provider']) {
+      assert.equal(Object.prototype.hasOwnProperty.call(cfg, key), false, `the key ${key} must be absent`);
+    }
+    assert.deepEqual(Object.keys(cfg.agents), ['build']);
+    assert.deepEqual(Object.keys(cfg.agents.build).sort(), ['permissions', 'steps']);
   } finally {
     await rm(runDir, { recursive: true, force: true });
   }
@@ -104,8 +126,8 @@ test('writeProfileConfig writes the config where opencode reads it, not under .o
 test('writeProfileConfig writes the ordered rule list with an exact shell allow', async () => {
   const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
   try {
-    const { cwd } = await writeProfileConfig({ runDir, profileKey: 'weak-find', treeDir: 'C:\\r\\sandbox\\tree', steps: PROFILE_STEPS['weak-find'] });
-    const cfg = JSON.parse(await readFile(path.join(cwd, 'opencode.json'), 'utf8'));
+    const { xdgHome } = await writeProfileConfig({ runDir, profileKey: 'weak-find', treeDir: 'C:\\r\\sandbox\\tree', steps: PROFILE_STEPS['weak-find'] });
+    const cfg = JSON.parse(await readFile(path.join(xdgHome, 'opencode', 'opencode.json'), 'utf8'));
     const rules = cfg.agents.build.permissions;
     assert.deepEqual(rules[0], { action: '*', resource: '*', effect: 'deny' });
     assert.ok(rules.some((r) => r.action === 'read' && r.resource === 'C:/r/sandbox/tree/*' && r.effect === 'allow'));

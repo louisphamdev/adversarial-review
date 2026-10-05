@@ -28,7 +28,8 @@ import {
   updateStore,
 } from '../catalog.mjs';
 import { makeBenchCallFor } from './models.mjs';
-import { installSignalHandlers, killAllTrackedSync } from '../proc.mjs';
+import { killAllTrackedSync } from '../proc.mjs';
+import { acquireLockWithCleanup, installCleanupHandler, setActiveRunDir } from '../cleanup.mjs';
 import { createLanePool, readMachine, laneCap, laneProvider, laneOutcome } from '../lanes.mjs';
 import { compareBaseline, hashRepo, readIntegrity, writeIntegrity } from '../integrity.mjs';
 import {
@@ -108,10 +109,7 @@ export async function runCommand(
     }
 
     // First action on resume: acquire lock
-    const lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
-    installSignalHandlers(async () => {
-      await lock.release();
-    });
+    const lock = await acquireLockWithCleanup(runDir, { stderr });
 
     try {
       const state = await readState(runDir);
@@ -384,6 +382,14 @@ export async function runCommand(
         : material.path;
 
   await writeMaterial(runDir, material);
+  setActiveRunDir(runDir);
+
+  // The handler goes in HERE, not at the lock below: the probe and the canary open lanes first,
+  // so a Ctrl-C during them is the most likely signal of the whole run. `acquireLockWithCleanup`
+  // cannot be used at that lock, because `installSignalHandlers` keeps the first handler it is
+  // given and a second install would never receive the lock.
+  const lockHolder = { lock: null };
+  installCleanupHandler({ stderr, lockHolder });
 
   // -------------------------------------------------------------------------
   // Step 2 of the G2-2 order: the integrity baseline, which needs runDir. The route and the
@@ -430,13 +436,13 @@ export async function runCommand(
   if (usesSwarm(routeDecision) && prep.sandbox) {
     const profiles = [];
     for (const profileKey of ['weak-find', 'strong-find', 'short', 'canary']) {
-      const { cwd } = await writeProfileConfig({
+      const { cwd, xdgHome } = await writeProfileConfig({
         runDir,
         profileKey,
         treeDir: prep.sandbox.treeDir,
         steps: PROFILE_STEPS[profileKey],
       });
-      profiles.push({ profileKey, cwd, mode: 'zen' });
+      profiles.push({ profileKey, cwd, xdgHome, mode: 'zen' });
     }
     const ranked = [...prep.pool]
       .sort((a, b) => latencyOf(prep.probeResults, a.model) - latencyOf(prep.probeResults, b.model))
@@ -447,8 +453,8 @@ export async function runCommand(
       treeDir: prep.sandbox.treeDir,
       profiles,
       models: ranked,
-      laneCallFor: ({ cwd, mode, prompt }) =>
-        makeLaneCall({ config, env, runDir, cwd, mode, stage: 'FIND', prompt, timeoutMs: 180000, callIdPrefix: 'canary', backend: swarmBackend }),
+      laneCallFor: ({ cwd, mode, xdgHome, prompt }) =>
+        makeLaneCall({ config, env, runDir, cwd, mode, xdgHome, stage: 'FIND', prompt, timeoutMs: 180000, callIdPrefix: 'canary', backend: swarmBackend }),
     });
     if (canary.result === 'failed') {
       // The run stops here, before the table, so nothing else cleans up after it. `keep` follows
@@ -516,6 +522,10 @@ export async function runCommand(
   // Detach mode: spawn detached resume worker and wait <= 10s for lock
   // -------------------------------------------------------------------------
   if (flags.detach) {
+    // The worker owns the run directory from here, and it rebuilds the sandbox under its own
+    // lock. The parent must sweep only the processes it started itself, so it clears the run
+    // directory. Every exit path below reads it when it fires, the signal handler included.
+    setActiveRunDir(null);
     const logPath = path.join(runDir, 'worker.log');
     const fd = fsSync.openSync(logPath, 'a');
     const scriptPath = fileURLToPath(new URL('../../adversarial-review.mjs', import.meta.url));
@@ -553,11 +563,9 @@ export async function runCommand(
     return 0;
   }
 
-  // Direct run mode
-  const lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
-  installSignalHandlers(async () => {
-    await lock.release();
-  });
+  // Direct run mode. The exit handler is already installed above; this hands it the lock.
+  lockHolder.lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  const lock = lockHolder.lock;
 
   try {
     return await executePipeline({
@@ -676,7 +684,7 @@ async function prepareSwarmTree({ runDir, material, config, env, swarmBackend, s
   });
   out.packText = await fs.readFile(pack.path, 'utf8');
 
-  const { cwd: probeCwd } = await writeProfileConfig({
+  const { cwd: probeCwd, xdgHome: probeXdgHome } = await writeProfileConfig({
     runDir,
     profileKey: 'probe',
     treeDir: sandbox.treeDir,
@@ -687,6 +695,7 @@ async function prepareSwarmTree({ runDir, material, config, env, swarmBackend, s
     env,
     runDir,
     cwd: probeCwd,
+    xdgHome: probeXdgHome,
     stage: 'FIND',
     schema: PROBE,
     prompt: PROBE_PROMPT,
@@ -717,13 +726,13 @@ async function prepareSwarmTree({ runDir, material, config, env, swarmBackend, s
     // would inherit the user's own opencode permissions, which is the boundary A6 and A7 close.
     const benchCache = new Map();
     for (const lens of lensSeats) {
-      const { cwd } = await writeProfileConfig({
+      const profile = await writeProfileConfig({
         runDir,
         profileKey: `bench-${lens}`,
         treeDir: path.join(LENS_DIR, lens),
         steps: PROFILE_STEPS.bench,
       });
-      benchCache.set(`profile:bench-${lens}`, cwd);
+      benchCache.set(`profile:bench-${lens}`, profile);
     }
     const benchCallFor = makeBenchCallFor({
       config,
@@ -1171,11 +1180,13 @@ async function laneForCall({ runDir, treeDir, stage, model, capability, env, nam
 
   const profileCacheKey = `profile:${profileKey}`;
   if (!namedConfigs.has(profileCacheKey)) {
-    namedConfigs.set(profileCacheKey, (await writeProfileConfig({ runDir, profileKey, treeDir, steps })).cwd);
+    namedConfigs.set(profileCacheKey, await writeProfileConfig({ runDir, profileKey, treeDir, steps }));
   }
-  const cwd = namedConfigs.get(profileCacheKey);
+  const { cwd, xdgHome: zenXdgHome } = namedConfigs.get(profileCacheKey);
 
-  let xdgHome;
+  // A zen lane reads the profile config of this run and nothing else; a named lane reads the
+  // home that carries its provider block.
+  let xdgHome = zenXdgHome;
   if (mode === 'named') {
     const key = `named:${profileKey}:${provider}`;
     if (!namedConfigs.has(key)) {

@@ -81,10 +81,67 @@ export async function writeMaterial(runDir, material) {
   }
 }
 
-// Appends an event object to events.jsonl.
-export async function appendEvent(runDir, event) {
+const appendQueues = new Map();
+
+// One queue per run directory: parallel seat calls must never interleave inside one line.
+export function appendEvent(runDir, event) {
   const file = path.join(runDir, 'events.jsonl');
-  await appendJsonLine(file, event);
+  const line = { ...event, ts: event.ts ?? Date.now() };
+  const prev = appendQueues.get(file) || Promise.resolve();
+  const next = prev.then(() => appendWithRetry(file, line));
+  appendQueues.set(file, next.catch(() => {}));
+  return next;
+}
+
+// An event is a report. A lost event never stops a review, so this never throws.
+async function appendWithRetry(file, obj) {
+  const delays = [50, 100, 200];
+  for (let i = 0; ; i++) {
+    try {
+      await appendJsonLine(file, obj);
+      return;
+    } catch (err) {
+      if (i >= delays.length) {
+        process.stderr.write(`warning: event not written (${err.code || err.message})\n`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, delays[i]));
+    }
+  }
+}
+
+// Runs after the lock and before the first append, so a crash-cut line becomes a skipped line.
+export async function repairEvents(runDir) {
+  const file = path.join(runDir, 'events.jsonl');
+  let fh;
+  try {
+    fh = await fs.open(file, 'r');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { repaired: false };
+    process.stderr.write(`warning: events repair skipped (${err.code || err.message})\n`);
+    return { repaired: false };
+  }
+  try {
+    const { size } = await fh.stat();
+    if (size === 0) return { repaired: false };
+    const buf = Buffer.alloc(1);
+    await fh.read(buf, 0, 1, size - 1);
+    if (buf[0] === 0x0a) return { repaired: false };
+  } finally {
+    await fh.close();
+  }
+  await fs.appendFile(file, '\n', 'utf8');
+  return { repaired: true };
+}
+
+// Returns null on a transient read error, so a caller can treat it as "no new data".
+export async function readEvents(runDir) {
+  try {
+    return await readJsonLines(path.join(runDir, 'events.jsonl'));
+  } catch (err) {
+    if (err && ['EBUSY', 'EPERM', 'EACCES'].includes(err.code)) return null;
+    throw err;
+  }
 }
 
 // Saves a completed stage checkpoint.
@@ -134,6 +191,19 @@ export async function writeIndexed(runDir, prefix, data) {
     }
     n++;
   }
+}
+
+// Next round number for a prefix: 1 + the records that writeIndexed already wrote.
+// The count and the record index agree, so a later round never overwrites a call file.
+export async function nextRound(runDir, prefix) {
+  let entries = [];
+  try {
+    entries = await fs.readdir(path.join(runDir, 'stages'));
+  } catch {
+    return 1;
+  }
+  const re = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-(\\d+)\\.json$`);
+  return 1 + entries.filter((e) => re.test(e)).length;
 }
 
 // Atomically persists final run result.

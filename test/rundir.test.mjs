@@ -1,15 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   createRun,
   writeMaterial,
   appendEvent,
+  repairEvents,
+  readEvents,
   writeCheckpoint,
   readCheckpoint,
   writeIndexed,
+  nextRound,
   writeResult,
   readState,
   assertRunDir,
@@ -99,6 +102,32 @@ describe('rundir module', () => {
     } finally {
       await repoCleanup();
       await envCleanup();
+    }
+  });
+
+  it('nextRound counts the indexed records', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-r-'));
+    try {
+      await mkdir(path.join(dir, 'stages'));
+      assert.equal(await nextRound(dir, 'verify'), 1);
+      await writeFile(path.join(dir, 'stages', 'verify-1.json'), '{}');
+      await writeFile(path.join(dir, 'stages', 'verify-2.json'), '{}');
+      assert.equal(await nextRound(dir, 'verify'), 3);
+      // A different prefix in the same directory does not move the count.
+      await writeFile(path.join(dir, 'stages', 'patch-review-1.json'), '{}');
+      assert.equal(await nextRound(dir, 'verify'), 3);
+      assert.equal(await nextRound(dir, 'patch-review'), 2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('nextRound without a stages directory -> 1', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-r-'));
+    try {
+      assert.equal(await nextRound(dir, 'verify'), 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 
@@ -233,6 +262,78 @@ describe('rundir module', () => {
     } finally {
       await repoCleanup();
       await envCleanup();
+    }
+  });
+
+  it('appendEvent keeps lines whole under 200 parallel appends', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-ev-'));
+    try {
+      await Promise.all(
+        Array.from({ length: 200 }, (_, i) =>
+          appendEvent(dir, { event: 'x', i, pad: 'p'.repeat(5000) }),
+        ),
+      );
+      const text = await readFile(path.join(dir, 'events.jsonl'), 'utf8');
+      const lines = text.trim().split('\n');
+      assert.equal(lines.length, 200);
+      for (const l of lines) JSON.parse(l);
+      assert.deepEqual(
+        lines.map((l) => JSON.parse(l).i),
+        Array.from({ length: 200 }, (_, i) => i),
+      );
+      assert.equal(typeof JSON.parse(lines[0]).ts, 'number');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('appendEvent keeps a ts the caller already set', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-ev-'));
+    try {
+      await appendEvent(dir, { event: 'cleanup', ts: 1234 });
+      const events = await readEvents(dir);
+      assert.deepEqual(events, [{ event: 'cleanup', ts: 1234 }]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('repairEvents appends one newline after a partial line and never truncates', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-ev-'));
+    try {
+      await writeFile(path.join(dir, 'events.jsonl'), '{"event":"a"}\n{"event":"b","ha');
+      assert.deepEqual(await repairEvents(dir), { repaired: true });
+      await appendEvent(dir, { event: 'c' });
+      const events = await readEvents(dir);
+      assert.deepEqual(
+        events.map((e) => e.event),
+        ['a', 'c'],
+      );
+      const text = await readFile(path.join(dir, 'events.jsonl'), 'utf8');
+      assert.ok(text.startsWith('{"event":"a"}\n{"event":"b","ha\n'));
+      assert.deepEqual(await repairEvents(dir), { repaired: false });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('repairEvents on a missing or empty file does nothing', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-ev-'));
+    try {
+      assert.deepEqual(await repairEvents(dir), { repaired: false });
+      await writeFile(path.join(dir, 'events.jsonl'), '');
+      assert.deepEqual(await repairEvents(dir), { repaired: false });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('readEvents returns an empty array for an absent file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ar-ev-'));
+    try {
+      assert.deepEqual(await readEvents(dir), []);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

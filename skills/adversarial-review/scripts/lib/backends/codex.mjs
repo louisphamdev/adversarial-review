@@ -6,8 +6,10 @@ export const name = 'codex';
 
 export function build(call, ctx = {}) {
   const { callId, runDir, cwd, model, effort, schema } = call;
-  const schemaFile = path.join(runDir, 'calls', `${callId}.schema.json`);
-  const outFile = path.join(runDir, 'calls', `${callId}.out.json`);
+  // The caller names the schema file per round, so a later round reads its own file.
+  const schemaFile = call.schemaFile || path.join(runDir, 'calls', `${callId}.schema.json`);
+  // The caller names the out file per attempt, so a retry cannot read the first attempt's answer.
+  const outFile = call.outFile || path.join(runDir, 'calls', `${callId}.out.json`);
 
   const args = [
     'exec',
@@ -38,6 +40,10 @@ export function build(call, ctx = {}) {
     },
     outFile,
   };
+}
+
+export function streaming() {
+  return false;
 }
 
 export function extract({ stdout, outFileText } = {}) {

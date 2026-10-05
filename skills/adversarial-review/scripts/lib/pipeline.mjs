@@ -10,6 +10,7 @@ import {
   VERIFY_JUDGE,
 } from './schemas.mjs';
 import { buildPrompt } from './prompts.mjs';
+import { findingEvent } from './contain.mjs';
 import { compareSift } from './sift.mjs';
 import { loadSeats } from './seats.mjs';
 
@@ -29,6 +30,9 @@ export async function runTable({
   log = () => {},
   checkpoint,
   loadCheckpoint,
+  seatCheckpoint,
+  loadSeatCheckpoint,
+  onSeatDone,
   sift,
 }) {
   const allSeatsMap = loadSeats();
@@ -68,8 +72,13 @@ export async function runTable({
       }
     }
   } else {
+    // Each seat is its own promise, so its result is checkpointed and announced as it returns.
     const findResults = await Promise.all(
       resolvedSeats.map(async (seat) => {
+        const saved =
+          typeof loadSeatCheckpoint === 'function' ? await loadSeatCheckpoint(seat.key) : null;
+        if (saved && Array.isArray(saved.findings)) return { seat, saved };
+
         const prompt = buildPrompt('FIND', {
           seat,
           request,
@@ -79,29 +88,45 @@ export async function runTable({
           requirements: request.requirements,
         });
         const res = await runAgent({ stage: 'FIND', seat, prompt, schema: FINDINGS });
-        return { seat, res };
+        if (!res || !res.ok || !res.value || !Array.isArray(res.value.findings)) {
+          return { seat, dead: true };
+        }
+        const findings = res.value.findings.map((f, idx) => ({
+          id: `${seat.key}-${idx + 1}`,
+          seat: seat.key,
+          ...f,
+        }));
+        const notReadSeat = Array.isArray(res.value.notRead) ? res.value.notRead : [];
+        if (typeof seatCheckpoint === 'function') {
+          await seatCheckpoint(seat.key, { seat: seat.key, findings, notRead: notReadSeat });
+        }
+        if (typeof onSeatDone === 'function') {
+          try {
+            await onSeatDone({
+              seat: seat.key,
+              callId: `find-${seat.key}`,
+              model: res.model ?? null,
+              findings: await Promise.all(findings.map((f) => findingEvent(f, request.repoRoot))),
+            });
+          } catch (err) {
+            // An event failure never stops the table; the table is the result, the event is a view.
+            log(`seat_done event failed for ${seat.key}: ${err && err.message ? err.message : err}`);
+          }
+        }
+        return { seat, saved: { findings, notRead: notReadSeat } };
       })
     );
 
     let aliveFindCount = 0;
-    for (const { seat, res } of findResults) {
-      if (!res || !res.ok || !res.value || !Array.isArray(res.value.findings)) {
-        recordDead(seat.key, 'FIND');
-      } else {
-        aliveFindCount++;
-        const list = res.value.findings;
-        list.forEach((f, idx) => {
-          allFindings.push({
-            id: `${seat.key}-${idx + 1}`,
-            seat: seat.key,
-            ...f,
-          });
-        });
-        if (Array.isArray(res.value.notRead)) {
-          for (const nr of res.value.notRead) {
-            notRead.push(`${seat.key}: ${nr}`);
-          }
-        }
+    for (const r of findResults) {
+      if (r.dead) {
+        recordDead(r.seat.key, 'FIND');
+        continue;
+      }
+      aliveFindCount++;
+      allFindings.push(...r.saved.findings);
+      for (const nr of r.saved.notRead || []) {
+        notRead.push(`${r.seat.key}: ${nr}`);
       }
     }
 

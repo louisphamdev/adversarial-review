@@ -137,15 +137,17 @@ function rules(treeDir) {
   ];
 }
 
-// The rule list goes in `<cwd>/opencode.json`, the project config document. `<cwd>/.opencode` is a
-// directory source for agents, commands, and plugins, so a config file inside it is never read:
-// the lane would keep the user's own permissions, which is the boundary this profile closes.
+// A zen lane runs `--standalone` with this XDG home, so this file is the only config it reads.
+// The keys `instructions`, `mcp`, `plugin`, and `provider` are absent on purpose: the user's own
+// `mcp` block starts one full set of MCP servers per lane directory and outlives the lane.
 export async function writeProfileConfig({ runDir, profileKey, treeDir, steps }) {
   const cwd = path.join(runDir, 'sandbox', 'profiles', profileKey);
+  const xdgHome = path.join(runDir, 'sandbox', 'xdg', profileKey, 'zen');
   await fs.mkdir(cwd, { recursive: true });
+  await fs.mkdir(path.join(xdgHome, 'opencode'), { recursive: true });
   const cfg = { $schema: 'https://opencode.ai/config.json', agents: { build: { steps, permissions: rules(treeDir) } } };
-  await writeFileAtomic(path.join(cwd, 'opencode.json'), JSON.stringify(cfg, null, 2));
-  return { cwd };
+  await writeFileAtomic(path.join(xdgHome, 'opencode', 'opencode.json'), JSON.stringify(cfg, null, 2));
+  return { cwd, xdgHome };
 }
 
 // The provider block holds a key: it lives only under sandbox/xdg, which removeSandbox always deletes.

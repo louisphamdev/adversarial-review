@@ -41,6 +41,10 @@ export function build(call, ctx = {}) {
   };
 }
 
+export function streaming() {
+  return false;
+}
+
 export function extract({ stdout, outFileText } = {}) {
   if (typeof stdout !== 'string') return '';
   try {

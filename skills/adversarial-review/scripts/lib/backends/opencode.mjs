@@ -57,10 +57,13 @@ export function scrubEnv(env = {}) {
 }
 
 /**
- * A zen free model answers inside the opencode service, so the lane needs no agent and no
- * config of its own: the permission profile in the lane cwd is the read-only boundary. A named
- * model of another provider needs its provider block, which lives in an isolated XDG home with
- * the `ar-seat` agent.
+ * Every lane runs `--standalone`, on its own private server. Through the background service the
+ * user's global MCP servers start once per new lane directory and outlive the lane, and no
+ * project config turns them off; a standalone lane is two processes that a tree kill removes.
+ *
+ * A zen free model needs no agent: the `build` agent of the isolated XDG home carries the
+ * read-only boundary. A named model of another provider needs its provider block, which lives
+ * in an XDG home of its own with the `ar-seat` agent.
  *
  * The tools block and the context pack come from prompts.mjs (spec section 12), so stdin
  * carries the seat prompt alone.
@@ -72,10 +75,10 @@ export function build(call, ctx = {}) {
   const args =
     lane.mode === 'named'
       ? ['run', '--standalone', '--format', 'json', '--auto', '--agent', 'ar-seat', ...modelArg]
-      : ['run', '--format', 'json', '--auto', ...modelArg];
-  // A named lane with no isolated home keeps the parent value: an `XDG_CONFIG_HOME` of
-  // `undefined` would reach the child as the text "undefined" and point at nothing.
-  if (lane.mode === 'named' && lane.xdgHome) env.XDG_CONFIG_HOME = lane.xdgHome;
+      : ['run', '--standalone', '--format', 'json', '--auto', ...modelArg];
+  // A lane with no isolated home keeps the parent value: an `XDG_CONFIG_HOME` of `undefined`
+  // would reach the child as the text "undefined" and point at nothing.
+  if (lane.xdgHome) env.XDG_CONFIG_HOME = lane.xdgHome;
 
   // `opencode run` takes its session directory from `root ?? process.env.PWD ?? process.cwd()`
   // and has no flag for it, so an inherited PWD beats the cwd below: the lane would load the
@@ -86,6 +89,19 @@ export function build(call, ctx = {}) {
   }
 
   return { args, env, cwd: lane.cwd, stdin: call.prompt ?? '', files: {} };
+}
+
+/**
+ * Only `--format json` writes event lines while the call runs. The answer comes from the argv
+ * this adapter builds, so a later change of the lane modes cannot leave this flag behind.
+ *
+ * @param {object} [call]
+ * @returns {boolean}
+ */
+export function streaming(call = {}) {
+  const { args } = build(call, {});
+  const i = args.indexOf('--format');
+  return i >= 0 && args[i + 1] === 'json';
 }
 
 /**

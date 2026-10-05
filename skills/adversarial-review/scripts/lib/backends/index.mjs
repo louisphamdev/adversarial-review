@@ -1,5 +1,6 @@
 // Backend adapter registry, resolution, and execution orchestration.
 import path from 'node:path';
+import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 
 import { runChild as defaultRunChild, resolveExecutable } from '../proc.mjs';
@@ -78,33 +79,76 @@ export async function resolveBackend(name, { config = {}, env = process.env } = 
 }
 
 /**
- * Write attempt log exclusively, incrementing n on EEXIST.
+ * Reserve attempt n by creating its live log with exclusive create.
+ * A final log without its live log comes from an older process, so that n is taken too.
  *
  * @param {string} callsDir
- * @param {string} callId
+ * @param {string} base
  * @param {number} startN
- * @param {string} content
- * @returns {Promise<{ n: number, logPath: string }>}
+ * @returns {Promise<number>}
  */
-async function writeAttemptLog(callsDir, callId, startN, content) {
-  let n = startN;
-  while (true) {
-    const logPath = path.join(callsDir, `${callId}.a${n}.log`);
+async function reserveAttempt(callsDir, base, startN) {
+  for (let n = Math.max(1, startN); ; n++) {
     try {
-      await fsPromises.writeFile(logPath, content, { flag: 'wx' });
-      return { n, logPath };
+      await fsPromises.access(path.join(callsDir, `${base}.a${n}.log`));
+      continue;
+    } catch {
+      // free
+    }
+    try {
+      await fsPromises.writeFile(path.join(callsDir, `${base}.a${n}.live.log`), '', { flag: 'wx' });
+      return n;
     } catch (err) {
-      if (err && err.code === 'EEXIST') {
-        n++;
-        continue;
-      }
+      if (err && err.code === 'EEXIST') continue;
       throw err;
     }
   }
 }
 
+// The attempt number was reserved by its live log, so the final log takes the same n.
+async function writeAttemptLogAt(callsDir, base, n, content) {
+  await fsPromises.writeFile(path.join(callsDir, `${base}.a${n}.log`), content, { flag: 'wx' });
+}
+
+function safe(fn, arg) {
+  if (typeof fn !== 'function') return;
+  try {
+    fn(arg);
+  } catch {
+    // reporting never breaks a call
+  }
+}
+
+function attemptLogContent(cmd, args, childRes) {
+  const exit = `${childRes.code !== null && childRes.code !== undefined ? childRes.code : ''}${
+    childRes.signal ? ` (signal: ${childRes.signal})` : ''
+  }${childRes.idled ? ' (idle)' : ''}`;
+  return [
+    '=== ARGV ===',
+    JSON.stringify([cmd, ...(args || [])], null, 2),
+    '=== EXIT CODE ===',
+    exit,
+    '=== STDOUT ===',
+    childRes.stdout || '',
+    '=== STDERR ===',
+    childRes.stderr || '',
+  ].join('\n');
+}
+
+async function readIfExists(file) {
+  if (!file) return '';
+  try {
+    return await fsPromises.readFile(file, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+// At most 3 attempts over the whole model list (spec C6).
+const MAX_ATTEMPTS = 3;
+
 /**
- * Orchestrate a seat call across up to two attempts with log recording.
+ * Orchestrate a seat call over a model list, at most three attempts, with a live log per attempt.
  *
  * @param {object} call
  * @param {string} call.callId
@@ -114,26 +158,40 @@ async function writeAttemptLog(callsDir, callId, startN, content) {
  * @param {string} call.runDir
  * @param {string} call.cwd
  * @param {string} [call.model]
+ * @param {string[]} [call.models] Model list; the first entry runs first. Defaults to [call.model].
+ * @param {number} [call.round=1] Round number; every call file carries `.r<round>`.
  * @param {string} [call.effort]
  * @param {number} [call.timeoutMs]
+ * @param {number} [call.idleMs] Idle deadline; applied only to a streaming attempt.
  * @param {number} [call.attemptBase=0]
  * @param {Function} [call.onEvent]
  * @param {object} options
  * @param {string|object} options.backend
  * @param {Function} [options.runChild]
  * @param {object} [options.fs]
- * @param {Function} [options.log]
+ * @param {Function} [options.onAttempt] ({ attempt, model }) before each attempt starts.
+ * @param {Function} [options.onStdout] ({ attempt, bytes }) per stdout chunk.
+ * @param {Function} [options.onStalled] ({ attempt, model, idleMs, action }) after an idle kill.
+ * @param {Function} [options.onFailover] ({ from, to, reason }) before an attempt with another model.
  * @returns {Promise<{ ok: boolean, value: any, raw: string, error: string|null, attempts: number, costTotal?: number|null, tokensTotal?: number|null, costComplete?: boolean, toolRefusals?: number, stepCount?: number, errorType?: string|null, model?: string|null }>}
  */
 export async function runSeatCall(call, options = {}) {
-  if (call.model !== undefined && call.model !== null && !isValidModel(call.model)) {
-    return {
-      ok: false,
-      value: null,
-      raw: '',
-      error: 'bad-model',
-      attempts: 0,
-    };
+  const models = Array.isArray(call.models) && call.models.length > 0 ? call.models : [call.model];
+  for (const m of models) {
+    if (m !== undefined && m !== null && !isValidModel(m)) {
+      return {
+        ok: false,
+        value: null,
+        raw: '',
+        error: 'bad-model',
+        attempts: 0,
+      };
+    }
+  }
+
+  const round = call.round ?? 1;
+  if (!Number.isInteger(round) || round < 1) {
+    throw new ConfigError(`call.round must be an integer >= 1: ${call.round}`);
   }
 
   let backendObj;
@@ -188,80 +246,111 @@ export async function runSeatCall(call, options = {}) {
     env: options.env || process.env,
   };
 
-  const built = adapter.build(call, ctx);
-
-  let promptPath = null;
+  // One prompt file and one schema file per round, so a later round never overwrites them.
+  const base = `${call.callId}.r${round}`;
+  const promptPath = path.join(callsDir, `${base}.prompt.txt`);
+  const schemaPath = path.join(callsDir, `${base}.schema.json`);
   if (call.prompt != null) {
-    promptPath = path.join(callsDir, `${call.callId}.prompt.txt`);
     await writeFileFn(promptPath, String(call.prompt));
   }
-  const schemaPath = path.join(callsDir, `${call.callId}.schema.json`);
-  if (call.schema != null && !built.files?.[schemaPath]) {
-    await writeFileFn(schemaPath, JSON.stringify(call.schema, null, 2));
-  }
-  if (built.files) {
-    for (const [filePath, content] of Object.entries(built.files)) {
-      await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-      await writeFileFn(filePath, content);
-    }
-  }
 
-  let spawnCmd;
-  let spawnArgs;
-  if (backendObj.name === 'custom') {
-    if (Array.isArray(built.args) && built.args.length > 0) {
-      spawnCmd = backendObj.exe || built.args[0];
-      spawnArgs = built.args.slice(1);
-    } else {
-      spawnCmd = backendObj.exe;
-      spawnArgs = [];
-    }
-  } else {
-    spawnCmd = backendObj.exe || backendObj.name;
-    spawnArgs = built.args || [];
-  }
-
-  // The opencode adapter already scrubbed the parent environment, so merging it back here
-  // would undo the scrub and hand every secret to the lane.
-  const childEnv =
-    adapter === opencodeBackend
-      ? { ...(built.env || {}) }
-      : {
-          ...(options.env || process.env),
-          ...(backendObj.env || {}),
-          ...(built.env || {}),
-        };
+  const streamingFn = backendObj.streaming || adapter.streaming;
 
   let attempts = 0;
-  let lastN = call.attemptBase || 0;
+  let modelIdx = 0;
+  let schemaWritten = false;
   let currentPrompt = call.prompt;
-
-  const applyRetry = (reason) => {
-    currentPrompt = `${call.prompt}\n\nYour previous answer failed: ${reason}. Answer again with ONE fenced json block.`;
+  let currentPromptFile = promptPath;
+  let pendingPromptChange = false;
+  let lastError = null;
+  let lastRaw = '';
+  let lastExtra = {
+    costTotal: null,
+    tokensTotal: null,
+    costComplete: false,
+    toolRefusals: 0,
+    stepCount: 0,
+    errorType: null,
+    model: models[0] ?? null,
+    events: [],
   };
 
-  while (attempts < 2) {
+  while (attempts < MAX_ATTEMPTS && modelIdx < models.length) {
     attempts++;
-    const targetN = Math.max(lastN + 1, (call.attemptBase || 0) + attempts);
+    const model = models[modelIdx];
+    const n = await reserveAttempt(callsDir, base, (call.attemptBase || 0) + attempts);
 
-    if (attempts > 1 && promptPath) {
-      await writeFileFn(promptPath, currentPrompt);
+    if (pendingPromptChange) {
+      currentPromptFile = path.join(callsDir, `${base}.a${n}.prompt.txt`);
+      await writeFileFn(currentPromptFile, String(currentPrompt));
+      pendingPromptChange = false;
     }
 
+    const attemptCall = {
+      ...call,
+      model,
+      prompt: currentPrompt,
+      promptFile: currentPromptFile,
+      schemaFile: schemaPath,
+      outFile: path.join(callsDir, `${base}.a${n}.out.json`),
+    };
+
+    const built = adapter.build(attemptCall, ctx);
+
+    if (!schemaWritten && call.schema != null && !built.files?.[schemaPath]) {
+      await writeFileFn(schemaPath, JSON.stringify(call.schema, null, 2));
+      schemaWritten = true;
+    }
+    if (built.files) {
+      for (const [filePath, content] of Object.entries(built.files)) {
+        await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+        await writeFileFn(filePath, content);
+      }
+    }
+
+    let spawnCmd;
+    let spawnArgs;
+    if (backendObj.name === 'custom') {
+      if (Array.isArray(built.args) && built.args.length > 0) {
+        spawnCmd = backendObj.exe || built.args[0];
+        spawnArgs = built.args.slice(1);
+      } else {
+        spawnCmd = backendObj.exe;
+        spawnArgs = [];
+      }
+    } else {
+      spawnCmd = backendObj.exe || backendObj.name;
+      spawnArgs = built.args || [];
+    }
+
+    // The opencode adapter already scrubbed the parent environment, so merging it back here
+    // would undo the scrub and hand every secret to the lane.
+    const childEnv =
+      adapter === opencodeBackend
+        ? { ...(built.env || {}) }
+        : {
+            ...(options.env || process.env),
+            ...(backendObj.env || {}),
+            ...(built.env || {}),
+          };
+
+    const streamingMode = typeof streamingFn === 'function' ? Boolean(streamingFn(attemptCall)) : false;
+
     const events = [];
+    const onEventFn = call.onEvent || options.onEvent;
     const parser =
       typeof adapter.createEventParser === 'function'
         ? adapter.createEventParser((evt) => {
             events.push(evt);
-            if (typeof call.onEvent === 'function') {
-              try {
-                call.onEvent(evt);
-              } catch {
-                // listener errors are ignored
-              }
-            }
+            safe(onEventFn, evt);
           })
         : null;
+
+    safe(options.onAttempt, { attempt: n, model });
+
+    // The host reads this file while the call runs, so every chunk is written as it arrives.
+    const live = fs.createWriteStream(path.join(callsDir, `${base}.a${n}.live.log`), { flags: 'a' });
+    let bytes = 0;
 
     const childRes = await runChildFn({
       cmd: spawnCmd,
@@ -270,9 +359,17 @@ export async function runSeatCall(call, options = {}) {
       env: childEnv,
       stdin: currentPrompt,
       timeoutMs: call.timeoutMs,
-      onStdout: parser ? (c) => parser.push(c) : undefined,
+      idleMs: streamingMode ? call.idleMs : undefined,
+      onStdout: (chunk) => {
+        live.write(chunk);
+        bytes += chunk.length;
+        safe(options.onStdout, { attempt: n, bytes });
+        if (parser) parser.push(chunk);
+      },
     });
     if (parser) parser.end();
+    await new Promise((resolve) => live.end(resolve));
+    await writeAttemptLogAt(callsDir, base, n, attemptLogContent(spawnCmd, spawnArgs, childRes));
 
     const summary = typeof adapter.summarizeEvents === 'function' ? adapter.summarizeEvents(events) : {};
     const extra = {
@@ -282,98 +379,65 @@ export async function runSeatCall(call, options = {}) {
       toolRefusals: summary.toolRefusals ?? 0,
       stepCount: summary.stepCount ?? 0,
       errorType: summary.errorType ?? null,
-      model: call.model ?? null,
+      model: model ?? null,
       // The canary judges the boundary from the refused tool calls, so the parsed events of
       // the returned attempt leave this function with the result.
       events,
     };
 
-    const logContent = [
-      '=== ARGV ===',
-      JSON.stringify([spawnCmd, ...spawnArgs], null, 2),
-      '=== EXIT CODE ===',
-      `${childRes.code !== null ? childRes.code : ''}${childRes.signal ? ` (signal: ${childRes.signal})` : ''}`,
-      '=== STDOUT ===',
-      childRes.stdout || '',
-      '=== STDERR ===',
-      childRes.stderr || '',
-    ].join('\n');
+    const nextModel = models[modelIdx + 1];
+    // A failover never retries the model that just failed, so the list advances by one.
+    const moveOn = (reason) => {
+      if (nextModel === undefined) return false;
+      safe(options.onFailover, { from: model, to: nextModel, reason });
+      modelIdx++;
+      return true;
+    };
+    // The suffix retry belongs to a one-model list only (spec C6 rule 4), so a list that is
+    // used up ends the call instead.
+    const handleContract = (reason) => {
+      if (moveOn('contract')) return false;
+      if (models.length > 1) return true;
+      currentPrompt = `${call.prompt}\n\nYour previous answer failed: ${reason}. Answer again with ONE fenced json block.`;
+      pendingPromptChange = true;
+      return false;
+    };
 
-    const { n: writtenN } = await writeAttemptLog(callsDir, call.callId, targetN, logContent);
-    lastN = writtenN;
-
-    if (childRes.timedOut) {
-      return {
-        ok: false,
-        value: null,
-        raw: '',
-        error: 'timeout',
-        attempts,
-        ...extra,
-        errorType: 'timeout',
-      };
+    if (childRes.idled) {
+      lastError = 'idle';
+      lastExtra = { ...extra, errorType: 'idle' };
+      const action = nextModel !== undefined ? 'failover' : attempts < MAX_ATTEMPTS ? 'retry' : 'dead';
+      safe(options.onStalled, { attempt: n, model, idleMs: call.idleMs, action });
+      moveOn('idle');
+      continue;
     }
 
-    if (childRes.spawnError) {
-      return {
-        ok: false,
-        value: null,
-        raw: '',
-        error: 'spawn',
-        attempts,
-        ...extra,
-        errorType: 'spawn',
-      };
+    if (childRes.timedOut || childRes.spawnError || childRes.code !== 0) {
+      const kind = childRes.timedOut ? 'timeout' : childRes.spawnError ? 'spawn' : 'exit';
+      lastError =
+        kind === 'exit'
+          ? `exit-${childRes.code !== null ? childRes.code : childRes.signal || 1}`
+          : kind;
+      lastExtra = { ...extra, errorType: kind === 'exit' ? extra.errorType : kind };
+      moveOn(kind);
+      continue;
     }
 
-    if (childRes.code !== 0) {
-      const exitErr = `exit-${childRes.code !== null ? childRes.code : (childRes.signal || 1)}`;
-      if (attempts === 1) {
-        applyRetry(exitErr);
-        continue;
-      }
-      return {
-        ok: false,
-        value: null,
-        raw: '',
-        error: exitErr,
-        attempts: 2,
-        ...extra,
-      };
-    }
-
-    let outFileText = '';
-    if (built.outFile) {
-      try {
-        outFileText = await fsPromises.readFile(built.outFile, 'utf8');
-      } catch {
-        outFileText = '';
-      }
-    }
-
+    const outFileText = await readIfExists(built.outFile);
     const extracted = adapter.extract({ stdout: childRes.stdout, outFileText, events });
 
     if (extracted && typeof extracted === 'object' && extracted.error) {
       // A refusal and a missing model do not change on a second ask.
       const fatal = extracted.error === 'provider-refused' || extracted.error === 'not-found';
-      if (!fatal && attempts === 1) {
-        applyRetry(`${extracted.error}: ${extracted.message || ''}`);
-        continue;
-      }
-      return {
-        ok: false,
-        value: null,
-        raw: '',
-        error: extracted.error,
-        attempts,
-        ...extra,
-        errorType: extracted.error,
-      };
+      lastError = extracted.error;
+      lastExtra = { ...extra, errorType: extracted.error };
+      if (fatal) break;
+      if (handleContract(`${extracted.error}: ${extracted.message || ''}`)) break;
+      continue;
     }
 
     const raw = extracted;
     const parseRes = parseStructured(raw, call.schema);
-
     if (parseRes.ok) {
       return {
         ok: true,
@@ -385,19 +449,18 @@ export async function runSeatCall(call, options = {}) {
       };
     }
 
-    const parseErr = `parse: ${parseRes.error}`;
-    if (attempts === 1) {
-      applyRetry(parseErr);
-      continue;
-    }
-
-    return {
-      ok: false,
-      value: null,
-      raw,
-      error: parseErr,
-      attempts: 2,
-      ...extra,
-    };
+    lastError = `parse: ${parseRes.error}`;
+    lastRaw = raw;
+    lastExtra = extra;
+    if (handleContract(lastError)) break;
   }
+
+  return {
+    ok: false,
+    value: null,
+    raw: lastRaw,
+    error: lastError || 'no-attempt',
+    attempts,
+    ...lastExtra,
+  };
 }

@@ -761,6 +761,99 @@ describe('pipeline module', () => {
       assert.ok(rulingPrompt.includes('skeptic-lc1'));
       assert.ok(rulingPrompt.includes('Verify lockfile stale timeout'));
     });
+
+    it('FIND: onSeatDone fires per seat before the slowest seat ends, ids match find.json', async () => {
+      const order = [];
+      let releaseSlow;
+      const slow = new Promise((r) => { releaseSlow = r; });
+      const seatFiles = new Map();
+      const runAgent = async ({ stage, seat }) => {
+        if (stage === 'FIND') {
+          if (seat.key === 'breaker') await slow;
+          return { ok: true, value: { findings: [{ title: `t-${seat.key}`, severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w', file: '../x' }], notRead: [] } };
+        }
+        return { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } };
+      };
+      const checkpoints = {};
+      const p = runTable({
+        request: {}, seats: threeSeats, runAgent,
+        checkpoint: async (n, d) => { checkpoints[n] = d; },
+        loadCheckpoint: async () => null,
+        seatCheckpoint: async (k, d) => { seatFiles.set(k, d); },
+        loadSeatCheckpoint: async () => null,
+        onSeatDone: async (e) => { order.push(e.seat); if (order.length === 2) releaseSlow(); },
+      });
+      await p;
+      assert.deepEqual(order.slice(0, 2).sort(), ['edge', 'skeptic']);
+      assert.equal(order[2], 'breaker');
+      assert.deepEqual(checkpoints.find.findings.map((f) => f.id), ['breaker-1', 'edge-1', 'skeptic-1']);
+      assert.equal(seatFiles.get('edge').findings[0].id, 'edge-1');
+    });
+
+    it('FIND resume: a seat with a per-seat file is not called and not re-announced', async () => {
+      const called = [];
+      const announced = [];
+      const runAgent = async ({ stage, seat }) => {
+        if (stage === 'FIND') called.push(seat.key);
+        if (stage === 'FIND') return { ok: true, value: { findings: [{ title: `t-${seat.key}`, severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w' }], notRead: [] } };
+        return { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } };
+      };
+      const saved = { seat: 'edge', findings: [{ id: 'edge-1', seat: 'edge', title: 'old', severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w' }], notRead: [] };
+      const checkpoints = {};
+      await runTable({
+        request: {}, seats: threeSeats, runAgent,
+        checkpoint: async (n, d) => { checkpoints[n] = d; },
+        loadCheckpoint: async () => null,
+        seatCheckpoint: async () => {},
+        loadSeatCheckpoint: async (k) => (k === 'edge' ? saved : null),
+        onSeatDone: async (e) => announced.push(e.seat),
+      });
+      assert.deepEqual(called.sort(), ['breaker', 'skeptic']);
+      assert.deepEqual(announced.sort(), ['breaker', 'skeptic']);
+      assert.equal(checkpoints.find.findings.find((f) => f.id === 'edge-1').title, 'old');
+    });
+
+    it('FIND: the event shape contains file paths without touching disk', async () => {
+      const events = [];
+      const runAgent = async ({ stage }) => (stage === 'FIND'
+        ? { ok: true, value: { findings: [{ title: 't', severity: 'important', detail: 'd', evidence: 'e', doneWhen: 'w', file: 'C:\\Windows\\win.ini', line: '1' }], notRead: [] } }
+        : { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } });
+      await runTable({ request: {}, seats: [edge], runAgent, onSeatDone: async (e) => events.push(e) });
+      assert.equal(events[0].findings[0].file, null);
+      assert.equal(events[0].findings[0].outOfRoot, true);
+    });
+
+    it('FIND: a seat that dies is recorded dead and never announced', async () => {
+      const announced = [];
+      const runAgent = async ({ stage, seat }) => {
+        if (stage === 'FIND') {
+          if (seat.key === 'skeptic') return { ok: false, error: 'seat died' };
+          return { ok: true, value: { findings: [{ title: `t-${seat.key}`, severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w' }], notRead: [`${seat.key} note`] } };
+        }
+        return { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } };
+      };
+      const result = await runTable({
+        request: {}, seats: threeSeats, runAgent,
+        onSeatDone: async (e) => announced.push(e.seat),
+      });
+      assert.deepEqual(announced.sort(), ['breaker', 'edge']);
+      assert.ok(result.gaps.deadSeats.some((d) => d.seat === 'skeptic' && d.stage === 'FIND'));
+      assert.deepEqual(result.gaps.notRead, ['breaker: breaker note', 'edge: edge note']);
+    });
+
+    it('FIND: an onSeatDone failure never stops the table', async () => {
+      const runAgent = async ({ stage, seat }) => (stage === 'FIND'
+        ? { ok: true, value: { findings: [{ title: `t-${seat.key}`, severity: 'minor', detail: 'd', evidence: 'e', doneWhen: 'w' }], notRead: [] } }
+        : { ok: true, value: { positions: [], missedBetweenLenses: [], fixRisks: [], notYetSaid: [], verdict: 'clean', closingList: [] } });
+      const logged = [];
+      const result = await runTable({
+        request: {}, seats: [edge], runAgent,
+        log: (m) => logged.push(m),
+        onSeatDone: async () => { throw new Error('event sink is gone'); },
+      });
+      assert.equal(result.findings.length, 1);
+      assert.ok(logged.some((m) => String(m).includes('event sink is gone')));
+    });
   });
 
   describe('runPatchReview', () => {

@@ -163,7 +163,7 @@ export async function modelsCommand(
       for (const lens of seats) {
         const treeDir = path.join(benchRoot, lens);
         await fs.cp(path.join(LENS_DIR, lens), treeDir, { recursive: true });
-        const { cwd } = await writeProfileConfig({
+        const { cwd, xdgHome } = await writeProfileConfig({
           runDir,
           profileKey: `bench-${lens}`,
           treeDir,
@@ -174,6 +174,7 @@ export async function modelsCommand(
           env,
           runDir,
           cwd,
+          xdgHome,
           stage: 'FIND',
           schema: FINDINGS,
           prompt: lensFindPrompt(lens, { treeDir }),
@@ -183,7 +184,7 @@ export async function modelsCommand(
           runSeatCall: seatCall,
         });
       }
-      const { cwd: probeCwd } = await writeProfileConfig({
+      const { cwd: probeCwd, xdgHome: probeXdgHome } = await writeProfileConfig({
         runDir,
         profileKey: 'probe',
         treeDir: benchRoot,
@@ -194,6 +195,7 @@ export async function modelsCommand(
         env,
         runDir,
         cwd: probeCwd,
+        xdgHome: probeXdgHome,
         stage: 'FIND',
         schema: PROBE,
         prompt: PROBE_PROMPT,

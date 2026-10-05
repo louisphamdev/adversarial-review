@@ -48,6 +48,12 @@ test('doctor reports the opencode exe, isolation, and fails on an opencode major
     const code = await main(['doctor'], { env, stdout, stderr: sink() });
     const text = stdout.text;
     assert.match(text, /isolation: sandbox copy \+ permission profile/);
+    // A lane that reads the user's global config starts one set of MCP servers per lane
+    // directory, so what the lane reads is a fact the doctor has to state.
+    assert.match(
+      text,
+      /lanes: standalone, isolated config \(no global MCP, instructions, or plugins\)/
+    );
     assert.match(text, /os-isolation: none/);
     assert.match(text, /opencode: major version 1 is not supported \(need 2\.x\)/);
     // The old v1 seat agent file is absent here, so the line must not appear at all.

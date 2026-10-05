@@ -11,7 +11,7 @@ import { resolveOpencodeExe } from '../skills/adversarial-review/scripts/lib/bac
 import { writeProfileConfig, removeSandbox, PROFILE_STEPS } from '../skills/adversarial-review/scripts/lib/sandbox.mjs';
 import { makeLaneCall } from '../skills/adversarial-review/scripts/lib/lane.mjs';
 import { runCanary } from '../skills/adversarial-review/scripts/lib/canary.mjs';
-import { killAllTrackedSync, runChild } from '../skills/adversarial-review/scripts/lib/proc.mjs';
+import { cleanupTracked, runChild, system32Path } from '../skills/adversarial-review/scripts/lib/proc.mjs';
 
 const live = process.env.ADVERSARIAL_REVIEW_LIVE === '1' && Boolean((await resolveOpencodeExe({}, process.env)).exe);
 const MODELS = ['opencode/big-pickle', 'opencode/nemotron-3.5-lightning-free'];
@@ -24,14 +24,14 @@ async function lane(profileKey) {
   const treeDir = path.join(runDir, 'sandbox', 'tree');
   await mkdir(treeDir, { recursive: true });
   await writeFile(path.join(treeDir, 'hello.txt'), 'hello from the tree');
-  const { cwd } = await writeProfileConfig({ runDir, profileKey, treeDir, steps: PROFILE_STEPS[profileKey] });
-  return { runDir, treeDir, cwd };
+  const { cwd, xdgHome } = await writeProfileConfig({ runDir, profileKey, treeDir, steps: PROFILE_STEPS[profileKey] });
+  return { runDir, treeDir, cwd, xdgHome };
 }
 
 // The opencode service can hold the lane cwd for a moment after the lane ends, so the retrying
 // removeSandbox runs before the plain rm: a bare rm would throw EPERM and leave the sandbox.
 async function cleanup(l) {
-  killAllTrackedSync();
+  await cleanupTracked();
   await removeSandbox(l.runDir);
   for (let i = 0; i < 3; i++) {
     try {
@@ -45,11 +45,17 @@ async function cleanup(l) {
 
 // The precondition of facts a to d: the engine must read the profile rule list at all. This one
 // spends no model call, so it names the cause when the canary tests below report an escape.
-test('live: the engine lists the profile config as a config document', { skip: !live }, async () => {
+test('live: the engine lists the isolated profile config as a config document', { skip: !live }, async () => {
   const l = await lane('canary');
   try {
     const { exe } = await resolveOpencodeExe({}, process.env);
-    const res = await runChild({ cmd: exe, args: ['debug', 'config'], cwd: l.cwd, timeoutMs: 60000 });
+    const res = await runChild({
+      cmd: exe,
+      args: ['debug', 'config'],
+      cwd: l.cwd,
+      env: { ...process.env, XDG_CONFIG_HOME: l.xdgHome, PWD: l.cwd },
+      timeoutMs: 60000,
+    });
     let sources;
     try {
       sources = JSON.parse(res.stdout);
@@ -58,7 +64,7 @@ test('live: the engine lists the profile config as a config document', { skip: !
     }
     const docs = sources.filter((s) => s.type === 'document').map((s) => s.path);
     assert.ok(
-      docs.some((p) => path.resolve(p) === path.resolve(path.join(l.cwd, 'opencode.json'))),
+      docs.some((p) => path.resolve(p) === path.resolve(path.join(l.xdgHome, 'opencode', 'opencode.json'))),
       `the profile rule list is not a config source; documents: ${JSON.stringify(docs)}`
     );
   } finally {
@@ -75,6 +81,7 @@ for (const model of MODELS) {
         env: process.env,
         runDir: l.runDir,
         cwd: l.cwd,
+        xdgHome: l.xdgHome,
         stage: 'TABLE',
         prompt: `Read the file "${l.treeDir.replace(/\\/g, '/')}/hello.txt" and print its content.`,
         timeoutMs: 170000,
@@ -90,13 +97,13 @@ for (const model of MODELS) {
   test(`live (${model}): the canary passes and leaves nothing behind`, { skip: !live }, async () => {
     const l = await lane('canary');
     try {
-      const laneCallFor = ({ cwd, prompt }) =>
-        makeLaneCall({ config: {}, env: process.env, runDir: l.runDir, cwd, stage: 'TABLE', prompt, timeoutMs: 170000 });
+      const laneCallFor = ({ cwd, xdgHome, prompt }) =>
+        makeLaneCall({ config: {}, env: process.env, runDir: l.runDir, cwd, xdgHome, stage: 'TABLE', prompt, timeoutMs: 170000 });
       const r = await runCanary({
         runDir: l.runDir,
         repoRoot: l.treeDir,
         treeDir: l.treeDir,
-        profiles: [{ profileKey: 'canary', cwd: l.cwd, mode: 'zen' }],
+        profiles: [{ profileKey: 'canary', cwd: l.cwd, xdgHome: l.xdgHome, mode: 'zen' }],
         models: [model],
         laneCallFor,
       });
@@ -106,3 +113,62 @@ for (const model of MODELS) {
     }
   });
 }
+
+// Through the background service, every new lane directory starts one full set of the user's
+// global MCP servers and keeps it until the service restarts: 16 sets, 170 node processes and
+// 12 GB leaked in one night. A standalone lane with an isolated config must add none of them.
+const MCP_NAME_RE = /codegraph|chrome-devtools-mcp|context7-mcp/i;
+
+async function processTable() {
+  const res =
+    process.platform === 'win32'
+      ? await runChild({
+          // PowerShell is not on the PATH of every shell, so the System32 path is the only
+          // reliable way to reach it. `wmic` is gone from Windows 11, and `tasklist` prints no
+          // command line, which is what names an MCP server.
+          cmd: system32Path('WindowsPowerShell/v1.0/powershell.exe'),
+          args: [
+            '-NoProfile',
+            '-Command',
+            "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+          ],
+          env: process.env,
+          timeoutMs: 120000,
+        })
+      : await runChild({ cmd: 'ps', args: ['-eo', 'pid=,args='], env: process.env, timeoutMs: 120000 });
+  return res.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+const mcpCount = (rows) => rows.filter((row) => MCP_NAME_RE.test(row)).length;
+const opencodePids = (rows) =>
+  new Set(rows.filter((row) => /opencode/i.test(row)).map((row) => row.split(/\s+/)[0]));
+
+test('live: a zen lane starts no MCP server and leaves no opencode process', { skip: !live }, async () => {
+  const before = await processTable();
+  assert.ok(before.length > 0, 'the process table could not be read, so the case proves nothing');
+  const mcpBefore = mcpCount(before);
+  const openBefore = opencodePids(before);
+
+  const l = await lane('weak-find');
+  try {
+    const call = makeLaneCall({
+      config: {},
+      env: process.env,
+      runDir: l.runDir,
+      cwd: l.cwd,
+      xdgHome: l.xdgHome,
+      stage: 'TABLE',
+      prompt: `Read the file "${l.treeDir.replace(/\\/g, '/')}/hello.txt" and print its content.`,
+      timeoutMs: 170000,
+    });
+    const r = await call('opencode/nemotron-3.5-lightning-free');
+    assert.notEqual(r.errorType, 'provider-refused', 'the free tier accepts a standalone lane');
+  } finally {
+    await cleanup(l);
+  }
+
+  const after = await processTable();
+  assert.equal(mcpCount(after), mcpBefore, 'a zen lane must start no MCP server');
+  const leaked = [...opencodePids(after)].filter((pid) => !openBefore.has(pid));
+  assert.deepEqual(leaked, [], 'no opencode process started by this case may remain');
+});

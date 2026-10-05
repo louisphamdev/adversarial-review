@@ -36,6 +36,7 @@ test('backends module: module exports shape', () => {
     assert.equal(typeof mod.name, 'string');
     assert.equal(typeof mod.build, 'function');
     assert.equal(typeof mod.extract, 'function');
+    assert.equal(typeof mod.streaming, 'function');
   }
 });
 
@@ -73,7 +74,8 @@ test('Golden argv: claude backend', () => {
     '--add-dir',
     call.runDir,
     '--output-format',
-    'json',
+    'stream-json',
+    '--verbose',
     '--model',
     'claude-3-7-sonnet',
     '--effort',
@@ -103,7 +105,8 @@ test('Golden argv: claude backend', () => {
     '--add-dir',
     call.runDir,
     '--output-format',
-    'json',
+    'stream-json',
+    '--verbose',
     '--model',
     'claude-3-7-sonnet',
     '--effort',
@@ -155,19 +158,30 @@ test('Golden argv: codex backend', () => {
   assert.deepEqual(JSON.parse(built.files[schemaFile]), strictify(FINDINGS));
 });
 
-test('opencode zen lane: v2 argv, profile cwd, no agent, no config env, prompt only on stdin', () => {
+// Through the background service, one full set of the user's MCP servers starts for every new
+// lane directory and outlives the lane. `--standalone` plus the isolated XDG home is what keeps
+// a zen lane to two processes that a tree kill removes.
+test('opencode zen lane: standalone, isolated XDG home, profile cwd, no agent, no config env, prompt only on stdin', () => {
   const call = {
     callId: 'c1',
     prompt: 'SEAT PROMPT',
     model: 'opencode/big-pickle',
-    lane: { mode: 'zen', cwd: '/run/sandbox/profiles/weak-find', stage: 'FIND' },
+    lane: {
+      mode: 'zen',
+      cwd: '/run/sandbox/profiles/weak-find',
+      xdgHome: '/run/sandbox/xdg/weak-find/zen',
+      stage: 'FIND',
+    },
   };
   const built = opencodeBackend.build(call, {
     platform: 'linux',
-    env: { PATH: '/bin', MY_API_KEY: 'k', GH_TOKEN: 't', HOME: '/h' },
+    env: { PATH: '/bin', MY_API_KEY: 'k', GH_TOKEN: 't', HOME: '/h', XDG_CONFIG_HOME: '/h/.config' },
   });
-  assert.deepEqual(built.args, ['run', '--format', 'json', '--auto', '-m', 'opencode/big-pickle']);
+  assert.deepEqual(built.args, ['run', '--standalone', '--format', 'json', '--auto', '-m', 'opencode/big-pickle']);
+  assert.ok(!built.args.includes('--agent'));
   assert.equal(built.cwd, '/run/sandbox/profiles/weak-find');
+  assert.equal(built.env.XDG_CONFIG_HOME, '/run/sandbox/xdg/weak-find/zen');
+  assert.equal(built.env.PWD, '/run/sandbox/profiles/weak-find');
   assert.equal(built.env.OPENCODE_CONFIG_CONTENT, undefined);
   assert.equal(built.env.MY_API_KEY, undefined);
   assert.equal(built.env.GH_TOKEN, undefined);
@@ -207,9 +221,19 @@ test('opencode build: no effort variant, and a call without a lane falls back to
     { prompt: 'P', model: 'opencode/big-pickle', effort: 'high', cwd: '/fallback' },
     { env: { PATH: '/bin' } }
   );
-  assert.deepEqual(built.args, ['run', '--format', 'json', '--auto', '-m', 'opencode/big-pickle']);
+  assert.deepEqual(built.args, ['run', '--standalone', '--format', 'json', '--auto', '-m', 'opencode/big-pickle']);
   assert.equal(built.cwd, '/fallback');
   assert.equal(built.env.XDG_CONFIG_HOME, undefined);
+});
+
+// A zen lane with no isolated home keeps the parent value: an `XDG_CONFIG_HOME` of `undefined`
+// would reach the child as the text "undefined" and point at nothing.
+test('opencode build: a zen lane without an isolated home keeps the parent XDG_CONFIG_HOME', () => {
+  const built = opencodeBackend.build(
+    { prompt: 'P', model: 'opencode/big-pickle', lane: { mode: 'zen', cwd: '/c', stage: 'FIND' } },
+    { env: { PATH: '/bin', XDG_CONFIG_HOME: '/h/.config' } }
+  );
+  assert.equal(built.env.XDG_CONFIG_HOME, '/h/.config');
 });
 
 // `opencode run` resolves the session directory as `root ?? process.env.PWD ?? process.cwd()`,
@@ -413,6 +437,88 @@ test('extract behavior per backend', () => {
   );
 });
 
+test('claude backend: stream-json argv keeps --json-schema', () => {
+  const { args } = claudeBackend.build(
+    { root: '/r', runDir: '/d', schema: { type: 'object' } },
+    {}
+  );
+  const i = args.indexOf('--output-format');
+  assert.equal(args[i + 1], 'stream-json');
+  assert.ok(args.includes('--verbose'));
+  assert.ok(args.includes('--json-schema'));
+  assert.ok(args.includes('--strict-mcp-config'));
+});
+
+test('claude extract: last result line wins, structured_output first', () => {
+  const stdout = [
+    '{"type":"system","subtype":"init"}',
+    'not json',
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"draft"}]}}',
+    '{"type":"result","subtype":"success","result":"{\\"ok\\":false}","structured_output":{"ok":true}}',
+  ].join('\n');
+  assert.equal(claudeBackend.extract({ stdout }), '{"ok":true}');
+});
+
+test('claude extract: no result line falls back to the last assistant text', () => {
+  const stdout =
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"```json\\n{\\"findings\\":[]}\\n```"}]}}\n';
+  // Raw stdout also matches /findings/, but it carries the text JSON-escaped, which the fence
+  // parser cannot read. Assert the decoded text, so a fall-through to stdout fails here.
+  assert.equal(claudeBackend.extract({ stdout }), '```json\n{"findings":[]}\n```');
+});
+
+test('claude extract: empty result and null structured_output fall back to assistant text', () => {
+  const text = '```json\n{"findings":[]}\n```';
+  const stdout = [
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } }),
+    JSON.stringify({ type: 'result', result: '', structured_output: null }),
+  ].join('\n');
+  assert.equal(claudeBackend.extract({ stdout }), text);
+});
+
+test('claude extract: a stream with no assistant text and no usable result falls back to stdout', () => {
+  const stdout = [
+    JSON.stringify({ type: 'system', subtype: 'init' }),
+    JSON.stringify({ type: 'result', result: '', structured_output: undefined }),
+  ].join('\n');
+  assert.equal(claudeBackend.extract({ stdout }), stdout);
+});
+
+test('streaming(): only stream modes are streaming', () => {
+  assert.equal(claudeBackend.streaming({}), true);
+  assert.equal(codexBackend.streaming({}), false);
+  assert.equal(customBackend.streaming({}), false);
+  assert.equal(geminiBackend.streaming({}), false);
+  // opencode `build` emits `--format json` in both lane modes (Part A).
+  assert.equal(opencodeBackend.streaming({}), true);
+});
+
+test('codex build: uses call.outFile when given', () => {
+  const built = codexBackend.build(
+    {
+      callId: 'c',
+      runDir: '/d',
+      root: '/r',
+      cwd: '/r',
+      outFile: '/d/calls/c.a2.out.json',
+      schema: {},
+    },
+    {}
+  );
+  assert.equal(built.outFile, '/d/calls/c.a2.out.json');
+  assert.ok(built.args.includes('/d/calls/c.a2.out.json'));
+});
+
+test('custom build: uses call.outFile when given', () => {
+  const config = { backends: { custom: { command: ['my-cli', '--out', '{outFile}'] } } };
+  const built = customBackend.build(
+    { callId: 'c', runDir: '/d', root: '/r', cwd: '/r', outFile: '/d/calls/c.a3.out.json' },
+    { config }
+  );
+  assert.equal(built.outFile, '/d/calls/c.a3.out.json');
+  assert.deepEqual(built.args, ['my-cli', '--out', '/d/calls/c.a3.out.json']);
+});
+
 test('resolveBackend validation', async () => {
   await assert.rejects(
     () => resolveBackend('unknown-backend'),
@@ -474,7 +580,7 @@ test('runSeatCall: bad-model rejects before spawn and writes no log', async () =
     assert.equal(res.ok, false);
     assert.equal(res.error, 'bad-model');
     assert.equal(res.attempts, 0);
-    assert.equal(existsSync(path.join(runDir, 'calls', 'bad-call.a1.log')), false);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'bad-call.r1.a1.log')), false);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -508,7 +614,7 @@ test('runSeatCall: custom backend running echo-seat -> ok, attempts === 1, log e
     assert.equal(res.attempts, 1);
     assert.deepEqual(res.value, { findings: [] });
 
-    const logFile = path.join(runDir, 'calls', 'c1.a1.log');
+    const logFile = path.join(runDir, 'calls', 'c1.r1.a1.log');
     assert.equal(existsSync(logFile), true);
 
     const logContent = await readFile(logFile, 'utf8');
@@ -520,7 +626,7 @@ test('runSeatCall: custom backend running echo-seat -> ok, attempts === 1, log e
   }
 });
 
-test('runSeatCall: fake seat prints prose twice -> ok:false, error starts with parse, attempts === 2, two logs', async () => {
+test('runSeatCall: fake seat prints prose -> ok:false, error starts with parse, attempts === 3, three logs', async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
   try {
     const runDir = path.join(tmp, 'run');
@@ -547,10 +653,11 @@ test('runSeatCall: fake seat prints prose twice -> ok:false, error starts with p
     assert.equal(res.ok, false);
     assert.equal(typeof res.error, 'string');
     assert.match(res.error, /^parse/);
-    assert.equal(res.attempts, 2);
+    assert.equal(res.attempts, 3);
 
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-prose.a1.log')), true);
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-prose.a2.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-prose.r1.a1.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-prose.r1.a2.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-prose.r1.a3.log')), true);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -586,14 +693,14 @@ test('runSeatCall: fake seat exits 1 then succeeds -> ok, attempts 2', async () 
     assert.equal(res.attempts, 2);
     assert.deepEqual(res.value, { findings: [] });
 
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-retry.a1.log')), true);
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-retry.a2.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-retry.r1.a1.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-retry.r1.a2.log')), true);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
 });
 
-test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attempts: 1', async () => {
+test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attempts: 3', async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
   try {
     const runDir = path.join(tmp, 'run');
@@ -620,7 +727,8 @@ test('runSeatCall: timeoutMs: 200 seat sleeps -> ok:false, error: timeout, attem
     const res = await runSeatCall(call, { backend });
     assert.equal(res.ok, false);
     assert.equal(res.error, 'timeout');
-    assert.equal(res.attempts, 1);
+    // One model and no valid answer: the same model runs again while attempts remain.
+    assert.equal(res.attempts, 3);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -653,8 +761,8 @@ test('runSeatCall: attemptBase: 2 -> log a3', async () => {
     const res = await runSeatCall(call, { backend });
     assert.equal(res.ok, true);
     assert.equal(res.attempts, 1);
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-base.a3.log')), true);
-    assert.equal(existsSync(path.join(runDir, 'calls', 'c-base.a1.log')), false);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-base.r1.a3.log')), true);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'c-base.r1.a1.log')), false);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -712,8 +820,8 @@ test('runSeatCall: EEXIST log conflict advances to next available index', async 
     await mkdir(callsDir, { recursive: true });
     await mkdir(cwd, { recursive: true });
 
-    // Pre-create c1.a1.log
-    await writeFile(path.join(callsDir, 'c1.a1.log'), 'PRE-EXISTING CONTENT', 'utf8');
+    // A final log of an older process, with no live log beside it: attempt 1 is taken.
+    await writeFile(path.join(callsDir, 'c1.r1.a1.log'), 'PRE-EXISTING CONTENT', 'utf8');
 
     const call = {
       callId: 'c1',
@@ -736,11 +844,11 @@ test('runSeatCall: EEXIST log conflict advances to next available index', async 
     assert.equal(res.attempts, 1);
 
     // Old log was untouched
-    const oldLog = await readFile(path.join(callsDir, 'c1.a1.log'), 'utf8');
+    const oldLog = await readFile(path.join(callsDir, 'c1.r1.a1.log'), 'utf8');
     assert.equal(oldLog, 'PRE-EXISTING CONTENT');
 
     // New log was written to a2.log
-    assert.equal(existsSync(path.join(callsDir, 'c1.a2.log')), true);
+    assert.equal(existsSync(path.join(callsDir, 'c1.r1.a2.log')), true);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -813,7 +921,7 @@ test('runSeatCall: synchronizes prompt file on disk before launching attempt 2 (
 
     let attempt2PromptOnDisk = null;
     let callCount = 0;
-    const promptPath = path.join(runDir, 'calls', 'c-sync-prompt.prompt.txt');
+    const promptPath = path.join(runDir, 'calls', 'c-sync-prompt.r1.a2.prompt.txt');
     const fakeRunChild = async () => {
       callCount++;
       if (callCount === 1) {
@@ -1142,7 +1250,7 @@ test('runSeatCall: a timeout and a spawn failure keep the event fields and name 
     });
     assert.equal(timedOut.error, 'timeout');
     assert.equal(timedOut.errorType, 'timeout');
-    assert.equal(timedOut.attempts, 1);
+    assert.equal(timedOut.attempts, 3);
     assert.equal(timedOut.costTotal, 0.5);
     assert.equal(timedOut.tokensTotal, 10);
     assert.equal(timedOut.model, 'gemini-3.8-flash');
@@ -1161,7 +1269,7 @@ test('runSeatCall: a timeout and a spawn failure keep the event fields and name 
   }
 });
 
-test('runSeatCall: an unparsable answer fails after two attempts with the event fields and no errorType', async () => {
+test('runSeatCall: an unparsable answer fails after three attempts with the event fields and no errorType', async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
   try {
     const runChildFake = streamingRunChild([
@@ -1184,8 +1292,8 @@ test('runSeatCall: an unparsable answer fails after two attempts with the event 
 
     assert.equal(res.ok, false);
     assert.match(res.error, /^parse/);
-    assert.equal(res.attempts, 2);
-    assert.equal(runChildFake.calls.length, 2);
+    assert.equal(res.attempts, 3);
+    assert.equal(runChildFake.calls.length, 3);
     assert.equal(res.errorType, null);
     assert.equal(res.costTotal, 0.25);
     assert.equal(res.costComplete, true);
@@ -1230,7 +1338,8 @@ test('runSeatCall: a backend with no event parser reports the default event fiel
     );
 
     assert.equal(res.ok, true);
-    assert.equal(sawOnStdout, undefined);
+    // Every attempt writes a live log, so onStdout is attached whatever the adapter parses.
+    assert.equal(typeof sawOnStdout, 'function');
     assert.equal(res.costTotal, null);
     assert.equal(res.tokensTotal, null);
     assert.equal(res.costComplete, false);
@@ -1243,7 +1352,7 @@ test('runSeatCall: a backend with no event parser reports the default event fiel
   }
 });
 
-test('runSeatCall: a non-zero exit on both attempts keeps the event fields', async () => {
+test('runSeatCall: a non-zero exit on every attempt keeps the event fields', async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
   try {
     const runChildFake = streamingRunChild([
@@ -1266,18 +1375,16 @@ test('runSeatCall: a non-zero exit on both attempts keeps the event fields', asy
 
     assert.equal(res.ok, false);
     assert.equal(res.error, 'exit-1');
-    assert.equal(res.attempts, 2);
-    assert.equal(runChildFake.calls.length, 2);
+    assert.equal(res.attempts, 3);
+    assert.equal(runChildFake.calls.length, 3);
     assert.equal(res.costTotal, 0.75);
     assert.equal(res.costComplete, true);
     assert.equal(res.tokensTotal, 10);
     assert.equal(res.stepCount, 0);
     assert.equal(res.errorType, null);
     assert.equal(res.model, 'gemini-3.8-flash');
-    assert.match(
-      runChildFake.calls[1].stdin,
-      /^seat prompt\n\nYour previous answer failed: exit-1\. Answer again with ONE fenced json block\.$/
-    );
+    // A non-zero exit is not a contract failure, so the prompt of attempt 2 is unchanged.
+    assert.equal(runChildFake.calls[1].stdin, 'seat prompt');
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -1363,4 +1470,238 @@ test('resolveBackend: opencode uses its own lookup and lists every searched path
       err.message.startsWith('opencode executable not found. Searched: ') &&
       err.message.includes('PATH:opencode')
   );
+});
+
+// --- runSeatCall x the model list, the live log and the attempt rules (task C4) -------------
+
+// The fixture reads the model name from the last argv item, so one command covers every behavior.
+function modelBackend() {
+  return {
+    name: 'custom',
+    exe: process.execPath,
+    command: [process.execPath, path.resolve('test/fixtures/backends/model-seat.mjs'), '{model}'],
+    streaming: () => true,
+  };
+}
+
+test('runSeatCall: idle on model 1 fails over to model 2', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const seen = { attempts: [], stalled: [], failover: [], stdout: [] };
+    const res = await runSeatCall(
+      {
+        callId: 'f1',
+        prompt: 'p',
+        schema: FINDINGS,
+        root: tmp,
+        runDir,
+        cwd,
+        models: ['silent', 'okmodel'],
+        idleMs: 300,
+        timeoutMs: 10000,
+      },
+      {
+        backend: modelBackend(),
+        onAttempt: (a) => seen.attempts.push(a),
+        onStalled: (s) => seen.stalled.push(s),
+        onFailover: (f) => seen.failover.push(f),
+        onStdout: (s) => seen.stdout.push(s),
+      }
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.model, 'okmodel');
+    assert.equal(res.attempts, 2);
+    assert.deepEqual(seen.failover, [{ from: 'silent', to: 'okmodel', reason: 'idle' }]);
+    assert.equal(seen.stalled[0].action, 'failover');
+    assert.deepEqual(seen.attempts, [
+      { attempt: 1, model: 'silent' },
+      { attempt: 2, model: 'okmodel' },
+    ]);
+    assert.ok(seen.stdout.length > 0);
+    assert.ok(existsSync(path.join(runDir, 'calls', 'f1.r1.a1.live.log')));
+    assert.match(await readFile(path.join(runDir, 'calls', 'f1.r1.a1.live.log'), 'utf8'), /start/);
+    assert.ok(existsSync(path.join(runDir, 'calls', 'f1.r1.a2.log')));
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: contract failure moves to the next model when one exists', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const failover = [];
+    const res = await runSeatCall(
+      { callId: 'f2', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['prose', 'okmodel'] },
+      { backend: modelBackend(), onFailover: (f) => failover.push(f) }
+    );
+    assert.equal(res.ok, true);
+    assert.deepEqual(failover, [{ from: 'prose', to: 'okmodel', reason: 'contract' }]);
+    // A list of more than one model never resends the prompt with the "answer again" suffix.
+    assert.equal(existsSync(path.join(runDir, 'calls', 'f2.r1.a2.prompt.txt')), false);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: one model and a contract failure retries the same model, cap 3 attempts', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const res = await runSeatCall(
+      { callId: 'f3', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['prose'] },
+      { backend: modelBackend() }
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.attempts, 3);
+    assert.match(await readFile(path.join(runDir, 'calls', 'f3.r1.a3.prompt.txt'), 'utf8'), /Answer again/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: a non-streaming adapter gets no idle deadline', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const backend = { ...modelBackend(), streaming: () => false };
+    const res = await runSeatCall(
+      {
+        callId: 'f4',
+        prompt: 'p',
+        schema: FINDINGS,
+        root: tmp,
+        runDir,
+        cwd,
+        models: ['silent'],
+        idleMs: 200,
+        timeoutMs: 1500,
+      },
+      { backend }
+    );
+    assert.equal(res.error, 'timeout');
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: attempt n is reserved by the live log before the child starts', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(path.join(runDir, 'calls'), { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeFile(path.join(runDir, 'calls', 'f5.r1.a1.live.log'), 'taken');
+    const res = await runSeatCall(
+      { callId: 'f5', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['okmodel'] },
+      { backend: modelBackend() }
+    );
+    assert.equal(res.ok, true);
+    assert.ok(existsSync(path.join(runDir, 'calls', 'f5.r1.a2.log')));
+    assert.equal(await readFile(path.join(runDir, 'calls', 'f5.r1.a1.live.log'), 'utf8'), 'taken');
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: a round of 2 writes its own prompt and schema and leaves round 1 alone', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const base = { callId: 'f6', schema: FINDINGS, root: tmp, runDir, cwd, models: ['okmodel'] };
+    await runSeatCall({ ...base, prompt: 'first round' }, { backend: modelBackend() });
+    await runSeatCall({ ...base, prompt: 'second round', round: 2 }, { backend: modelBackend() });
+
+    const calls = path.join(runDir, 'calls');
+    assert.equal(await readFile(path.join(calls, 'f6.r1.prompt.txt'), 'utf8'), 'first round');
+    assert.equal(await readFile(path.join(calls, 'f6.r2.prompt.txt'), 'utf8'), 'second round');
+    assert.ok(existsSync(path.join(calls, 'f6.r2.schema.json')));
+    assert.ok(existsSync(path.join(calls, 'f6.r2.a1.log')));
+    assert.equal(existsSync(path.join(calls, 'f6.prompt.txt')), false);
+
+    await assert.rejects(
+      () => runSeatCall({ ...base, prompt: 'p', round: 0 }, { backend: modelBackend() }),
+      (err) => err instanceof ConfigError && /round/.test(err.message)
+    );
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: every model of the list is validated before the first spawn', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const res = await runSeatCall(
+      { callId: 'f7', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['okmodel', '--x'] },
+      { backend: modelBackend() }
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'bad-model');
+    assert.equal(res.attempts, 0);
+    assert.equal(existsSync(path.join(runDir, 'calls', 'f7.r1.a1.live.log')), false);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runSeatCall: a custom command reads the prompt and schema files of the round', async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), 'ar-test-'));
+  try {
+    const runDir = path.join(tmp, 'run');
+    const cwd = path.join(runDir, 'cwd');
+    await mkdir(cwd, { recursive: true });
+    const seenArgs = [];
+    const res = await runSeatCall(
+      { callId: 'f8', prompt: 'p', schema: FINDINGS, root: tmp, runDir, cwd, models: ['prose', 'okmodel'] },
+      {
+        backend: {
+          name: 'custom',
+          exe: process.execPath,
+          command: [
+            process.execPath,
+            path.resolve('test/fixtures/backends/model-seat.mjs'),
+            '--prompt',
+            '{promptFile}',
+            '--schema',
+            '{schemaFile}',
+            '{model}',
+          ],
+        },
+        runChild: async (opts) => {
+          seenArgs.push(opts.args);
+          return {
+            code: 0,
+            signal: null,
+            stdout: seenArgs.length === 1 ? 'prose' : '```json\n{"findings":[]}\n```',
+            stderr: '',
+            timedOut: false,
+            idled: false,
+            spawnError: null,
+          };
+        },
+      }
+    );
+    assert.equal(res.ok, true);
+    const calls = path.join(runDir, 'calls');
+    assert.ok(seenArgs[0].includes(path.join(calls, 'f8.r1.prompt.txt')));
+    assert.ok(seenArgs[0].includes(path.join(calls, 'f8.r1.schema.json')));
+    assert.ok(existsSync(path.join(calls, 'f8.r1.schema.json')));
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
 });

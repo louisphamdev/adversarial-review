@@ -48,7 +48,92 @@ async function setupEnvAndRepo() {
   return { iso, repo, cleanup };
 }
 
+// Resolves the single run directory that a `run` created under the isolated state home.
+async function soleRunDir(iso) {
+  const runsBase = path.join(iso.home, '.adversarial-review', 'runs');
+  const repoDirs = await fs.readdir(runsBase);
+  const runDirs = await fs.readdir(path.join(runsBase, repoDirs[0]));
+  return path.join(runsBase, repoDirs[0], runDirs[0]);
+}
+
 describe('pipeline-cli e2e tests', () => {
+  it('two patch-review rounds on one run leave patch_seat-<seat>.r1.prompt.txt and .r2.prompt.txt', async () => {
+    const { iso, repo, cleanup } = await setupEnvAndRepo();
+    try {
+      const runRes = spawnSync(
+        process.execPath,
+        [CLI_PATH, 'run', '--route', 'spawn', '--backend', 'custom', '--json'],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      assert.equal(runRes.status, 1, `expected BLOCK exit 1, got ${runRes.status}. stderr: ${runRes.stderr}`);
+
+      const runDir = await soleRunDir(iso);
+      const planFile = path.join(iso.home, 'plan.md');
+
+      await fs.writeFile(planFile, '## C1\nfirst plan\n');
+      const first = spawnSync(
+        process.execPath,
+        [CLI_PATH, 'patch-review', runDir, '--plan', planFile],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      assert.equal(first.status, 0, `first patch-review should APPLY. stderr: ${first.stderr}`);
+
+      await fs.writeFile(planFile, '## C1\nsecond plan\n');
+      const second = spawnSync(
+        process.execPath,
+        [CLI_PATH, 'patch-review', runDir, '--plan', planFile],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      assert.equal(second.status, 0, `second patch-review should APPLY. stderr: ${second.stderr}`);
+
+      const callsDir = path.join(runDir, 'calls');
+      const r1 = await fs.readFile(path.join(callsDir, 'patch_seat-breaker.r1.prompt.txt'), 'utf8');
+      const r2 = await fs.readFile(path.join(callsDir, 'patch_seat-breaker.r2.prompt.txt'), 'utf8');
+      assert.match(r1, /first plan/);
+      assert.match(r2, /second plan/);
+      assert.equal(existsSync(path.join(callsDir, 'patch_seat-breaker.prompt.txt')), false);
+
+      // The round number is the record index, so each round has its own stage record.
+      assert.ok(existsSync(path.join(runDir, 'stages', 'patch-review-1.json')));
+      assert.ok(existsSync(path.join(runDir, 'stages', 'patch-review-2.json')));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('two verify rounds on one run leave verify_seat-<seat>.r1.prompt.txt and .r2.prompt.txt', async () => {
+    const { iso, repo, cleanup } = await setupEnvAndRepo();
+    try {
+      const runRes = spawnSync(
+        process.execPath,
+        [CLI_PATH, 'run', '--route', 'spawn', '--backend', 'custom', '--json'],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      assert.equal(runRes.status, 1, `expected BLOCK exit 1, got ${runRes.status}. stderr: ${runRes.stderr}`);
+
+      const runDir = await soleRunDir(iso);
+      for (const label of ['first', 'second']) {
+        const verifyRes = spawnSync(
+          process.execPath,
+          [CLI_PATH, 'verify', runDir],
+          { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+        );
+        assert.equal(verifyRes.status, 0, `${label} verify should PASS. stderr: ${verifyRes.stderr}`);
+      }
+
+      const callsDir = path.join(runDir, 'calls');
+      assert.ok(existsSync(path.join(callsDir, 'verify_seat-breaker.r1.prompt.txt')));
+      assert.ok(existsSync(path.join(callsDir, 'verify_seat-breaker.r2.prompt.txt')));
+      assert.equal(existsSync(path.join(callsDir, 'verify_seat-breaker.prompt.txt')), false);
+
+      // The round number is the record index, so each round has its own stage record.
+      assert.ok(existsSync(path.join(runDir, 'stages', 'verify-1.json')));
+      assert.ok(existsSync(path.join(runDir, 'stages', 'verify-2.json')));
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('e2e run --route spawn --backend custom --json -> exit 1, result.json exists, sift skipped with no-key', async () => {
     const { iso, repo, cleanup } = await setupEnvAndRepo();
     try {

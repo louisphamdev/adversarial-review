@@ -12,6 +12,7 @@ import { doctorCommand } from './doctor.mjs';
 import { ENGINE_VERSION } from '../version.mjs';
 import { ConfigError, RunError } from '../errors.mjs';
 import { LockBusyError } from '../lockfile.mjs';
+import { withExitCleanup } from '../cleanup.mjs';
 
 function printHelp(stdout) {
   stdout.write(`adversarial-review v${ENGINE_VERSION} - Zero-dependency adversarial code review engine
@@ -68,17 +69,21 @@ export async function main(
 
   try {
     switch (command) {
+      // Every command that opens a lane sweeps before it exits: a lane process that outlives
+      // the command keeps a private opencode server and its MCP servers alive (A14 item 3).
+      // `doctor --probe` and `models research|bench` open lanes too, through the same canary and
+      // lane-call path, so they are wrapped as well.
       case 'run':
-        return await runCommand(flags, positionals, io);
+        return await withExitCleanup({ stderr }, () => runCommand(flags, positionals, io));
 
       case 'status':
         return await statusCommand(flags, positionals, io);
 
       case 'patch-review':
-        return await patchReviewCommand(flags, positionals, io);
+        return await withExitCleanup({ stderr }, () => patchReviewCommand(flags, positionals, io));
 
       case 'verify':
-        return await verifyCommand(flags, positionals, io);
+        return await withExitCleanup({ stderr }, () => verifyCommand(flags, positionals, io));
 
       case 'sift':
         return await siftCommand(flags, positionals, io);
@@ -90,13 +95,13 @@ export async function main(
         return await quotaCommand(flags, positionals, io);
 
       case 'models':
-        return await modelsCommand(flags, positionals, io);
+        return await withExitCleanup({ stderr }, () => modelsCommand(flags, positionals, io));
 
       case 'hook':
         return await hookCommand(flags, positionals, io);
 
       case 'doctor':
-        return await doctorCommand(flags, positionals, io);
+        return await withExitCleanup({ stderr }, () => doctorCommand(flags, positionals, io));
 
       case 'install':
       case 'uninstall': {

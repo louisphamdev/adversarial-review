@@ -96,7 +96,7 @@ async function probeCanary({ config, env, stdout, backend }) {
   try {
     const treeDir = path.join(runDir, 'sandbox', 'tree');
     await fs.mkdir(treeDir, { recursive: true });
-    const { cwd } = await writeProfileConfig({
+    const { cwd, xdgHome } = await writeProfileConfig({
       runDir,
       profileKey: 'canary',
       treeDir,
@@ -106,15 +106,16 @@ async function probeCanary({ config, env, stdout, backend }) {
       runDir,
       repoRoot: treeDir,
       treeDir,
-      profiles: [{ profileKey: 'canary', cwd, mode: 'zen' }],
+      profiles: [{ profileKey: 'canary', cwd, xdgHome, mode: 'zen' }],
       models: [model],
-      laneCallFor: ({ cwd: laneCwd, mode, prompt }) =>
+      laneCallFor: ({ cwd: laneCwd, mode, xdgHome: laneXdgHome, prompt }) =>
         makeLaneCall({
           config,
           env,
           runDir,
           cwd: laneCwd,
           mode,
+          xdgHome: laneXdgHome,
           stage: 'FIND',
           prompt,
           timeoutMs: 180000,
@@ -197,6 +198,7 @@ export async function doctorCommand(
 
   stdout.write('\n--- Lane isolation ---\n');
   stdout.write('isolation: sandbox copy + permission profile\n');
+  stdout.write('lanes: standalone, isolated config (no global MCP, instructions, or plugins)\n');
   stdout.write(`os-isolation: ${await detectOsIsolation(env)}\n`);
   const stale = await removeStaleSandboxKeys(env);
   stdout.write(

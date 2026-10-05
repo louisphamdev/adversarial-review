@@ -15,7 +15,7 @@ try {
 const args = process.argv.slice(2);
 if (cfg.logFile) {
   try {
-    fs.appendFileSync(cfg.logFile, args.join(' ') + '\n');
+    fs.appendFileSync(cfg.logFile, `${args.join(' ')} XDG=${process.env.XDG_CONFIG_HOME || 'none'}\n`);
   } catch {
     // A missing log directory must not fail the call under test.
   }

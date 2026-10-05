@@ -1,16 +1,16 @@
 // CLI patch-review and verify commands (§18.1, §6.1).
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { assertRunDir, readState, readCheckpoint, writeIndexed } from '../rundir.mjs';
-import { acquireLock } from '../lockfile.mjs';
+import { assertRunDir, readState, readCheckpoint, writeIndexed, nextRound } from '../rundir.mjs';
 import { runPatchReview, runVerify } from '../pipeline.mjs';
 import { runSeatCall } from '../backends/index.mjs';
 import { loadConfig } from '../config.mjs';
 import { runChild } from '../proc.mjs';
+import { acquireLockWithCleanup } from '../cleanup.mjs';
 import { normalizeDiff } from '../material.mjs';
 import { ConfigError, RunError } from '../errors.mjs';
 
-function createClosingAgent({ config, env, runDir, repoRoot }) {
+function createClosingAgent({ config, env, runDir, repoRoot, round = 1 }) {
   const hostBackend = config.hostBackend || 'claude';
   const judgeBackend = config.stages?.ruling?.backend || hostBackend;
 
@@ -31,6 +31,7 @@ function createClosingAgent({ config, env, runDir, repoRoot }) {
         cwd: path.join(runDir, 'cwd'),
         model,
         timeoutMs,
+        round,
       },
       {
         backend,
@@ -66,7 +67,7 @@ export async function patchReviewCommand(
     throw new ConfigError(`Cannot read plan file "${flags.plan}": ${err.message}`);
   }
 
-  const lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  const lock = await acquireLockWithCleanup(runDir, { stderr });
 
   try {
     const state = await readState(runDir);
@@ -79,7 +80,8 @@ export async function patchReviewCommand(
     const { config } = loadConfig({ env, flags, stderr });
     const repoRoot = state.request?.repoRoot || cwd;
 
-    const runAgent = createClosingAgent({ config, env, runDir, repoRoot });
+    const round = await nextRound(runDir, 'patch-review');
+    const runAgent = createClosingAgent({ config, env, runDir, repoRoot, round });
     const res = await runPatchReview({
       state: { ...state, ruling },
       plan: planText,
@@ -114,7 +116,7 @@ export async function verifyCommand(
   }
   const runDir = assertRunDir(env, positionals[0]);
 
-  const lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  const lock = await acquireLockWithCleanup(runDir, { stderr });
 
   try {
     const state = await readState(runDir);
@@ -145,7 +147,8 @@ export async function verifyCommand(
     const findCheckpoint = await readCheckpoint(runDir, 'find');
     const findings = state.result?.raw?.findings || state.result?.findings || findCheckpoint?.findings || [];
 
-    const runAgent = createClosingAgent({ config, env, runDir, repoRoot });
+    const round = await nextRound(runDir, 'verify');
+    const runAgent = createClosingAgent({ config, env, runDir, repoRoot, round });
     const res = await runVerify({
       state: { ...state, ruling, findings },
       diff: normDiff,

@@ -226,3 +226,81 @@ test('a failed canary exits 3 and deletes the sandbox, or keeps it under --keep-
     }
   }
 });
+
+// Through the background service, one full set of the user's MCP servers starts for every new
+// lane directory and stays until the service restarts; 16 sets leaked in one night. Every lane
+// of a swarm run must therefore be standalone and read a config inside the run directory only.
+test('every swarm lane call is standalone with an XDG home inside the run directory', async () => {
+  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+  const { env, home, cleanup } = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+  const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+  const log = path.join(bins.dir, 'calls.log');
+  try {
+    await writeSwarmBin({ dir: bins.dir, models: ['p/m1'], logFile: log });
+    await seedModelStore({ home, model: 'p/m1', lenses: CODE_LENS_SEATS });
+    await writeFile(path.join(repo.root, 'a.js'), '2');
+
+    const base = runsDir(env, repo.root);
+    const before = (await exists(base)) ? await readdir(base) : [];
+    const r = await runCli(
+      ['run', '--route', 'swarm', '--model', 'p/m1', '--backend', 'claude', '--allow-gaps'],
+      { env, cwd: repo.root }
+    );
+    const runDir = await newRunDir(base, before);
+
+    const runCalls = (await readFile(log, 'utf8'))
+      .split('\n')
+      .filter((line) => /^run\b/.test(line));
+    assert.ok(runCalls.length > 0, `no lane call reached the fake executable (exit ${r.code}): ${r.stderr}`);
+    for (const line of runCalls) {
+      assert.match(line, /^run --standalone /, `a lane call is not standalone: ${line}`);
+      const xdg = line.split(' XDG=')[1];
+      assert.ok(
+        xdg && path.resolve(xdg).startsWith(path.resolve(path.join(runDir, 'sandbox', 'xdg'))),
+        `a lane reads a config outside the run directory: ${line}`
+      );
+    }
+  } finally {
+    await repo.cleanup();
+    await cleanup();
+    await bins.cleanup();
+  }
+});
+
+// The user requirement of A14: the lanes are cleaned up before the table exits. The record is
+// what makes that checkable after the fact, so it belongs in the result and in the event log.
+test('a run records the exit cleanup in the event log and in the result', async () => {
+  const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+  const { env, home, cleanup } = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
+  const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+  try {
+    await writeFile(path.join(repo.root, 'a.js'), '2');
+    await writeStubBackend({ home });
+
+    const base = runsDir(env, repo.root);
+    const before = (await exists(base)) ? await readdir(base) : [];
+    const r = await runCli(['run', '--route', 'spawn', '--backend', 'custom', '--allow-gaps'], {
+      env,
+      cwd: repo.root,
+    });
+    assert.ok(r.code === 0 || r.code === 1, `${r.code}: ${r.stdout}\n${r.stderr}`);
+    const runDir = await newRunDir(base, before);
+
+    const events = (await readFile(path.join(runDir, 'events.jsonl'), 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((e) => e.event === 'cleanup');
+    assert.equal(events.length, 1, 'one cleanup event per run');
+    assert.deepEqual(events[0].stillAlive, []);
+
+    const result = JSON.parse(await readFile(path.join(runDir, 'result.json'), 'utf8'));
+    assert.deepEqual(result.cleanup.stillAlive, []);
+    assert.equal(typeof result.cleanup.killed, 'number');
+    assert.equal(await exists(path.join(runDir, 'sandbox', 'xdg')), false);
+  } finally {
+    await repo.cleanup();
+    await cleanup();
+    await bins.cleanup();
+  }
+});
