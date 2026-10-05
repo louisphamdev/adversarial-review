@@ -162,24 +162,8 @@ export async function runTable({
     }
   }
 
-  // SIFT starts in parallel with stages 3-5
   let siftResult = null;
   let siftPromise = null;
-
-  if (sift && sift.loaded) {
-    siftResult = sift.loaded;
-  } else if (allFindings.length === 0) {
-    siftResult = { status: 'skipped', reason: 'no-findings', rows: [], readingOrder: [] };
-  } else if (sift && typeof sift.start === 'function') {
-    siftPromise = Promise.resolve()
-      .then(() => sift.start(allFindings))
-      .catch(() => ({
-        status: 'skipped',
-        reason: 'failed',
-        rows: [],
-        readingOrder: [],
-      }));
-  }
 
   // STAGE 3: TABLE
   let disputes = [];
@@ -352,187 +336,203 @@ export async function runTable({
     }
   }
 
-  // STAGE 5: LAST CALL
-  let lastCallItems = [];
-  let lastcallCheckpoint = null;
-
-  if (typeof loadCheckpoint === 'function') {
-    lastcallCheckpoint = await loadCheckpoint('lastcall');
+  // The sift starts after DISPUTE: the `survives` decision needs the challenges.
+  if (sift && sift.loaded) {
+    siftResult = sift.loaded;
+  } else if (allFindings.length === 0) {
+    siftResult = { status: 'skipped', reason: 'no-findings', rows: [], readingOrder: [] };
+  } else if (sift && typeof sift.start === 'function') {
+    siftPromise = Promise.resolve()
+      .then(() => sift.start(allFindings, { rebuttals }))
+      .catch(() => ({ status: 'skipped', reason: 'failed', rows: [], readingOrder: [] }));
   }
 
-  if (lastcallCheckpoint) {
-    lastCallItems = lastcallCheckpoint.lastCall || [];
-    if (Array.isArray(lastcallCheckpoint.deadSeats)) {
-      for (const d of lastcallCheckpoint.deadSeats) {
-        if (!deadSeats.some((x) => x.seat === d.seat && x.stage === d.stage)) {
-          deadSeats.push(d);
+  try {
+    // STAGE 5: LAST CALL
+    let lastCallItems = [];
+    let lastcallCheckpoint = null;
+
+    if (typeof loadCheckpoint === 'function') {
+      lastcallCheckpoint = await loadCheckpoint('lastcall');
+    }
+
+    if (lastcallCheckpoint) {
+      lastCallItems = lastcallCheckpoint.lastCall || [];
+      if (Array.isArray(lastcallCheckpoint.deadSeats)) {
+        for (const d of lastcallCheckpoint.deadSeats) {
+          if (!deadSeats.some((x) => x.seat === d.seat && x.stage === d.stage)) {
+            deadSeats.push(d);
+          }
+        }
+      }
+    } else {
+      const lastCallResults = await Promise.all(
+        resolvedSeats.map(async (seat) => {
+          const prompt = buildPrompt('LASTCALL', {
+            seat,
+            request,
+            materialPath: request.materialPath,
+            repoRoot: request.repoRoot,
+          });
+          const res = await runAgent({ stage: 'LASTCALL', seat, prompt, schema: LASTCALL });
+          return { seat, res };
+        })
+      );
+
+      for (const { seat, res } of lastCallResults) {
+        if (!res || !res.ok || !res.value) {
+          recordDead(seat.key, 'LASTCALL');
+        } else {
+          const items = Array.isArray(res.value.notYetSaid) ? res.value.notYetSaid : [];
+          items.forEach((txt, idx) => {
+            lastCallItems.push({
+              id: `${seat.key}-lc${idx + 1}`,
+              seat: seat.key,
+              text: txt,
+            });
+          });
+        }
+      }
+
+      if (typeof checkpoint === 'function') {
+        await checkpoint('lastcall', {
+          lastCall: lastCallItems,
+          deadSeats: deadSeats.filter((d) => d.stage === 'LASTCALL'),
+        });
+      }
+    }
+
+    if (siftPromise) siftResult = await siftPromise;
+
+    // STAGE 6: RULING
+    const judgePrompt = buildPrompt('RULING', {
+      seat: resolvedJudge,
+      request,
+      materialPath: request.materialPath,
+      repoRoot: request.repoRoot,
+      budget: request.budget,
+      requirements: request.requirements,
+      findings: allFindings,
+      rebuttals,
+      seams,
+      fixRisks,
+      lastCall: lastCallItems,
+      readingOrder: siftResult?.readingOrder || [],
+      sift: siftResult,
+      noSeat,
+      deadSeats,
+      notRead,
+    });
+
+    const judgeRes = await runAgent({
+      stage: 'RULING',
+      seat: resolvedJudge,
+      prompt: judgePrompt,
+      schema: RULING,
+    });
+
+    if (!judgeRes || !judgeRes.ok || !judgeRes.value) {
+      return {
+        findings: allFindings,
+        lastCall: lastCallItems,
+        disputes: rebuttals,
+        seams,
+        fixRisks,
+        ruling: null,
+        gaps: { noSeat, deadSeats, notRead },
+        gateVerdict: 'BLOCK',
+        exitCode: 3,
+        blockingCount: 0,
+        sift: siftResult,
+        unknownSources: 0,
+      };
+    }
+
+    const ruling = judgeRes.value;
+
+    // Clean sources in closingList
+    const knownIds = new Set([
+      ...allFindings.map((f) => normalizeId(f.id)),
+      ...lastCallItems.map((lc) => normalizeId(lc.id)),
+    ]);
+
+    let unknownSources = 0;
+    if (Array.isArray(ruling.closingList)) {
+      for (const item of ruling.closingList) {
+        if (Array.isArray(item.sources)) {
+          const cleaned = [];
+          const seenSources = new Set();
+          for (const rawSrc of item.sources) {
+            const norm = normalizeId(rawSrc);
+            if (!knownIds.has(norm)) {
+              unknownSources++;
+            } else {
+              if (!seenSources.has(norm)) {
+                seenSources.add(norm);
+                cleaned.push(norm);
+              }
+            }
+          }
+          item.sources = cleaned;
         }
       }
     }
-  } else {
-    const lastCallResults = await Promise.all(
-      resolvedSeats.map(async (seat) => {
-        const prompt = buildPrompt('LASTCALL', {
-          seat,
-          request,
-          materialPath: request.materialPath,
-          repoRoot: request.repoRoot,
-        });
-        const res = await runAgent({ stage: 'LASTCALL', seat, prompt, schema: LASTCALL });
-        return { seat, res };
-      })
-    );
+    ruling.unknownSources = unknownSources;
 
-    for (const { seat, res } of lastCallResults) {
-      if (!res || !res.ok || !res.value) {
-        recordDead(seat.key, 'LASTCALL');
+    // Compare sift after ruling
+    if (siftResult && typeof compareSift === 'function') {
+      const comp = compareSift(siftResult, ruling, allFindings);
+      siftResult.disagreements = comp.disagreements || [];
+    }
+
+    const blockingList = (ruling.closingList || []).filter(
+      (item) => item.severity === 'critical' || item.severity === 'important'
+    );
+    const blockingCount = blockingList.length;
+
+    let gateVerdict = 'PASS';
+    let exitCode = 0;
+
+    if (blockingCount > 0 || ruling.verdict === 'blocked') {
+      gateVerdict = 'BLOCK';
+      exitCode = 1;
+    } else if (deadSeats.length > 0) {
+      if (request.allowGaps) {
+        gateVerdict = 'PASS';
+        exitCode = 0;
       } else {
-        const items = Array.isArray(res.value.notYetSaid) ? res.value.notYetSaid : [];
-        items.forEach((txt, idx) => {
-          lastCallItems.push({
-            id: `${seat.key}-lc${idx + 1}`,
-            seat: seat.key,
-            text: txt,
-          });
-        });
+        gateVerdict = 'BLOCK';
+        exitCode = 1;
       }
     }
 
     if (typeof checkpoint === 'function') {
-      await checkpoint('lastcall', {
-        lastCall: lastCallItems,
-        deadSeats: deadSeats.filter((d) => d.stage === 'LASTCALL'),
-      });
+      await checkpoint('ruling', ruling);
     }
-  }
 
-  if (siftPromise) {
-    siftResult = await siftPromise;
-    if (typeof checkpoint === 'function') {
-      await checkpoint('sift', siftResult);
-    }
-  }
-
-  // STAGE 6: RULING
-  const judgePrompt = buildPrompt('RULING', {
-    seat: resolvedJudge,
-    request,
-    materialPath: request.materialPath,
-    repoRoot: request.repoRoot,
-    budget: request.budget,
-    requirements: request.requirements,
-    findings: allFindings,
-    rebuttals,
-    seams,
-    fixRisks,
-    lastCall: lastCallItems,
-    readingOrder: siftResult?.readingOrder || [],
-    sift: siftResult,
-    noSeat,
-    deadSeats,
-    notRead,
-  });
-
-  const judgeRes = await runAgent({
-    stage: 'RULING',
-    seat: resolvedJudge,
-    prompt: judgePrompt,
-    schema: RULING,
-  });
-
-  if (!judgeRes || !judgeRes.ok || !judgeRes.value) {
     return {
       findings: allFindings,
       lastCall: lastCallItems,
       disputes: rebuttals,
       seams,
       fixRisks,
-      ruling: null,
+      ruling,
       gaps: { noSeat, deadSeats, notRead },
-      gateVerdict: 'BLOCK',
-      exitCode: 3,
-      blockingCount: 0,
+      gateVerdict,
+      exitCode,
+      blockingCount,
       sift: siftResult,
-      unknownSources: 0,
+      unknownSources,
     };
-  }
-
-  const ruling = judgeRes.value;
-
-  // Clean sources in closingList
-  const knownIds = new Set([
-    ...allFindings.map((f) => normalizeId(f.id)),
-    ...lastCallItems.map((lc) => normalizeId(lc.id)),
-  ]);
-
-  let unknownSources = 0;
-  if (Array.isArray(ruling.closingList)) {
-    for (const item of ruling.closingList) {
-      if (Array.isArray(item.sources)) {
-        const cleaned = [];
-        const seenSources = new Set();
-        for (const rawSrc of item.sources) {
-          const norm = normalizeId(rawSrc);
-          if (!knownIds.has(norm)) {
-            unknownSources++;
-          } else {
-            if (!seenSources.has(norm)) {
-              seenSources.add(norm);
-              cleaned.push(norm);
-            }
-          }
-        }
-        item.sources = cleaned;
-      }
+  } finally {
+    // Abort, then wait for the sift at most 2 s, so no sift request runs after the lock is released.
+    if (sift && typeof sift.abort === 'function') sift.abort();
+    if (siftPromise) {
+      let t;
+      await Promise.race([siftPromise, new Promise((r) => { t = setTimeout(r, 2000); })]);
+      clearTimeout(t);
     }
   }
-  ruling.unknownSources = unknownSources;
-
-  // Compare sift after ruling
-  if (siftResult && typeof compareSift === 'function') {
-    const comp = compareSift(siftResult, ruling, allFindings);
-    siftResult.disagreements = comp.disagreements || [];
-  }
-
-  const blockingList = (ruling.closingList || []).filter(
-    (item) => item.severity === 'critical' || item.severity === 'important'
-  );
-  const blockingCount = blockingList.length;
-
-  let gateVerdict = 'PASS';
-  let exitCode = 0;
-
-  if (blockingCount > 0 || ruling.verdict === 'blocked') {
-    gateVerdict = 'BLOCK';
-    exitCode = 1;
-  } else if (deadSeats.length > 0) {
-    if (request.allowGaps) {
-      gateVerdict = 'PASS';
-      exitCode = 0;
-    } else {
-      gateVerdict = 'BLOCK';
-      exitCode = 1;
-    }
-  }
-
-  if (typeof checkpoint === 'function') {
-    await checkpoint('ruling', ruling);
-  }
-
-  return {
-    findings: allFindings,
-    lastCall: lastCallItems,
-    disputes: rebuttals,
-    seams,
-    fixRisks,
-    ruling,
-    gaps: { noSeat, deadSeats, notRead },
-    gateVerdict,
-    exitCode,
-    blockingCount,
-    sift: siftResult,
-    unknownSources,
-  };
 }
 
 function ownerSeatsOf(item) {

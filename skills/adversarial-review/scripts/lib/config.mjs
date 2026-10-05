@@ -48,7 +48,6 @@ export const DEFAULTS = Object.freeze({
     model: 'typesafe/jev-1.13',
     apiKeyEnv: 'JEV_API_KEY',
     keyFile: null,
-    lowConfidence: 0.6,
     timeoutMs: 60000,
     concurrency: 8,
     routerThreshold: 0.3,

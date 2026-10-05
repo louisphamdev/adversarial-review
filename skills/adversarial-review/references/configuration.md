@@ -243,12 +243,6 @@ Default: `null`
 Settable by: user config.
 Path to a file holding the API key.
 
-#### sift.lowConfidence
-
-Default: `0.6`
-Settable by: user config.
-Confidence cutoff below which findings receive extra review.
-
 #### sift.timeoutMs
 
 Default: `60000` (60 seconds)

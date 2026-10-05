@@ -1,5 +1,6 @@
 // CLI sift command (§18.1, §8).
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { siftFindings } from '../sift.mjs';
 import { loadConfig } from '../config.mjs';
 import { writeFileAtomic } from '../fsx.mjs';
@@ -15,9 +16,8 @@ export async function siftCommand(
     return 2;
   }
 
-  let materialText;
   try {
-    materialText = await fs.readFile(flags.material, 'utf8');
+    await fs.readFile(flags.material, 'utf8');
   } catch (err) {
     stderr.write(`Error reading material file "${flags.material}": ${err.message}\n`);
     return 2;
@@ -38,9 +38,13 @@ export async function siftCommand(
 
   const { config } = loadConfig({ env, flags, stderr });
 
+  // The material file is the only file whose lines may reach Jev.
+  const materialPath = path.resolve(flags.material);
   const result = await siftFindings({
-    material: { text: materialText, kind: 'file' },
     findings,
+    scope: { files: [materialPath.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => `${d.toLowerCase()}:`)], runMaterial: null },
+    repoRoot: path.dirname(materialPath),
+    stage: 'code',
     config,
     env,
   });

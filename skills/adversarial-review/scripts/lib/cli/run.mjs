@@ -60,8 +60,10 @@ import { buildBundle, computeDataLeaves, seatEntries } from '../bundle.mjs';
 import { readBundle } from './preflight.mjs';
 import { acquireLock, readLock, pidAlive } from '../lockfile.mjs';
 import { runTable, normalizeId } from '../pipeline.mjs';
-import { siftFindings } from '../sift.mjs';
-import { stateDir, homeDir } from '../paths.mjs';
+import { siftFindings, materialScopeOf } from '../sift.mjs';
+import { versionAtLeast } from '../ledger.mjs';
+import { runChild } from '../proc.mjs';
+import { stateDir, isInside, homeDir } from '../paths.mjs';
 import { SCHEMA_VERSION, ENGINE_VERSION } from '../version.mjs';
 import { ConfigError, RunError } from '../errors.mjs';
 
@@ -1161,24 +1163,8 @@ async function executePipeline({
 
   const until = flags.until || request.until || null;
 
-  let loadedSift = await readCheckpoint(runDir, 'sift');
-
-  const siftObj = {
-    loaded: loadedSift,
-    start: async (findings) => {
-      const res = await siftFindings({
-        material: {
-          kind: request.materialKind,
-          text: request.material?.text,
-        },
-        findings,
-        config,
-        env,
-      });
-      await writeCheckpoint(runDir, 'sift', res);
-      return res;
-    },
-  };
+  const loadedSift = await readCheckpoint(runDir, 'sift');
+  const siftObj = makeSiftObj({ request, runDir, config, env, loadedSift, runChild });
 
   let pipelineResult;
   try {
@@ -1317,6 +1303,34 @@ const ROUTE_KEYS = {
 };
 
 // Pipeline stage names and route-table keys differ; a raw lower-casing sent patch and verify to the host.
+// The sift handle that runTable starts after DISPUTE and aborts on every exit path.
+export function makeSiftObj({ request, runDir, config, env, loadedSift, runChild, siftFn = siftFindings, writeCp = writeCheckpoint }) {
+  const siftAbort = new AbortController();
+  // Reuse a sift checkpoint only when a 3.1 engine wrote it with status `used`; discard any other.
+  const reusable = loadedSift && versionAtLeast(loadedSift.engineVersion) && loadedSift.status === 'used' ? loadedSift : null;
+  return {
+    loaded: reusable,
+    start: async (findings, extras = {}) => {
+      const res = await siftFn({
+        findings,
+        rebuttals: extras.rebuttals || [],
+        scope: await materialScopeOf(request, runChild),
+        repoRoot: request.repoRoot,
+        runDir,
+        stage: request.stage,
+        config,
+        env,
+        signal: siftAbort.signal,
+      });
+      res.engineVersion = ENGINE_VERSION;
+      // An aborted or failed sift writes no checkpoint and never overwrites one.
+      if (!siftAbort.signal.aborted && !['all-failed', 'failed'].includes(res.reason)) await writeCp(runDir, 'sift', res);
+      return res;
+    },
+    abort: () => siftAbort.abort(),
+  };
+}
+
 export function routeKeyOf(stage) {
   return ROUTE_KEYS[stage] || stage.toLowerCase();
 }

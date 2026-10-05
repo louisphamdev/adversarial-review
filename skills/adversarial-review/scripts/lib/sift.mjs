@@ -1,43 +1,14 @@
-import { readFile as defaultReadFile } from 'node:fs/promises';
-import { findKey, resolveJevTarget, DEFAULT_URL, DEFAULT_MODEL, TYPESAFE_API_URL, TYPESAFE_DEFAULT_MODEL } from './jev.mjs';
+// The decision sift: one focused Jev request per finding, scoped to the reviewed material.
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { askJev, resolveJevTarget, mapLimit, capText, appendJevLog, isSecretPath, findKey, JEV_STATE_CAP } from './jev.mjs';
 
-export { findKey, DEFAULT_URL, DEFAULT_MODEL, TYPESAFE_API_URL, TYPESAFE_DEFAULT_MODEL };
+export { findKey, DEFAULT_URL, DEFAULT_MODEL, TYPESAFE_API_URL, TYPESAFE_DEFAULT_MODEL } from './jev.mjs';
 
-// Criteria legend is sent with each question; keep labels concise to save tokens.
-export const VERDICTS = {
-  confirmed: 'evidence holds, failure is concrete',
-  disputed: 'evidence partial or unverifiable',
-  refuted: 'material proves it is not a defect',
-  advisory: 'real but not blocking: naming, style, taste',
-};
-
-export const SEVERITY = ['advisory', 'should fix', 'blocks release'];
-
-export const MAX_STATE_CHARS = 100000;
-export const DEFAULT_TIMEOUT_MS = 60000;
-export const DEFAULT_LOW_CONFIDENCE = 0.6;
-
-// Jev evaluates questions against state; material and each finding are written once.
-export function buildState(materialText, findings) {
-  const text = typeof materialText === 'object' && materialText !== null
-    ? (materialText.text ?? '')
-    : (materialText ?? '');
-  const lines = (findings || []).map((f) => {
-    const claim = f.claim ?? f.title ?? '';
-    return `${f.id} [${f.seat}] ${claim}${f.evidence ? ` | ${f.evidence}` : ''}`;
-  });
-  return `MATERIAL\n${text}\n\nFINDINGS\n${lines.join('\n')}`;
-}
-
-// Question instructions point to finding id; the key and criteria carry the axis.
-export function buildQuestions(findings) {
-  const questions = {};
-  for (const f of findings || []) {
-    questions[`${f.id}_verdict`] = { type: 'choice', instructions: f.id, criteria: VERDICTS };
-    questions[`${f.id}_severity`] = { type: 'score', instructions: `${f.id} severity`, criteria: SEVERITY };
-  }
-  return questions;
-}
+const EXCERPT_CAP = 3000;
+const MARGIN = 6;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const slash = (p) => String(p ?? '').replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => `${d.toLowerCase()}:`);
 
 // Clusters findings by file/line or claim to detect duplicate issues across seats.
 export function clusterFindings(findings = [], rows = []) {
@@ -79,202 +50,234 @@ export function clusterFindings(findings = [], rows = []) {
   return clusters;
 }
 
-// Sifts findings with Jev; never throws and returns skipped status on any failure.
-export async function siftFindings({
-  material,
-  findings,
-  config = {},
-  env = process.env,
-  fetchImpl = fetch,
-  fetch: fetchAlias,
-  readFile = defaultReadFile,
-  readFileImpl,
-} = {}) {
+// The excerpt scope: the only files whose lines may leave the machine (spec B8).
+export async function materialScopeOf(request = {}, runChild) {
+  const root = slash(request.repoRoot || '');
+  const join = (base, rel) => slash(path.posix.join(slash(base), slash(rel)));
+  const kind = request.materialKind || request.material?.kind;
+  const scope = { files: [], runMaterial: request.materialPath ? slash(request.materialPath) : null };
+  if (kind === 'diff') {
+    const text = String(request.material?.text ?? '');
+    const untracked = text.match(/^# Untracked files[^\n]*\n([\s\S]*?)(?:\n\n|$)/m);
+    if (untracked) for (const l of untracked[1].split('\n').map((s) => s.trim()).filter(Boolean)) scope.files.push(join(root, l));
+    for (const m of text.matchAll(/^diff --git a\/.* b\/(.*)$/gm)) scope.files.push(join(root, m[1]));
+  } else if (kind === 'file') {
+    const t = request.material?.targetPath || request.target;
+    if (t) scope.files.push(slash(t));
+  } else if (kind === 'dir' || kind === 'directory') {
+    // Fail closed: outside git, or when git fails, the scope stays empty.
+    const dir = slash(request.material?.path || request.target || root);
+    if (typeof runChild === 'function') {
+      const r = await runChild({ cmd: 'git', args: ['-c', 'core.quotepath=false', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd: dir });
+      if (r.code === 0) for (const rel of r.stdout.split('\0').filter(Boolean)) scope.files.push(join(dir, rel));
+    }
+  }
+  scope.files = [...new Set(scope.files)];
+  return scope;
+}
+
+function citedLines(f, base) {
+  const nums = [];
+  for (const m of String(f.line ?? '').matchAll(/(\d+)(?:\s*-\s*(\d+))?/g)) nums.push([Number(m[1]), Number(m[2] ?? m[1])]);
+  for (const m of String(f.evidence ?? '').matchAll(/([\w.\-/\\]+):(\d+)(?:-(\d+))?/g)) {
+    if (path.basename(slash(m[1])) === base) nums.push([Number(m[2]), Number(m[3] ?? m[2])]);
+  }
+  return nums;
+}
+
+export async function buildExcerpt(finding = {}, { scope = { files: [], runMaterial: null }, repoRoot = '', runDir = '' } = {}) {
+  if (!finding.file) return { text: '', action: 'missing' };
+  const rel = slash(finding.file);
+  const base = path.posix.basename(rel);
+  // 1. Resolve the cited path.
+  const cited = (base === 'material.txt' || base === 'material.diff') && scope.runMaterial
+    ? scope.runMaterial
+    : slash(path.resolve(repoRoot || '.', rel));
+  // 2. Secret patterns on every segment of the cited path, case-insensitive.
+  if (isSecretPath(rel) || isSecretPath(cited)) return { text: '', action: 'secret_path' };
+  // 3. lstat, realpath, and the secret patterns again on the realpath.
+  let st;
+  let real;
   try {
-    const siftCfg = (config && 'sift' in config && typeof config.sift === 'object') ? config.sift : (config || {});
-    const fnFetch = fetchAlias || fetchImpl || globalThis.fetch;
-    const fnReadFile = readFileImpl || readFile || defaultReadFile;
-
-    if (siftCfg.enabled === false) {
-      return { status: 'skipped', reason: 'disabled', rows: [], readingOrder: [] };
-    }
-
-    const key = await findKey(siftCfg, env, fnReadFile);
-    if (!key) {
-      return { status: 'skipped', reason: 'no-key', rows: [], readingOrder: [] };
-    }
-
-    if (!Array.isArray(findings) || findings.length === 0) {
-      return { status: 'skipped', reason: 'no-findings', rows: [], readingOrder: [] };
-    }
-
-    if (material?.kind === 'dir' || material?.kind === 'directory') {
-      return { status: 'skipped', reason: 'material-is-directory', rows: [], readingOrder: [] };
-    }
-
-    const materialText = typeof material === 'object' && material !== null ? (material.text ?? '') : (material ?? '');
-    const state = buildState(materialText, findings);
-    if (state.length > MAX_STATE_CHARS) {
-      return { status: 'skipped', reason: 'state-over-budget', rows: [], readingOrder: [] };
-    }
-
-    const timeoutMs = typeof siftCfg.timeoutMs === 'number' ? siftCfg.timeoutMs : DEFAULT_TIMEOUT_MS;
-    // A ref'd timer, not AbortSignal.timeout (unref'd): it must fire even when nothing else holds the loop.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const signal = controller.signal;
-    const { url, model } = resolveJevTarget(siftCfg, env);
-    const questions = buildQuestions(findings);
-
-    let res;
-    try {
-      res = await fnFetch(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ model, state, questions }),
-        signal,
-      });
-    } catch (err) {
-      clearTimeout(timer);
-      if (err?.name === 'AbortError' || err?.name === 'TimeoutError' || signal.aborted) {
-        return { status: 'skipped', reason: 'timeout', rows: [], readingOrder: [] };
-      }
-      return { status: 'skipped', reason: 'network', rows: [], readingOrder: [] };
-    }
-
-    if (!res.ok) {
-      clearTimeout(timer);
-      await res.text().catch(() => {});
-      return { status: 'skipped', reason: `http-${res.status}`, rows: [], readingOrder: [] };
-    }
-
-    let text;
-    try {
-      text = await res.text();
-    } catch (err) {
-      clearTimeout(timer);
-      if (err?.name === 'AbortError' || err?.name === 'TimeoutError' || signal.aborted) {
-        return { status: 'skipped', reason: 'timeout', rows: [], readingOrder: [] };
-      }
-      return { status: 'skipped', reason: 'network', rows: [], readingOrder: [] };
-    }
-
-    clearTimeout(timer);
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return { status: 'skipped', reason: 'bad-response', rows: [], readingOrder: [] };
-    }
-
-    if (!data || typeof data !== 'object' || !data.answers || typeof data.answers !== 'object') {
-      return { status: 'skipped', reason: 'bad-response', rows: [], readingOrder: [] };
-    }
-
-    const rows = [];
-    for (const f of findings) {
-      const v = data.answers[`${f.id}_verdict`];
-      const s = data.answers[`${f.id}_severity`];
-      if (!v || !s || typeof v !== 'object' || typeof s !== 'object' || typeof v.choice !== 'string') {
-        return { status: 'skipped', reason: 'bad-response', rows: [], readingOrder: [] };
-      }
-      const confidence = typeof v.confidence === 'number' ? Number(v.confidence.toFixed(3)) : 0;
-      const severity = typeof s.score === 'number' ? Number(s.score.toFixed(2)) : 0;
-      rows.push({
-        id: f.id,
-        seat: f.seat,
-        verdict: v.choice,
-        confidence,
-        severity,
-      });
-    }
-
-    rows.sort((a, b) => b.severity - a.severity || a.confidence - b.confidence);
-
-    const lowConfidence = typeof siftCfg.lowConfidence === 'number' ? siftCfg.lowConfidence : DEFAULT_LOW_CONFIDENCE;
-    const lowConfRows = rows.filter((r) => r.confidence < lowConfidence).sort((a, b) => a.confidence - b.confidence);
-    const readingOrder = lowConfRows.map((r) => r.id);
-
-    const filteredOut = rows.filter((r) => r.verdict === 'refuted' && r.confidence >= 0.85).map((r) => r.id);
-    const highConfidenceConfirmed = rows.filter((r) => r.verdict === 'confirmed' && r.confidence >= 0.8).map((r) => r.id);
-    const clusters = clusterFindings(findings, rows);
-
-    const result = {
-      status: 'used',
-      rows,
-      readingOrder,
-      filteredOut,
-      highConfidenceConfirmed,
-      clusters,
-    };
-    if (data.model) result.model = data.model;
-    if (data.usage) result.usage = data.usage;
-    return result;
+    st = await fs.lstat(cited);
+    real = slash(await fs.realpath(cited));
   } catch {
-    return { status: 'skipped', reason: 'network', rows: [], readingOrder: [] };
+    return { text: '', action: 'missing' };
+  }
+  if (isSecretPath(real)) return { text: '', action: 'secret_path' };
+  const roots = [];
+  const viaRoot = [];
+  for (const r of [repoRoot, runDir]) {
+    if (!r) continue;
+    try {
+      const realRoot = slash(await fs.realpath(r)).replace(/\/$/, '');
+      roots.push(realRoot);
+      if (real.startsWith(`${realRoot}/`)) viaRoot.push(slash(path.posix.join(slash(r), real.slice(realRoot.length + 1))));
+    } catch {
+      // A missing root cannot contain the file.
+    }
+  }
+  // 4. Scope membership: the cited path, or, when a link sits anywhere on the path, its realpath.
+  const inScope = (p) => p === scope.runMaterial || scope.files.includes(p);
+  const linked = st.isSymbolicLink() || !viaRoot.concat(real).includes(cited);
+  if (linked ? !(inScope(real) || viaRoot.some(inScope)) : !inScope(cited)) return { text: '', action: 'not_in_material' };
+  // 5. Root containment of the realpath.
+  if (!roots.some((r) => real === r || real.startsWith(`${r}/`))) return { text: '', action: 'outside_root' };
+  // 6. Size, then 7. read the realpath that was tested.
+  const rst = await fs.stat(real);
+  if (rst.size > MAX_FILE_BYTES) return { text: '', action: 'too_large' };
+  const lines = (await fs.readFile(real, 'utf8')).split(/\r?\n/);
+  const keep = new Set();
+  for (const [a, b] of citedLines(finding, base)) {
+    for (let i = Math.max(1, a - MARGIN); i <= Math.min(lines.length, b + MARGIN); i++) keep.add(i);
+  }
+  let out = '';
+  let prev = 0;
+  for (const i of [...keep].sort((x, y) => x - y)) {
+    const line = `${i}: ${lines[i - 1]}\n`;
+    if (out.length + line.length > EXCERPT_CAP) {
+      out += '...(cut)\n';
+      break;
+    }
+    if (prev && i !== prev + 1) out += '...\n';
+    out += line;
+    prev = i;
+  }
+  return { text: out, action: 'asked' };
+}
+
+export function buildSiftState({ stage = 'code', finding = {}, excerpt = '', challenges = '' }) {
+  const head = `REVIEW STAGE: ${stage} review. The MATERIAL EXCERPT is the only part of the reviewed material shown here.`;
+  const fields = {
+    title: String(finding.title ?? ''),
+    detail: String(finding.detail ?? ''),
+    evidence: String(finding.evidence ?? ''),
+    doneWhen: String(finding.doneWhen ?? ''),
+  };
+  let ex = String(excerpt ?? '');
+  let ch = String(challenges ?? '');
+  const render = () =>
+    [
+      head,
+      `FINDING (claimed severity ${finding.severity ?? 'unknown'}, raised by the ${finding.seat ?? 'unknown'} reviewer)\nTitle: ${fields.title}\nDetail: ${fields.detail}\nEvidence cited: ${fields.evidence}\nFixed when: ${fields.doneWhen}`,
+      `MATERIAL EXCERPT\n${ex || '(no excerpt)'}`,
+      ch ? `CHALLENGES AND OWNER ANSWER\n${ch}` : '',
+    ].filter(Boolean).join('\n\n');
+  let state = render();
+  let cut = false;
+  if (state.length > JEV_STATE_CAP) { cut = true; ex = capText(ex, 1000); state = render(); }
+  if (state.length > JEV_STATE_CAP) { ch = capText(ch, 1000); state = render(); }
+  if (state.length > JEV_STATE_CAP) { fields.detail = capText(fields.detail, 500); state = render(); }
+  if (state.length > JEV_STATE_CAP) {
+    for (const k of Object.keys(fields)) fields[k] = capText(fields[k], 900);
+    state = render();
+  }
+  if (state.length > JEV_STATE_CAP) state = capText(state, JEV_STATE_CAP);
+  return { state, cut };
+}
+
+export function SIFT_QUESTIONS(disputed) {
+  const q = {
+    grounded: {
+      type: 'choice',
+      instructions: 'Does the MATERIAL EXCERPT contain the text or code that the evidence quotes or cites?',
+      criteria: { yes: 'the cited text is in the excerpt', partly: 'some of it is in the excerpt, some is not shown', no: 'the excerpt does not contain it, or contradicts the quote' },
+    },
+    happens: {
+      type: 'choice',
+      instructions: 'Read the excerpt as written. Does the failure described in the FINDING actually occur?',
+      criteria: { happens: 'a realistic input, caller, or reader triggers the described failure', unclear: 'the excerpt alone cannot show whether it occurs', does_not: 'the excerpt shows it cannot occur or is already handled' },
+    },
+    impact: {
+      type: 'score',
+      instructions: 'If the failure occurs, how bad is the consequence for the user of this software?',
+      criteria: ['wording, naming, or taste only', 'wrong only in a rare corner case', 'wrong in normal use, a security hole, or data loss'],
+    },
+  };
+  if (disputed) {
+    q.survives = {
+      type: 'choice',
+      instructions: 'Weigh the CHALLENGES against the OWNER ANSWER. Does the finding survive?',
+      criteria: { survives: 'the owner answer meets every challenge and the defect remains', falls: 'the owner withdrew, or a challenge shows the claim is wrong, unreachable, or out of scope' },
+    };
+  }
+  return q;
+}
+
+const P = (row, q, label) => row?.p?.[q]?.[label] ?? 0;
+
+export function readingOrderOf(rows = []) {
+  const used = rows.filter((r) => r.status === 'used');
+  const doubt = (r) => Math.max(P(r, 'happens', 'does_not'), P(r, 'survives', 'falls'));
+  const first = used.filter((r) => doubt(r) >= 0.5).sort((a, b) => doubt(b) - doubt(a));
+  const rest = used.filter((r) => doubt(r) < 0.5).sort((a, b) => P(a, 'grounded', 'yes') - P(b, 'grounded', 'yes'));
+  return [...first, ...rest].map((r) => r.id);
+}
+
+export async function siftFindings({ findings, rebuttals = [], scope = { files: [], runMaterial: null }, repoRoot = '', runDir = '', stage = 'code', config = {}, env = process.env, fetch: f = globalThis.fetch, signal } = {}) {
+  try {
+    const siftCfg = config?.sift && typeof config.sift === 'object' ? config.sift : {};
+    if (siftCfg.enabled === false) return { status: 'skipped', reason: 'disabled', rows: [], readingOrder: [] };
+    const key = await findKey(siftCfg, env);
+    if (!key) return { status: 'skipped', reason: 'no-key', rows: [], readingOrder: [] };
+    if (!Array.isArray(findings) || findings.length === 0) return { status: 'skipped', reason: 'no-findings', rows: [], readingOrder: [] };
+
+    const { url, model } = resolveJevTarget(siftCfg, env);
+    const limit = Number.isInteger(siftCfg.concurrency) ? siftCfg.concurrency : 8;
+    const deadline = typeof siftCfg.timeoutMs === 'number' ? siftCfg.timeoutMs : 60000;
+    const overall = new AbortController();
+    const onAbort = () => overall.abort();
+    if (signal?.aborted) overall.abort();
+    else if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => overall.abort(), deadline);
+    try {
+      const rebById = new Map(rebuttals.map((r) => [r.id, r]));
+      const rows = await mapLimit(findings, limit, async (fnd) => {
+        const reb = rebById.get(fnd.id);
+        const ex = await buildExcerpt(fnd, { scope, repoRoot, runDir }).catch(() => ({ text: '', action: 'missing' }));
+        if (ex.action !== 'asked') await appendJevLog(runDir, { purpose: 'sift', id: fnd.id, action: ex.action, ms: null, stateChars: 0 });
+        const challenges = reb
+          ? `${(reb.challengers || []).map((c) => `- ${c.seat}: ${c.reason}`).join('\n')}\nOWNER ANSWER (stands firm: ${reb.standsFirm})\n${reb.rebuttal ?? ''}`
+          : '';
+        const { state, cut } = buildSiftState({ stage, finding: fnd, excerpt: ex.text, challenges });
+        if (overall.signal.aborted) return { id: fnd.id, seat: fnd.seat, status: 'failed', reason: 'timeout', p: null };
+        const r = await askJev({ url, model, key, state, questions: SIFT_QUESTIONS(Boolean(reb)), fetch: f, signal: overall.signal, timeoutMs: deadline });
+        await appendJevLog(runDir, { purpose: 'sift', id: fnd.id, action: r.ok ? (cut ? 'cut' : 'asked') : 'failed', ms: r.ms ?? null, stateChars: state.length });
+        if (!r.ok) return { id: fnd.id, seat: fnd.seat, status: 'failed', reason: r.reason, p: null };
+        const a = r.answers;
+        return {
+          id: fnd.id,
+          seat: fnd.seat,
+          status: 'used',
+          grounded: a.grounded?.choice ?? null,
+          happens: a.happens?.choice ?? null,
+          impact: typeof a.impact?.score === 'number' ? Number(a.impact.score.toFixed(2)) : null,
+          survives: a.survives?.choice ?? null,
+          p: { grounded: a.grounded?.probabilities ?? null, happens: a.happens?.probabilities ?? null, impact: a.impact?.probabilities ?? null, survives: a.survives?.probabilities ?? null },
+        };
+      });
+      if (rows.every((r) => r.status === 'failed')) return { status: 'skipped', reason: 'all-failed', rows, readingOrder: [] };
+      const clusterRows = rows.map((r) => ({ id: r.id, severity: r.impact ?? 0, confidence: P(r, 'happens', 'happens') }));
+      return { status: 'used', rows, readingOrder: readingOrderOf(rows), clusters: clusterFindings(findings, clusterRows), model };
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  } catch {
+    return { status: 'skipped', reason: 'failed', rows: [], readingOrder: [] };
   }
 }
 
-// Compares judge closingList sources with sift votes; non-sift ids are ignored.
 export function compareSift(sift, ruling, findings = []) {
-  if (!sift || sift.status !== 'used' || !Array.isArray(sift.rows) || !ruling || !Array.isArray(ruling.closingList)) {
-    return { disagreements: [] };
+  if (!sift || sift.status !== 'used' || !Array.isArray(sift.rows) || !ruling) return { disagreements: [] };
+  const kept = new Set((ruling.closingList || []).flatMap((c) => c?.sources || []));
+  for (const a of ruling.advisory || []) for (const f of findings) if (new RegExp(`\\b${String(f.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(a)) kept.add(f.id);
+  const out = [];
+  for (const r of sift.rows) {
+    if (r.status !== 'used') continue;
+    const doubt = Math.max(P(r, 'happens', 'does_not'), P(r, 'survives', 'falls'));
+    if (kept.has(r.id) && doubt >= 0.8) out.push({ id: r.id, type: 'judge-kept-falls', p: doubt });
+    if (!kept.has(r.id) && P(r, 'happens', 'happens') >= 0.8 && (r.impact ?? 0) >= 1.5) out.push({ id: r.id, type: 'judge-dropped-real', p: P(r, 'happens', 'happens') });
   }
-
-  const siftRowById = new Map();
-  for (const row of sift.rows) {
-    siftRowById.set(row.id, row);
-  }
-
-  const keptIds = new Set();
-  for (const item of ruling.closingList) {
-    if (Array.isArray(item?.sources)) {
-      for (const src of item.sources) {
-        keptIds.add(src);
-      }
-    }
-  }
-
-  const disagreements = [];
-  const seenIds = new Set();
-
-  for (const id of keptIds) {
-    const row = siftRowById.get(id);
-    if (!row) continue;
-    if (row.verdict === 'refuted' && row.confidence >= 0.8) {
-      seenIds.add(id);
-      disagreements.push({
-        id,
-        type: 'judge-kept-refuted',
-        reason: 'judge-kept-refuted',
-        verdict: row.verdict,
-        confidence: row.confidence,
-        severity: row.severity,
-      });
-    }
-  }
-
-  const candidateFindings = Array.isArray(findings) && findings.length > 0 ? findings : sift.rows;
-  for (const f of candidateFindings) {
-    const id = f.id;
-    if (keptIds.has(id) || seenIds.has(id)) continue;
-    const row = siftRowById.get(id);
-    if (!row) continue;
-    if (row.verdict === 'confirmed' && row.confidence >= 0.8 && row.severity >= 1.5) {
-      seenIds.add(id);
-      disagreements.push({
-        id,
-        type: 'judge-dropped-confirmed',
-        reason: 'judge-dropped-confirmed',
-        verdict: row.verdict,
-        confidence: row.confidence,
-        severity: row.severity,
-      });
-    }
-  }
-
-  return { disagreements };
+  return { disagreements: out };
 }
