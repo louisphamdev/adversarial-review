@@ -2,7 +2,8 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { runChild as defaultRunChild } from './proc.mjs';
-import { isSecretName, decodeGitPath } from './sandbox.mjs';
+import { isSecretName } from './sandbox.mjs';
+import { materialDiffPaths, containedPath } from './diff-paths.mjs';
 import { safeGitArgs } from './integrity.mjs';
 
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'return', 'function', 'class', 'new', 'else', 'try']);
@@ -21,15 +22,6 @@ export function definedNames(diffText) {
   return [...names];
 }
 
-function changedFiles(diffText) {
-  const out = [];
-  for (const line of String(diffText).split('\n')) {
-    const m = line.match(/^\+\+\+ (.+)$/);
-    if (m && m[1] !== '/dev/null') out.push(decodeGitPath(m[1]).replace(/^b\//, ''));
-  }
-  return [...new Set(out)];
-}
-
 export async function buildContextPack({ material, treeDir, repoRoot, packChars = 60000, runChild = defaultRunChild }) {
   const sections = [];
   let used = 0, skippedSecrets = 0;
@@ -43,14 +35,16 @@ export async function buildContextPack({ material, treeDir, repoRoot, packChars 
   };
   const readTree = async (rel) => {
     if (isSecretName(path.posix.basename(rel))) { skippedSecrets++; return null; }
-    try { return await fs.readFile(path.join(treeDir, rel), 'utf8'); } catch { return null; }
+    const real = await containedPath(treeDir, rel);
+    if (!real) return null;
+    try { return await fs.readFile(real, 'utf8'); } catch { return null; }
   };
 
   add(material.kind === 'diff' ? '.ar-review/material.diff' : 'material', String(material.text || '').slice(0, packChars - 64));
 
   if (material.kind === 'diff') {
     const files = [];
-    for (const rel of changedFiles(material.text)) {
+    for (const rel of materialDiffPaths(material.text)) {
       const text = await readTree(rel);
       if (text != null) files.push({ rel, text });
     }

@@ -5,6 +5,9 @@ import os from 'node:os';
 import { runChild as defaultRunChild } from './proc.mjs';
 import { safeGitArgs, listIntegrityPaths } from './integrity.mjs';
 import { writeFileAtomic } from './fsx.mjs';
+import { materialDiffPaths, containedPath, decodeGitPath } from './diff-paths.mjs';
+
+export { decodeGitPath };
 
 export const PROFILE_STEPS = Object.freeze({ 'weak-find': 8, 'strong-find': 16, short: 4, probe: 2, bench: 16, canary: 10 });
 
@@ -21,37 +24,8 @@ export const hasGlobChars = (p) => /[*?[\]{}]/.test(String(p));
 
 const fwd = (p) => String(p).replace(/\\/g, '/');
 
-export function decodeGitPath(s) {
-  if (!(s.startsWith('"') && s.endsWith('"'))) return s;
-  const bytes = [];
-  const body = s.slice(1, -1);
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i];
-    if (c === '\\') {
-      const n = body[i + 1];
-      if (/[0-7]/.test(n)) {
-        bytes.push(parseInt(body.slice(i + 1, i + 4), 8));
-        i += 3;
-        continue;
-      }
-      const map = { n: 10, t: 9, '"': 34, '\\': 92 };
-      bytes.push(map[n] ?? n.charCodeAt(0));
-      i += 1;
-      continue;
-    }
-    bytes.push(...Buffer.from(c, 'utf8'));
-  }
-  return Buffer.from(bytes).toString('utf8');
-}
-
 function materialPaths(material) {
-  if (material?.kind !== 'diff') return [];
-  const out = new Set();
-  for (const line of String(material.text || '').split('\n')) {
-    const m = line.match(/^\+\+\+ (?:b\/)?(.+)$/);
-    if (m && m[1] !== '/dev/null') out.add(decodeGitPath(m[1]).replace(/^b\//, ''));
-  }
-  return [...out];
+  return material?.kind === 'diff' ? materialDiffPaths(material.text) : [];
 }
 
 export async function planSandbox({ repoRoot, material, runChild = defaultRunChild, hooksDir }) {
@@ -62,12 +36,15 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
   if (!listed) {
     listed = (await listIntegrityPaths(repoRoot, { hooksDir: hooks, runChild })).filter((p) => !p.startsWith('.git/'));
   }
+  // Only the material is untrusted: git ls-files never names a path outside the work tree.
+  const trusted = new Set(listed);
   const all = [...new Set([...listed, ...materialPaths(material)])];
   const files = [];
   let bytes = 0;
   let skippedSecrets = 0;
   let skippedMissing = 0;
   let skippedReserved = 0;
+  let skippedOutside = 0;
   for (const rel of all) {
     if (rel.split('/')[0].toLowerCase() === '.ar-review') { skippedReserved++; continue; }
     if (isSecretName(path.posix.basename(rel))) { skippedSecrets++; continue; }
@@ -79,10 +56,11 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
       continue;
     }
     if (!st.isFile()) { skippedMissing++; continue; }
+    if (!trusted.has(rel) && !(await containedPath(repoRoot, rel))) { skippedOutside++; continue; }
     files.push(rel);
     bytes += st.size;
   }
-  return { files, bytes, skippedSecrets, skippedMissing, skippedReserved };
+  return { files, bytes, skippedSecrets, skippedMissing, skippedReserved, skippedOutside };
 }
 
 async function copyLimited(pairs, limit = 16) {
@@ -107,6 +85,7 @@ export async function createSandbox({ repoRoot, runDir, material, config = {}, r
     bytes: plan.bytes,
     skippedSecrets: plan.skippedSecrets,
     skippedMissing: plan.skippedMissing,
+    skippedOutside: plan.skippedOutside,
   };
   // The caps are read from the listing, before the first copy: a partial tree gives a false view.
   if (plan.files.length > maxFiles || plan.bytes > maxBytes) {

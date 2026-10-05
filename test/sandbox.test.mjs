@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { readFile, writeFile, mkdtemp, rm, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { makeTempRepo } from './helpers/isolated-env.mjs';
+import { materialDiffPaths, containedPath } from '../skills/adversarial-review/scripts/lib/diff-paths.mjs';
 import {
   isSecretName,
   decodeGitPath,
   createSandbox,
+  planSandbox,
   writeProfileConfig,
   writeNamedConfig,
   removeSandbox,
@@ -70,6 +72,79 @@ test('createSandbox copies an untracked file that the diff material adds', async
     assert.equal(await readFile(path.join(r.treeDir, '.ar-review', 'material.diff'), 'utf8'), text);
   } finally {
     await repo.cleanup();
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+// A hunk line that adds `++ <path>` reads as `+++ <path>`, the same as a file header. Only the
+// headers of a `diff --git` section may name a path, so these never leave the reviewer machine.
+test('planSandbox ignores a forged +++ line inside a hunk', async () => {
+  const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+  const outside = await mkdtemp(path.join(tmpdir(), 'ar-out-'));
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    await writeFile(path.join(outside, 'outside.txt'), 'OUTSIDE_SENTINEL');
+    await writeFile(path.join(repo.root, 'untracked.yml'), 'UNTRACKED_SENTINEL');
+    const rel = `../${path.basename(outside)}/outside.txt`;
+    const text = `diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1 +1,3 @@\n-1\n--- a/x\n+++ ${rel}\n+++ untracked.yml\n`;
+    const plan = await planSandbox({ repoRoot: repo.root, material: { kind: 'diff', text }, hooksDir: path.join(runDir, 'hooks') });
+    assert.deepEqual(plan.files, ['a.js']);
+    const r = await createSandbox({ repoRoot: repo.root, runDir, material: { kind: 'diff', text }, config: {} });
+    assert.ok(!existsSync(path.join(r.treeDir, 'untracked.yml')), 'an untracked file named only inside a hunk is not copied');
+  } finally {
+    await repo.cleanup();
+    await rm(outside, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test('materialDiffPaths reads headers only, and decodes before it strips the b/ prefix', () => {
+  const text = [
+    'diff --git a/x.js b/x.js', '--- a/x.js', '+++ b/x.js', '@@ -1 +1 @@', '--- a/y', '+++ b/../y',
+    'diff --git a/gone.js b/gone.js', '--- a/gone.js', '+++ /dev/null', '@@ -1 +0,0 @@', '-g',
+    'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"', '--- "a/caf\\303\\251.txt"', '+++ "b/caf\\303\\251.txt"', '@@ -1 +1 @@',
+    '+++ b/not-a-header.js',
+  ].join('\n');
+  assert.deepEqual(materialDiffPaths(text), ['x.js', ACCENTED]);
+  assert.deepEqual(materialDiffPaths('--- a/x\n+++ b/x\n'), [], 'a header outside a diff --git section is not read');
+});
+
+test('containedPath refuses absolute, drive, UNC, and dot-dot paths, and anything outside the real root', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ar-root-'));
+  try {
+    await mkdir(path.join(root, 'src'), { recursive: true });
+    await writeFile(path.join(root, 'src', 'a.js'), 'a');
+    for (const bad of ['/etc/passwd', 'C:\\x', 'c:x', '\\\\server\\share\\x', '//server/share/x', '../x', 'src/../../x', 'src\\..\\..\\x', 'src/..', '', 'a\0b']) {
+      assert.equal(await containedPath(root, bad), null, JSON.stringify(bad));
+    }
+    assert.equal(await containedPath(root, 'src/missing.js'), null, 'a path with no real target is refused');
+    const real = await containedPath(root, 'src/a.js');
+    assert.ok(real && real.toLowerCase().endsWith(path.join('src', 'a.js').toLowerCase()), String(real));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a diff header that names a path through a link out of the repository is not copied', async (t) => {
+  const repo = await makeTempRepo({ files: { 'a.js': '1' } });
+  const outside = await mkdtemp(path.join(tmpdir(), 'ar-out-'));
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    await writeFile(path.join(outside, 'secret.txt'), 'LINKED_SENTINEL');
+    try {
+      await symlink(outside, path.join(repo.root, 'lnk'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (err) {
+      t.skip(`cannot create a directory link here: ${err.code}`);
+      return;
+    }
+    const text = 'diff --git a/lnk/secret.txt b/lnk/secret.txt\n--- a/lnk/secret.txt\n+++ b/lnk/secret.txt\n@@ -1 +1,2 @@\n-x\n+++ lnk/secret.txt\n';
+    const material = { kind: 'diff', text };
+    const r = await createSandbox({ repoRoot: repo.root, runDir, material, config: {} });
+    assert.ok(!existsSync(path.join(r.treeDir, 'lnk', 'secret.txt')));
+    assert.equal(r.skippedOutside, 1);
+  } finally {
+    await repo.cleanup();
+    await rm(outside, { recursive: true, force: true });
     await rm(runDir, { recursive: true, force: true });
   }
 });
