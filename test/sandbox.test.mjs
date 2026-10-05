@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { makeTempRepo } from './helpers/isolated-env.mjs';
 import { materialDiffPaths, containedPath } from '../skills/adversarial-review/scripts/lib/diff-paths.mjs';
+import { ConfigError } from '../skills/adversarial-review/scripts/lib/errors.mjs';
 import {
   isSecretName,
   decodeGitPath,
@@ -76,6 +77,30 @@ test('createSandbox leaves out secret paths by every part, in any case', async (
     assert.equal(r.skippedSecrets, secrets.length);
   } finally {
     await repo.cleanup();
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+// A full directory walk copies untracked and ignored files into a tree that free providers read.
+// When git cannot list the tracked files, the swarm stops and names the git error instead.
+test('planSandbox stops with a usage error that names the git failure, and never walks the directory', async () => {
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    const cases = [
+      [{ code: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository\n', spawnError: null }, /dubious ownership/],
+      [{ code: null, stdout: '', stderr: '', spawnError: new Error('Executable not found: git') }, /Executable not found: git/],
+      [{ code: 1, stdout: '', stderr: '', spawnError: null }, /exit 1/],
+    ];
+    for (const [res, re] of cases) {
+      const calls = [];
+      const runChild = async (opts) => { calls.push(opts.args); return res; };
+      await assert.rejects(
+        planSandbox({ repoRoot: runDir, material: { kind: 'file', text: '' }, runChild, hooksDir: path.join(runDir, 'hooks') }),
+        (err) => err instanceof ConfigError && err.exitCode === 2 && /git ls-files/.test(err.message) && re.test(err.message)
+      );
+      assert.equal(calls.length, 1, 'no second listing after the failure');
+    }
+  } finally {
     await rm(runDir, { recursive: true, force: true });
   }
 });

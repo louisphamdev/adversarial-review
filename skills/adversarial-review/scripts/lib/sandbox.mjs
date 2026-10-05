@@ -3,7 +3,8 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import { runChild as defaultRunChild } from './proc.mjs';
-import { safeGitArgs, listIntegrityPaths } from './integrity.mjs';
+import { safeGitArgs } from './integrity.mjs';
+import { ConfigError } from './errors.mjs';
 import { writeFileAtomic } from './fsx.mjs';
 import { materialDiffPaths, containedPath, decodeGitPath } from './diff-paths.mjs';
 import { isSecretPath } from './jev.mjs';
@@ -36,10 +37,12 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
   const hooks = hooksDir || path.join(os.tmpdir(), 'ar-empty-hooks');
   await fs.mkdir(hooks, { recursive: true });
   const res = await runChild({ cmd: 'git', args: [...safeGitArgs(hooks), 'ls-files', '-c', '-z'], cwd: repoRoot });
-  let listed = res.code === 0 ? res.stdout.split('\0').filter(Boolean) : null;
-  if (!listed) {
-    listed = (await listIntegrityPaths(repoRoot, { hooksDir: hooks, runChild })).filter((p) => !p.startsWith('.git/'));
+  // No fallback walk: it would copy untracked and ignored files into a tree free providers read.
+  if (res.code !== 0) {
+    const why = String(res.stderr || '').trim() || res.spawnError?.message || `exit ${res.code ?? res.signal}`;
+    throw new ConfigError(`the swarm needs the tracked file list, and git ls-files failed in ${repoRoot}: ${why}`);
   }
+  const listed = res.stdout.split('\0').filter(Boolean);
   // Only the material is untrusted: git ls-files never names a path outside the work tree.
   const trusted = new Set(listed);
   const all = [...new Set([...listed, ...materialPaths(material)])];
