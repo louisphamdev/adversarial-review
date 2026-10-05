@@ -103,7 +103,13 @@ export async function acquireLockWithCleanup(runDir, { stderr } = {}) {
   setActiveRunDir(runDir);
   const lockHolder = { lock: null };
   installCleanupHandler({ stderr, lockHolder });
-  lockHolder.lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  try {
+    lockHolder.lock = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  } catch (err) {
+    // A busy lock means a live owner: a sweep of this run directory would delete its lane config.
+    setActiveRunDir(null);
+    throw err;
+  }
   return lockHolder.lock;
 }
 

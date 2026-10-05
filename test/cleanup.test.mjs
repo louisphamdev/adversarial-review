@@ -177,6 +177,30 @@ test('acquireLockWithCleanup takes the run lock and names the run directory for 
   }
 });
 
+// A busy lock belongs to a live owner. The command that lost the race must not sweep that
+// owner's run directory on its way out: the lanes would lose their config mid-run.
+test('acquireLockWithCleanup that loses the lock leaves the owner run directory alone', async () => {
+  const runDir = await makeRunDir();
+  const owner = await acquireLock(path.join(runDir, 'lock'), { onBusy: 'fail' });
+  try {
+    const result = JSON.stringify({ gateVerdict: 'BLOCK', exitCode: 1 }, null, 2) + '\n';
+    await writeFile(path.join(runDir, 'result.json'), result);
+    await writeFile(path.join(runDir, 'events.jsonl'), '{"event":"start"}\n');
+    const sink = { write: () => {} };
+    await assert.rejects(
+      withExitCleanup({ stderr: sink }, () => acquireLockWithCleanup(runDir, { stderr: sink })),
+      (err) => err.name === 'LockBusyError'
+    );
+    assert.equal(existsSync(path.join(runDir, 'sandbox', 'xdg')), true, 'the owner keeps its lane config');
+    assert.equal(await readFile(path.join(runDir, 'events.jsonl'), 'utf8'), '{"event":"start"}\n', 'no cleanup line');
+    assert.equal(await readFile(path.join(runDir, 'result.json'), 'utf8'), result, 'the owner result is untouched');
+  } finally {
+    await owner.release();
+    setActiveRunDir(null);
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
 // `doctor --probe` and `models research|bench` open lanes through the same canary and lane-call
 // path as `run`. A command that opens a lane and is not wrapped leaks every lane it starts.
 const LANE_COMMANDS = [
