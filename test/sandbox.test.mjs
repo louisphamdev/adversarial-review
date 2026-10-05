@@ -193,6 +193,30 @@ test('a diff header that names a path through a link out of the repository is no
   }
 });
 
+test('a tracked path whose parent directory became a link out of the repository is not copied', async (t) => {
+  const repo = await makeTempRepo({ files: { 'a.js': '1', 'sub/secret.txt': 'tracked' } });
+  const outside = await mkdtemp(path.join(tmpdir(), 'ar-out-'));
+  const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));
+  try {
+    await writeFile(path.join(outside, 'secret.txt'), 'LINKED_SENTINEL');
+    await rm(path.join(repo.root, 'sub'), { recursive: true, force: true });
+    try {
+      await symlink(outside, path.join(repo.root, 'sub'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (err) {
+      t.skip(`cannot create a directory link here: ${err.code}`);
+      return;
+    }
+    const r = await createSandbox({ repoRoot: repo.root, runDir, material: { kind: 'file', text: '' }, config: {} });
+    assert.ok(!existsSync(path.join(r.treeDir, 'sub', 'secret.txt')));
+    assert.ok(existsSync(path.join(r.treeDir, 'a.js')));
+    assert.equal(r.skippedOutside, 1);
+  } finally {
+    await repo.cleanup();
+    await rm(outside, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true });
+  }
+});
+
 test('createSandbox reports a cap breach before copying anything', async () => {
   const repo = await makeTempRepo({ files: { 'a.js': '1', 'b.js': '2' } });
   const runDir = await mkdtemp(path.join(tmpdir(), 'ar-run-'));

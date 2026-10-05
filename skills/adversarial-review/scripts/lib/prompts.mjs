@@ -268,6 +268,7 @@ const SEAT_RE_REVIEW_RULES = [
 // A patch loop that only adds mechanisms grows each round, so a cut comes before an addition.
 const CUT_FIRST = 'Prefer a fix that removes or simplifies a mechanism over a fix that adds one.';
 const PATCH_SEAT_CUT = `${CUT_FIRST}\nMark each new unit that the plan adds (a function, a flag, a mode, a file) as \`oversized\`, unless no cut meets the \`doneWhen\`.`;
+const PATCH_JUDGE_ITEM_ID = 'Fill `itemId` of each revise entry with the C<n> label of its closing item, or with `cross` for the cross-cutting section.';
 const PATCH_JUDGE_CUT = `${CUT_FIRST}\nDemand a cut of each new unit that the plan adds (a function, a flag, a mode, a file), unless no cut meets the \`doneWhen\`.`;
 
 // A verify claim blocks only when it cites a changed line, so the seat must name the side of the line.
@@ -427,6 +428,7 @@ export function buildPrompt(stage, ctx = {}) {
           : 'You ruled on this work in an earlier round. Your earlier demands are below, per open item.\nRule on each earlier demand: met or not-met.',
         'A new demand on an open item blocks only if a seat objection in this round names the same open item.\nA new demand outside the open items blocks only if a seat in this round reports it with a cited delta line, and you verify that the line appears in the DELTA block.\nPut every other new demand in advisory.',
         normStage === 'VERIFY_JUDGE' ? VERIFY_JUDGE_NEW_IN_DIFF : PATCH_JUDGE_CUT,
+        normStage === 'PATCH_JUDGE' ? PATCH_JUDGE_ITEM_ID : '',
         openItemsBlock(open),
         reg.length > 0 ? regressionBlock(reg) : '',
         deltaBlock(ctx.reReview),
@@ -584,7 +586,7 @@ export function buildPrompt(stage, ctx = {}) {
       `=== PATCH PLAN ===\n${planText}`,
       `=== SEAT REVIEWS ===\n${responsesText}`,
       'Decide whether the plan may be applied (APPLY) or requires revision (REVISE). If REVISE, list what must be revised and its doneWhen condition.',
-      'Fill `itemId` of each revise entry with the C<n> label of its closing item, or with `cross` for the cross-cutting section.',
+      PATCH_JUDGE_ITEM_ID,
       PATCH_JUDGE_CUT,
       stageBudgetLine,
       UNTRUSTED_TEXT,

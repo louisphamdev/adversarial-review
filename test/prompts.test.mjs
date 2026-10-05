@@ -23,6 +23,7 @@ import {
   LASTCALL,
   PATCH_SEAT,
   VERIFY_SEAT,
+  PATCH_JUDGE as PATCH_JUDGE_SCHEMA,
 } from '../skills/adversarial-review/scripts/lib/schemas.mjs';
 
 describe('prompts module', () => {
@@ -524,6 +525,18 @@ describe('prompts module', () => {
     const f = buildPrompt('VERIFY_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], reReview: rr({ openItems: [] }) });
     assert.ok(f.includes('This is the final regression pass. Rule only on the seat reviews of the regression-check items.'));
     assert.ok(f.includes('=== OPEN ITEMS ===\n(none)'));
+  });
+
+  it('the patch judge is told to fill itemId in every pass, and the schema requires it', () => {
+    const sentence = 'Fill `itemId` of each revise entry with the C<n> label of its closing item';
+    const closingList = [{ n: 1, item: 'i', doneWhen: 'd', sources: [] }];
+    for (const extra of [{ plan: 'p', closingList }, { reReview: rr() }]) {
+      const p = buildPrompt('PATCH_JUDGE', { ...baseCtx, seat: judge, seatResponses: [], ...extra });
+      assert.ok(p.includes(sentence), JSON.stringify(Object.keys(extra)));
+    }
+    const ruling = (revise) => ({ verdict: 'REVISE', reasons: ['r'], revise });
+    assert.equal(validate(ruling([{ itemId: 'C1', item: 'x', doneWhen: 'd' }]), PATCH_JUDGE_SCHEMA).ok, true);
+    assert.equal(validate(ruling([{ item: 'x', doneWhen: 'd' }]), PATCH_JUDGE_SCHEMA).ok, false);
   });
 
   it('judge re-review shows the regression list; only verify names the final regression pass', () => {

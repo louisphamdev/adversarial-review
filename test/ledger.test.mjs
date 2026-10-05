@@ -189,6 +189,20 @@ describe('applyRound demands', () => {
     assert.equal(control.last.blocking.length, 0);
     assert.deepEqual(control.last.advisory.map((a) => [a.itemId, a.note]), [['C2', 'no-objection']]);
   });
+  it('a seat answer with a finding id such as breaker-2 never binds to C2', () => {
+    const l0 = applyRound(initLedger(three, [], 'code'), rec(1,
+      [{ seat: 'skeptic', askedFor: all, items: all.map((id) => ({ id, plan: 'oversized', reason: 'r1' })), error: null }], [], { reviewedIds: all }));
+    const round2With = (plan) => applyRound(l0, rec(2,
+      [{ seat: 'skeptic', askedFor: all, items: [{ id: 'C1', plan: 'sound', reason: 'ok' }, { id: 'breaker-2', plan, reason: 'r2' }, { id: 'C3', plan: 'sound', reason: 'ok' }], error: null }],
+      [], { reviewedIds: all }));
+    // A sound answer under a finding id does not settle C2: C2 stays open as unanswered.
+    const sound = round2With('sound');
+    assert.equal(sound.items.C2.state, 'open');
+    assert.equal(sound.items.C1.state, 'settled');
+    // An objection under a finding id is unmapped, so it holds every reviewed item, not C2 alone.
+    const objecting = round2With('breaks-my-lens');
+    for (const id of all) assert.equal(objecting.items[id].state, 'open', id);
+  });
   it('a numeric itemId maps to its item', () => {
     const l = round2(['C2'], [{ itemId: 2, item: 'cover the empty case', doneWhen: 'x' }]);
     assert.deepEqual(l.last.blocking.map((b) => b.itemId), ['C2']);

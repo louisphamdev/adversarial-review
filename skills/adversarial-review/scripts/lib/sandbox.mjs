@@ -43,8 +43,7 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
     throw new ConfigError(`the swarm needs the tracked file list, and git ls-files failed in ${repoRoot}: ${why}`);
   }
   const listed = res.stdout.split('\0').filter(Boolean);
-  // Only the material is untrusted: git ls-files never names a path outside the work tree.
-  const trusted = new Set(listed);
+  // A listed path is checked too: a tracked parent directory can be replaced by a link out of the work tree.
   const all = [...new Set([...listed, ...materialPaths(material)])];
   const files = [];
   let bytes = 0;
@@ -63,7 +62,7 @@ export async function planSandbox({ repoRoot, material, runChild = defaultRunChi
       continue;
     }
     if (!st.isFile()) { skippedMissing++; continue; }
-    if (!trusted.has(rel) && !(await containedPath(repoRoot, rel))) { skippedOutside++; continue; }
+    if (!(await containedPath(repoRoot, rel))) { skippedOutside++; continue; }
     files.push(rel);
     bytes += st.size;
   }
