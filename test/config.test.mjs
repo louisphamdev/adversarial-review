@@ -13,7 +13,7 @@ import { makeIsolatedEnv, makeTempRepo } from './helpers/isolated-env.mjs';
 
 test('config module', async (t) => {
   await t.test('isValidModel', () => {
-    assert.equal(isValidModel('intact/antigravity/gemini-3.8-flash'), true);
+    assert.equal(isValidModel('acme/example-model'), true);
     assert.equal(isValidModel('xiaomi/mimo-v2.5-pro#high'), true);
     assert.equal(isValidModel('claude-opus-5-5'), true);
 
@@ -34,7 +34,8 @@ test('config module', async (t) => {
     assert.equal(DEFAULTS.route, 'auto');
     assert.equal(DEFAULTS.routeAsk, true);
     assert.equal(DEFAULTS.budget, 20);
-    assert.equal(DEFAULTS.maxParallel, 4);
+    assert.equal(DEFAULTS.maxParallel, null);
+    assert.deepEqual(DEFAULTS.lanes, { reserveRamMb: 2048, laneRamMb: 400 });
     assert.deepEqual(DEFAULTS.swarm, {
       backend: 'opencode',
       allowFree: false,
@@ -199,6 +200,75 @@ test('config module', async (t) => {
     }
   });
 
+  await t.test('empty user config keeps the lane defaults and no parallel limit', async () => {
+    const { env, home, cleanup: c1 } = await makeIsolatedEnv();
+    const { root, cleanup: c2 } = await makeTempRepo({ git: false });
+    try {
+      const userCfgPath = path.join(home, '.adversarial-review', 'config.json');
+      fs.mkdirSync(path.dirname(userCfgPath), { recursive: true });
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3 }));
+
+      const { config } = loadConfig({ env, repoRoot: root });
+      assert.equal(config.maxParallel, null);
+      assert.equal(config.lanes.reserveRamMb, 2048);
+      assert.equal(config.lanes.laneRamMb, 400);
+    } finally {
+      await c1();
+      await c2();
+    }
+  });
+
+  await t.test('user config merges lanes key by key', async () => {
+    const { env, home, cleanup: c1 } = await makeIsolatedEnv();
+    const { root, cleanup: c2 } = await makeTempRepo({ git: false });
+    try {
+      const userCfgPath = path.join(home, '.adversarial-review', 'config.json');
+      fs.mkdirSync(path.dirname(userCfgPath), { recursive: true });
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3, lanes: { laneRamMb: 300 } }));
+
+      const { config } = loadConfig({ env, repoRoot: root });
+      assert.equal(config.lanes.laneRamMb, 300);
+      assert.equal(config.lanes.reserveRamMb, 2048);
+    } finally {
+      await c1();
+      await c2();
+    }
+  });
+
+  await t.test('user maxParallel that is not a positive integer warns and means no limit', async () => {
+    const { env, home, cleanup: c1 } = await makeIsolatedEnv();
+    const { root, cleanup: c2 } = await makeTempRepo({ git: false });
+    try {
+      const userCfgPath = path.join(home, '.adversarial-review', 'config.json');
+      fs.mkdirSync(path.dirname(userCfgPath), { recursive: true });
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3, maxParallel: 2.5 }));
+
+      const { config, warnings } = loadConfig({ env, repoRoot: root });
+      assert.equal(config.maxParallel, null);
+      assert.ok(warnings.some((w) => w.includes('maxParallel')));
+    } finally {
+      await c1();
+      await c2();
+    }
+  });
+
+  await t.test('user maxParallel that is not a number at all warns and means no limit', async () => {
+    const { env, home, cleanup: c1 } = await makeIsolatedEnv();
+    const { root, cleanup: c2 } = await makeTempRepo({ git: false });
+    try {
+      const userCfgPath = path.join(home, '.adversarial-review', 'config.json');
+      fs.mkdirSync(path.dirname(userCfgPath), { recursive: true });
+      fs.writeFileSync(userCfgPath, JSON.stringify({ version: 3, maxParallel: '4' }));
+
+      const { config, warnings } = loadConfig({ env, repoRoot: root });
+      assert.equal(config.maxParallel, null);
+      assert.ok(warnings.some((w) => w.includes('maxParallel')));
+    } finally {
+      await c1();
+      await c2();
+    }
+  });
+
   await t.test('user config with broken JSON throws ConfigError', async () => {
     const { env, home, cleanup: c1 } = await makeIsolatedEnv();
     const { root, cleanup: c2 } = await makeTempRepo({ git: false });
@@ -348,6 +418,18 @@ test('config module', async (t) => {
         (err) => {
           assert.ok(err instanceof ConfigError);
           assert.ok(err.message.includes('flags.model'));
+          return true;
+        }
+      );
+
+      // `run --model` is repeatable, so the flag arrives as an array. Every element is checked,
+      // and a valid list must pass: rejecting the array made the flag unusable on `run`.
+      loadConfig({ env, repoRoot: root, flags: { model: ['p/m1', 'q/m2'] } });
+      assert.throws(
+        () => loadConfig({ env, repoRoot: root, flags: { model: ['p/m1', '#invalid'] } }),
+        (err) => {
+          assert.ok(err instanceof ConfigError);
+          assert.ok(err.message.includes('#invalid'), err.message);
           return true;
         }
       );

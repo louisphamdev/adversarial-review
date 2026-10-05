@@ -1,0 +1,32 @@
+[
+  {
+    "id": "or-default-eats-zero",
+    "lines": [3, 4],
+    "keywords": ["parseLimit", "||", "zero", "0", "falsy", "nullish", "??", "Number"]
+  },
+  {
+    "id": "empty-page-first",
+    "lines": [9, 10],
+    "keywords": ["page[0]", "empty", "undefined", "first", "guard", "sliceUsers", "out of range"]
+  },
+  {
+    "id": "name-key-collision",
+    "lines": [16, 17],
+    "keywords": ["collision", "toLowerCase", "key", "overwrite", "duplicate", "indexByName", "trim"]
+  },
+  {
+    "id": "retry-non-idempotent-post",
+    "lines": [22, 25],
+    "keywords": ["idempotent", "POST", "retry", "duplicate", "twice", "idempotency", "order"]
+  },
+  {
+    "id": "average-of-empty-list",
+    "lines": [30, 33],
+    "keywords": ["NaN", "empty", "length", "divide", "zero", "averageAge", "0"]
+  },
+  {
+    "id": "page-count-size-zero",
+    "lines": [36, 37],
+    "keywords": ["Infinity", "size", "zero", "0", "pageCount", "divide", "NaN"]
+  }
+]

@@ -4,13 +4,16 @@ import { spawnSync, spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { makeIsolatedEnv, makeTempRepo } from './helpers/isolated-env.mjs';
+import { makeIsolatedEnv, makeTempRepo, makeFakeBins } from './helpers/isolated-env.mjs';
 
 const CLI_PATH = path.resolve('skills/adversarial-review/scripts/adversarial-review.mjs');
 const FAKE_SEAT_PATH = path.resolve('test/fixtures/fake-seat.mjs');
 
 async function setupEnvAndRepo() {
-  const iso = await makeIsolatedEnv();
+  // A hermetic PATH. Every `run` discovers the swarm executable, whatever the route is, so a
+  // real opencode on the developer PATH would answer these spawn cases instead of the fixtures.
+  const bins = await makeFakeBins({});
+  const iso = await makeIsolatedEnv({ [bins.pathKey]: bins.pathEnv });
   const repo = await makeTempRepo({
     git: true,
     files: { 'index.js': 'console.log("hello");\n' },
@@ -39,6 +42,7 @@ async function setupEnvAndRepo() {
   const cleanup = async () => {
     await iso.cleanup();
     await repo.cleanup();
+    await bins.cleanup();
   };
 
   return { iso, repo, cleanup };

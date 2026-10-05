@@ -8,10 +8,10 @@ import {
   loadPrior,
   readStore,
   updateStore,
+  storeLensTiers,
   scoreBench,
-  probe,
   bench,
-  pick,
+  loadLensKey,
 } from '../skills/adversarial-review/scripts/lib/catalog.mjs';
 
 describe('catalog module', () => {
@@ -35,17 +35,80 @@ describe('catalog module', () => {
       };
 
       const res = await discover('opencode', {
-        config: {},
+        config: { backends: { opencode: { exe: '/x/opencode' } } },
         runChild: fakeRunChild,
         stderr,
       });
 
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].cmd, 'opencode');
+      assert.equal(calls[0].cmd, '/x/opencode');
       assert.deepEqual(calls[0].args, ['models']);
       assert.deepEqual(res.candidates, ['a/b', 'c/d#high']);
       assert.equal(res.authoritative, true);
       assert.equal(res.error, undefined);
+    });
+
+    it('opencode discover keeps the error and names a wrapper flag as the hint', async () => {
+      const fakeRunChild = async () => ({ code: 1, signal: null, stdout: '', stderr: 'ERROR Unrecognized flag: --yolo in command opencode models', timedOut: false });
+      const res = await discover('opencode', { config: { backends: { opencode: { exe: '/x/opencode' } } }, runChild: fakeRunChild, stderr: { write: () => {} } });
+      assert.deepEqual(res.candidates, []);
+      assert.match(res.error, /Unrecognized flag/);
+      assert.match(res.hint, /wrapper/);
+      assert.ok(res.notes.some((n) => /Unrecognized flag/.test(n)));
+    });
+
+    it('opencode discover without an executable gives a note with the searched locations', async () => {
+      const res = await discover('opencode', { config: {}, env: { PATH: '', USERPROFILE: '/nohome', HOME: '/nohome' }, exists: async () => false, runChild: async () => { throw new Error('must not run'); }, stderr: { write: () => {} } });
+      assert.deepEqual(res.candidates, []);
+      assert.ok(res.notes.some((n) => /opencode executable not found/.test(n)));
+    });
+
+    it('opencode discover writes every note to the stderr it receives', async () => {
+      const lines = [];
+      const res = await discover('opencode', {
+        config: {},
+        env: { PATH: 'C:\\bin', USERPROFILE: 'C:\\Users\\u' },
+        exists: async () => false,
+        runChild: async () => { throw new Error('must not run'); },
+        stderr: { write: (msg) => lines.push(msg) },
+      });
+      assert.deepEqual(res.candidates, []);
+      assert.ok(
+        lines.some((l) => /^note: opencode executable not found/.test(l)),
+        `expected a note line, got ${JSON.stringify(lines)}`
+      );
+    });
+
+    it('opencode discover writes the failure note to stderr for a non-zero exit', async () => {
+      const lines = [];
+      const fakeRunChild = async () => ({ code: 1, signal: null, stdout: '', stderr: 'ERROR Unrecognized flag: --yolo in command opencode models', timedOut: false });
+      await discover('opencode', {
+        config: { backends: { opencode: { exe: '/x/opencode' } } },
+        runChild: fakeRunChild,
+        stderr: { write: (msg) => lines.push(msg) },
+      });
+      assert.ok(lines.some((l) => /^note: discovery failed:.*Unrecognized flag/.test(l)));
+    });
+
+    it('opencode discover bounds the models call and names a timeout', async () => {
+      // A first-run opencode under a fresh home never answers `models`, and the G2-2 order puts
+      // that call on every route, so an unbounded call hangs the whole engine.
+      let passed = null;
+      const fakeRunChild = async (opts) => {
+        passed = opts;
+        return { code: null, signal: null, stdout: '', stderr: '', timedOut: true };
+      };
+      const res = await discover('opencode', {
+        config: { backends: { opencode: { exe: '/x/opencode' } } },
+        runChild: fakeRunChild,
+        stderr: { write: () => {} },
+      });
+      assert.ok(passed.timeoutMs > 0, 'the models call carries a timeout');
+      assert.deepEqual(res.candidates, []);
+      assert.ok(
+        res.notes.some((n) => /did not answer/.test(n)),
+        `expected a timeout note, got ${JSON.stringify(res.notes)}`
+      );
     });
 
     it('claude backend returns hardcoded models with authoritative: false', async () => {
@@ -275,6 +338,7 @@ describe('catalog module', () => {
           reasoning: false,
           context: 128000,
           textOnly: true,
+          cost: { input: 2.5, output: 10 },
         });
         assert.equal(prior1.get('freecorp/free-model').free, true);
 
@@ -317,12 +381,12 @@ describe('catalog module', () => {
   });
 
   describe('readStore and updateStore', () => {
-    it('readStore returns empty store with version: 3 if file does not exist', async () => {
+    it('readStore returns empty store with version: 4 if file does not exist', async () => {
       const { home, cleanup } = await makeIsolatedEnv();
       try {
         const stateDir = path.join(home, '.state');
         const store = await readStore(stateDir);
-        assert.equal(store.version, 3);
+        assert.equal(store.version, 4);
       } finally {
         await cleanup();
       }
@@ -363,7 +427,7 @@ describe('catalog module', () => {
         ]);
 
         const finalStore = await readStore(stateDir);
-        assert.equal(finalStore.version, 3);
+        assert.equal(finalStore.version, 4);
         assert.ok(finalStore['opencode:model-a'], 'model-a must be present');
         assert.ok(finalStore['opencode:model-b'], 'model-b must be present');
         assert.equal(finalStore['opencode:model-a'].tier, 'top');
@@ -374,332 +438,160 @@ describe('catalog module', () => {
     });
   });
 
-  describe('pick', () => {
+
+  describe('3.1 pool and assignment', () => {
     const prior = new Map([
-      ['provider/top-model', { free: false, toolCall: true, reasoning: true, context: 128000, textOnly: true }],
-      ['provider/std-model', { free: false, toolCall: true, reasoning: false, context: 64000, textOnly: true }],
-      ['provider/free-model', { free: true, toolCall: true, reasoning: true, context: 32000, textOnly: true }],
-      ['provider/unmeasured-1', { free: false, toolCall: true, reasoning: true, context: 100000, textOnly: true }],
+      ['opencode/big-pickle', { free: true }],
+      ['opencode/paid-x', { free: false }],
     ]);
 
-    it('measured top wins over standard', async () => {
-      const now = 1727100000000;
+    it('free comes from price data, never the name', async () => {
+      const { buildPool } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const { pool } = buildPool({
+        candidates: ['opencode/big-pickle', 'opencode/paid-x', 'opencode/looks-free', 'opencode/unknown-free', 'acme/a/b'],
+        prior, store: {}, named: [],
+        probeResults: {
+          'opencode/unknown-free': { costComplete: true, costTotal: 0, tokensTotal: 12 },
+          'opencode/looks-free': { costComplete: false, costTotal: 0, tokensTotal: 12 },
+        },
+      });
+      assert.deepEqual(pool.map((p) => p.model).sort(), ['opencode/big-pickle', 'opencode/unknown-free']);
+      assert.equal(pool.find((p) => p.model === 'opencode/unknown-free').freeSource, 'probe');
+    });
+
+    it('named models join whatever the provider; bad names become notes', async () => {
+      const { buildPool, cleanNamed } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const c = cleanNamed([' acme/a/b ', '', 'nonslash', 'ACME/A/B', 'p/'], ['acme/a/b']);
+      assert.deepEqual(c.named, ['acme/a/b']);
+      assert.equal(c.notes.length, 2);
+      const { pool } = buildPool({ candidates: ['acme/a/b'], prior: new Map(), store: {}, named: c.named, probeResults: {} });
+      assert.deepEqual(pool, [{ model: 'acme/a/b', provider: 'acme', free: false, freeSource: null, named: true }]);
+    });
+
+    it('probe runs all models at once, honors the deadline, and storable() keeps only final answers', async () => {
+      const { probe, storableProbe } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const started = [];
+      const laneCall = async (m) => {
+        started.push(m);
+        if (m === 'slow') await new Promise((r) => setTimeout(r, 300));
+        if (m === 'refused') return { ok: false, errorType: 'provider-refused' };
+        return { ok: true, value: { ok: true }, costTotal: 0, tokensTotal: 5, costComplete: true };
+      };
+      const t0 = Date.now();
+      const r = await probe({ models: ['fast', 'slow', 'refused'], laneCall, deadlineMs: 100 });
+      assert.ok(Date.now() - t0 < 250);
+      assert.deepEqual(started.sort(), ['fast', 'refused', 'slow']);
+      assert.equal(r.fast.callable, true);
+      assert.equal(r.slow.errorType, 'timeout');
+      assert.equal(storableProbe(r.fast), true);
+      assert.equal(storableProbe(r.refused), true);
+      assert.equal(storableProbe(r.slow), false);
+      assert.equal(storableProbe({ errorType: 'rate-limited' }), false);
+    });
+
+    it('assignSeats: strong seats first, distinct models, failover up to 2, unusable never assigned', async () => {
+      const { assignSeats } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const pool = ['m1', 'm2', 'm3'].map((m) => ({ model: m, provider: 'opencode', free: true }));
       const store = {
-        version: 3,
-        'opencode:provider/std-model': {
-          callable: true,
-          tier: 'standard',
-          score: 4,
-          invented: 1,
-          measuredAt: now - 1000,
-        },
-        'opencode:provider/top-model': {
-          callable: true,
-          tier: 'top',
-          score: 6,
-          invented: 0,
-          measuredAt: now - 1000,
-        },
+        'opencode:m1': { callable: true, latencyMs: 10, lenses: { breaker: 'top', edge: 'unusable' } },
+        'opencode:m2': { callable: true, latencyMs: 20, lenses: { breaker: 'standard', edge: 'standard' } },
+        'opencode:m3': { callable: true, latencyMs: 5 },
       };
-
-      const picked = await pick({
-        candidates: ['provider/std-model', 'provider/top-model'],
-        store,
-        prior,
-        route: 'auto',
-        now,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/top-model');
-      assert.equal(picked.tier, 'top');
-      assert.equal(picked.measured, true);
+      const seats = [{ key: 'edge', tier: 'standard' }, { key: 'breaker', tier: 'strong' }];
+      const r = assignSeats({ seats, pool, store });
+      assert.equal(r.breaker.model, 'm1');
+      assert.equal(r.breaker.capability, 'strong');
+      assert.notEqual(r.edge.model, 'm1');
+      assert.equal(r.edge.capability, 'weak');
+      assert.ok(r.edge.failover.length <= 2 && !r.edge.failover.includes('m1'));
+      assert.deepEqual(assignSeats({ seats, pool: [], store }), {});
     });
 
-    it('free model dropped on auto with allowFree: false', async () => {
-      const now = 1727100000000;
-      const store = {
-        version: 3,
-        'opencode:provider/free-model': {
-          callable: true,
-          tier: 'top',
-          score: 6,
-          invented: 0,
-          free: true,
-          measuredAt: now - 1000,
-        },
-        'opencode:provider/std-model': {
-          callable: true,
-          tier: 'standard',
-          score: 4,
-          invented: 1,
-          free: false,
-          measuredAt: now - 1000,
-        },
-      };
-
-      const picked = await pick({
-        candidates: ['provider/free-model', 'provider/std-model'],
-        store,
-        prior,
-        route: 'auto',
-        allowFree: false,
-        now,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/std-model');
-      assert.equal(picked.tier, 'standard');
+    it('updateStore runs an updater under the lock and refuses to overwrite a corrupt file', async () => {
+      const { updateStore, readStore } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const { home, cleanup } = await makeIsolatedEnv();
+      try {
+        const dir = path.join(home, 'state'); await fs.mkdir(dir, { recursive: true });
+        await updateStore(dir, (cur) => ({ ...cur, 'opencode:m': { misbehaved: 1, lenses: { edge: 'top' } } }));
+        await updateStore(dir, (cur) => ({ ...cur, 'opencode:m': { ...cur['opencode:m'], misbehaved: (cur['opencode:m'].misbehaved || 0) + 1, lenses: { ...cur['opencode:m'].lenses, breaker: 'light' } } }));
+        const s = await readStore(dir);
+        assert.equal(s.version, 4);
+        assert.equal(s['opencode:m'].misbehaved, 2);
+        assert.deepEqual(s['opencode:m'].lenses, { edge: 'top', breaker: 'light' });
+        await fs.writeFile(path.join(dir, 'models.json'), '{broken');
+        await assert.rejects(updateStore(dir, (c) => c));
+        assert.equal(await fs.readFile(path.join(dir, 'models.json'), 'utf8'), '{broken');
+      } finally { await cleanup(); }
     });
 
-    it('all measured unusable -> probes unmeasured and returns measured: false', async () => {
-      const now = 1727100000000;
-      const store = {
-        version: 3,
-        'opencode:provider/bad-model': {
-          callable: true,
-          tier: 'unusable',
-          score: 0,
-          invented: 5,
-          measuredAt: now - 1000,
-        },
-      };
-
-      const probed = [];
-      const fakeProbeFn = async (candidate) => {
-        probed.push(candidate);
-        return { callable: true, ok: true };
-      };
-
-      const picked = await pick({
-        candidates: ['provider/bad-model', 'provider/unmeasured-1'],
-        store,
-        prior,
-        route: 'swarm',
-        probeFn: fakeProbeFn,
-        now,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/unmeasured-1');
-      assert.equal(picked.measured, false);
-      assert.deepEqual(probed, ['provider/unmeasured-1']);
+    it('a version-3 top-level tier reads as the breaker lens', async () => {
+      const { readStore } = await import('../skills/adversarial-review/scripts/lib/catalog.mjs');
+      const { home, cleanup } = await makeIsolatedEnv();
+      try {
+        const dir = path.join(home, 'state'); await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, 'models.json'), JSON.stringify({ version: 3, 'opencode:m': { tier: 'top' } }));
+        assert.equal((await readStore(dir))['opencode:m'].lenses.breaker, 'top');
+      } finally { await cleanup(); }
     });
 
-    it('nothing callable -> null', async () => {
-      const store = { version: 3 };
-      const fakeProbeFn = async () => ({ callable: false, ok: false });
-
-      const picked = await pick({
-        candidates: ['provider/unmeasured-1'],
-        store,
-        prior,
-        route: 'auto',
-        probeFn: fakeProbeFn,
-      });
-
-      assert.equal(picked, null);
-    });
-
-    it('candidates without toolCall or non-text output in prior are excluded', async () => {
-      const localPrior = new Map([
-        ['provider/no-tool', { free: false, toolCall: false, reasoning: true, context: 64000, textOnly: true }],
-        ['provider/image-only', { free: false, toolCall: true, reasoning: true, context: 64000, textOnly: false }],
-        ['provider/valid', { free: false, toolCall: true, reasoning: true, context: 64000, textOnly: true }],
-      ]);
-      const probed = [];
-      const fakeProbeFn = async (cand) => {
-        probed.push(cand);
-        return { callable: true };
-      };
-
-      const picked = await pick({
-        candidates: ['provider/no-tool', 'provider/image-only', 'provider/valid'],
-        store: { version: 3 },
-        prior: localPrior,
-        route: 'auto',
-        probeFn: fakeProbeFn,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/valid');
-      assert.deepEqual(probed, ['provider/valid']);
-    });
-
-    it('swarm route prefers free model among equal tiers', async () => {
-      const now = 1727100000000;
-      const store = {
-        version: 3,
-        'opencode:provider/paid-top': {
-          callable: true,
-          tier: 'top',
-          score: 6,
-          invented: 0,
-          free: false,
-          measuredAt: now - 1000,
-        },
-        'opencode:provider/free-top': {
-          callable: true,
-          tier: 'top',
-          score: 5,
-          invented: 0,
-          free: true,
-          measuredAt: now - 1000,
-        },
-      };
-
-      const picked = await pick({
-        candidates: ['provider/paid-top', 'provider/free-top'],
-        store,
-        prior,
-        route: 'swarm',
-        now,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/free-top');
-    });
-
-    it('stale measurement older than maxAgeDays triggers probe fallback', async () => {
-      const now = 1727100000000;
-      const eightDaysMs = 8 * 24 * 3600 * 1000;
-      const store = {
-        version: 3,
-        'opencode:provider/stale-top': {
-          callable: true,
-          tier: 'top',
-          score: 6,
-          invented: 0,
-          measuredAt: now - eightDaysMs,
-        },
-      };
-
-      const probed = [];
-      const fakeProbeFn = async (cand) => {
-        probed.push(cand);
-        return { callable: true };
-      };
-
-      const picked = await pick({
-        candidates: ['provider/stale-top'],
-        store,
-        prior,
-        route: 'auto',
-        maxAgeDays: 7,
-        probeFn: fakeProbeFn,
-        now,
-      });
-
-      assert.ok(picked);
-      assert.equal(picked.model, 'provider/stale-top');
-      assert.equal(picked.measured, false);
-      assert.deepEqual(probed, ['provider/stale-top']);
-    });
-  });
-
-  describe('probe and bench runners', () => {
-    it('probe measures callable, latency, contract, and measuredAt', async () => {
-      const calls = [];
-      const fakeProbeCall = async ({ backend, model }) => {
-        calls.push({ backend, model });
-        return { ok: true, value: { status: 'ok' }, error: null };
-      };
-
-      const res = await probe({
-        backend: 'opencode',
-        models: ['model-1', 'model-2'],
-        probeCall: fakeProbeCall,
-        limit: 1,
-      });
-
-      assert.equal(calls.length, 1);
-      assert.equal(calls[0].model, 'model-1');
-      const entry = res['opencode:model-1'];
-      assert.ok(entry);
-      assert.equal(entry.callable, true);
-      assert.equal(entry.contract, true);
-      assert.equal(typeof entry.latencyMs, 'number');
-      assert.equal(typeof entry.measuredAt, 'number');
-    });
-
-    it('bench runs findings against answer key and stores scores and tier', async () => {
-      const fakeBenchCall = async ({ backend, model }) => {
-        return {
-          ok: true,
-          value: {
-            findings: [
-              { title: 'loop issue', line: '15', detail: 'bound error' },
-              { title: 'vip check', line: '22', detail: 'discount inverted' },
-            ],
-          },
+    it('a second bench run moves the stored breaker lens', async () => {
+      const { home, cleanup } = await makeIsolatedEnv();
+      try {
+        const dir = path.join(home, 'state');
+        await fs.mkdir(dir, { recursive: true });
+        const key = await loadLensKey('breaker');
+        const findAll = key.map((d) => ({ title: d.keywords[0], line: String(d.lines[0]) }));
+        // The CLI `models bench` path: bench() -> storeLensTiers().
+        const runBench = async (hits) => {
+          const res = await bench({
+            models: ['m'],
+            lenses: ['breaker'],
+            benchCallFor: () => async () => ({ ok: true, value: { findings: findAll.slice(0, hits) } }),
+            deadlineMs: 1000,
+          });
+          await storeLensTiers(dir, {
+            backend: 'opencode',
+            model: 'm',
+            tiers: { breaker: res.m.breaker.tier },
+          });
+          return (await readStore(dir))['opencode:m'];
         };
-      };
 
-      const answerKey = [
-        { id: 'loop', lines: [14, 17], keywords: ['loop', 'bound'] },
-        { id: 'discount', lines: [21, 23], keywords: ['discount', 'vip'] },
-      ];
-
-      const res = await bench({
-        backend: 'opencode',
-        models: ['model-1'],
-        benchCall: fakeBenchCall,
-        answerKey,
-        limit: 1,
-      });
-
-      const entry = res['opencode:model-1'];
-      assert.ok(entry);
-      assert.equal(entry.callable, true);
-      assert.equal(entry.contract, true);
-      assert.equal(entry.score, 2);
-      assert.equal(entry.invented, 0);
-      assert.equal(entry.tier, 'light');
+        assert.equal((await runBench(2)).lenses.breaker, 'light');
+        assert.equal((await runBench(key.length)).lenses.breaker, 'top');
+      } finally { await cleanup(); }
     });
 
-    it('bench marks tier unusable when contract fails', async () => {
-      const failingBenchCall = async () => {
-        return {
-          ok: false,
-          error: 'parse error in model response',
-          raw: 'not valid json',
-        };
-      };
-
-      const res = await bench({
-        backend: 'opencode',
-        models: ['model-bad'],
-        benchCall: failingBenchCall,
-        limit: 1,
-      });
-
-      const entry = res['opencode:model-bad'];
-      assert.ok(entry);
-      assert.equal(entry.callable, true);
-      assert.equal(entry.contract, false);
-      assert.equal(entry.tier, 'unusable');
+    it('updateStore in object form merges lensMeasuredAt per lens, like lenses', async () => {
+      const { home, cleanup } = await makeIsolatedEnv();
+      try {
+        const dir = path.join(home, 'state');
+        await fs.mkdir(dir, { recursive: true });
+        await updateStore(dir, { 'opencode:m': { lenses: { edge: 'top' }, lensMeasuredAt: { edge: 111 } } });
+        await updateStore(dir, { 'opencode:m': { lenses: { medic: 'light' }, lensMeasuredAt: { medic: 222 } } });
+        const stored = (await readStore(dir))['opencode:m'];
+        assert.deepEqual(stored.lenses, { edge: 'top', medic: 'light' });
+        assert.deepEqual(stored.lensMeasuredAt, { edge: 111, medic: 222 });
+      } finally { await cleanup(); }
     });
 
-    it('bench loads default answer key if none provided', async () => {
-      const benchCall = async () => ({
-        ok: true,
-        value: {
-          findings: [
-            { title: 'unawaited promise', line: '8', detail: 'async getExchangeRates not awaited', evidence: 'rates' },
-          ],
-        },
-      });
-
-      const res = await bench({
-        backend: 'opencode',
-        models: ['model-default-key'],
-        benchCall,
-        limit: 1,
-      });
-
-      const entry = res['opencode:model-default-key'];
-      assert.ok(entry);
-      assert.equal(entry.score, 1);
+    it('storeLensTiers stamps only the lenses the caller measured', async () => {
+      const { home, cleanup } = await makeIsolatedEnv();
+      try {
+        const dir = path.join(home, 'state');
+        await fs.mkdir(dir, { recursive: true });
+        await updateStore(dir, { 'opencode:m': { lenses: { edge: 'top' }, lensMeasuredAt: { edge: 111 } } });
+        await storeLensTiers(dir, {
+          backend: 'opencode',
+          model: 'm',
+          tiers: { edge: 'top', medic: 'light', racer: 'unmeasured' },
+          measured: ['medic'],
+          now: () => 999,
+        });
+        const stored = (await readStore(dir))['opencode:m'];
+        assert.deepEqual(stored.lenses, { edge: 'top', medic: 'light' });
+        assert.deepEqual(stored.lensMeasuredAt, { edge: 111, medic: 999 });
+      } finally { await cleanup(); }
     });
   });
 });

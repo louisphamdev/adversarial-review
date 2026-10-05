@@ -59,6 +59,16 @@ export async function resolveBackend(name, { config = {}, env = process.env } = 
     return { name: 'custom', exe, command };
   }
 
+  // opencode has its own lookup: a .cmd wrapper on PATH adds flags opencode v2 rejects, so the
+  // generic PATHEXT resolution is wrong for this backend (spec A1).
+  if (name === 'opencode') {
+    const { exe, searched } = await opencodeBackend.resolveOpencodeExe(config, env);
+    if (!exe) {
+      throw new ConfigError(`opencode executable not found. Searched: ${searched.join(', ')}`);
+    }
+    return { name, exe };
+  }
+
   const exeName = config?.backends?.[name]?.exe || name;
   const exe = await resolveExecutable(exeName, env);
   if (!exe) {
@@ -107,12 +117,13 @@ async function writeAttemptLog(callsDir, callId, startN, content) {
  * @param {string} [call.effort]
  * @param {number} [call.timeoutMs]
  * @param {number} [call.attemptBase=0]
+ * @param {Function} [call.onEvent]
  * @param {object} options
  * @param {string|object} options.backend
  * @param {Function} [options.runChild]
  * @param {object} [options.fs]
  * @param {Function} [options.log]
- * @returns {Promise<{ ok: boolean, value: any, raw: string, error: string|null, attempts: number }>}
+ * @returns {Promise<{ ok: boolean, value: any, raw: string, error: string|null, attempts: number, costTotal?: number|null, tokensTotal?: number|null, costComplete?: boolean, toolRefusals?: number, stepCount?: number, errorType?: string|null, model?: string|null }>}
  */
 export async function runSeatCall(call, options = {}) {
   if (call.model !== undefined && call.model !== null && !isValidModel(call.model)) {
@@ -174,6 +185,7 @@ export async function runSeatCall(call, options = {}) {
     isCmdShim,
     command: backendObj.command,
     config: options.config,
+    env: options.env || process.env,
   };
 
   const built = adapter.build(call, ctx);
@@ -209,15 +221,24 @@ export async function runSeatCall(call, options = {}) {
     spawnArgs = built.args || [];
   }
 
-  const childEnv = {
-    ...(options.env || process.env),
-    ...(backendObj.env || {}),
-    ...(built.env || {}),
-  };
+  // The opencode adapter already scrubbed the parent environment, so merging it back here
+  // would undo the scrub and hand every secret to the lane.
+  const childEnv =
+    adapter === opencodeBackend
+      ? { ...(built.env || {}) }
+      : {
+          ...(options.env || process.env),
+          ...(backendObj.env || {}),
+          ...(built.env || {}),
+        };
 
   let attempts = 0;
   let lastN = call.attemptBase || 0;
   let currentPrompt = call.prompt;
+
+  const applyRetry = (reason) => {
+    currentPrompt = `${call.prompt}\n\nYour previous answer failed: ${reason}. Answer again with ONE fenced json block.`;
+  };
 
   while (attempts < 2) {
     attempts++;
@@ -227,14 +248,45 @@ export async function runSeatCall(call, options = {}) {
       await writeFileFn(promptPath, currentPrompt);
     }
 
+    const events = [];
+    const parser =
+      typeof adapter.createEventParser === 'function'
+        ? adapter.createEventParser((evt) => {
+            events.push(evt);
+            if (typeof call.onEvent === 'function') {
+              try {
+                call.onEvent(evt);
+              } catch {
+                // listener errors are ignored
+              }
+            }
+          })
+        : null;
+
     const childRes = await runChildFn({
       cmd: spawnCmd,
       args: spawnArgs,
-      cwd: call.cwd,
+      cwd: built.cwd || call.cwd,
       env: childEnv,
       stdin: currentPrompt,
       timeoutMs: call.timeoutMs,
+      onStdout: parser ? (c) => parser.push(c) : undefined,
     });
+    if (parser) parser.end();
+
+    const summary = typeof adapter.summarizeEvents === 'function' ? adapter.summarizeEvents(events) : {};
+    const extra = {
+      costTotal: summary.costTotal ?? null,
+      tokensTotal: summary.tokensTotal ?? null,
+      costComplete: summary.costComplete ?? false,
+      toolRefusals: summary.toolRefusals ?? 0,
+      stepCount: summary.stepCount ?? 0,
+      errorType: summary.errorType ?? null,
+      model: call.model ?? null,
+      // The canary judges the boundary from the refused tool calls, so the parsed events of
+      // the returned attempt leave this function with the result.
+      events,
+    };
 
     const logContent = [
       '=== ARGV ===',
@@ -257,6 +309,8 @@ export async function runSeatCall(call, options = {}) {
         raw: '',
         error: 'timeout',
         attempts,
+        ...extra,
+        errorType: 'timeout',
       };
     }
 
@@ -267,13 +321,15 @@ export async function runSeatCall(call, options = {}) {
         raw: '',
         error: 'spawn',
         attempts,
+        ...extra,
+        errorType: 'spawn',
       };
     }
 
     if (childRes.code !== 0) {
       const exitErr = `exit-${childRes.code !== null ? childRes.code : (childRes.signal || 1)}`;
       if (attempts === 1) {
-        currentPrompt = `${call.prompt}\n\nYour previous answer failed: ${exitErr}. Answer again with ONE fenced json block.`;
+        applyRetry(exitErr);
         continue;
       }
       return {
@@ -282,6 +338,7 @@ export async function runSeatCall(call, options = {}) {
         raw: '',
         error: exitErr,
         attempts: 2,
+        ...extra,
       };
     }
 
@@ -294,7 +351,27 @@ export async function runSeatCall(call, options = {}) {
       }
     }
 
-    const raw = adapter.extract({ stdout: childRes.stdout, outFileText });
+    const extracted = adapter.extract({ stdout: childRes.stdout, outFileText, events });
+
+    if (extracted && typeof extracted === 'object' && extracted.error) {
+      // A refusal and a missing model do not change on a second ask.
+      const fatal = extracted.error === 'provider-refused' || extracted.error === 'not-found';
+      if (!fatal && attempts === 1) {
+        applyRetry(`${extracted.error}: ${extracted.message || ''}`);
+        continue;
+      }
+      return {
+        ok: false,
+        value: null,
+        raw: '',
+        error: extracted.error,
+        attempts,
+        ...extra,
+        errorType: extracted.error,
+      };
+    }
+
+    const raw = extracted;
     const parseRes = parseStructured(raw, call.schema);
 
     if (parseRes.ok) {
@@ -304,12 +381,13 @@ export async function runSeatCall(call, options = {}) {
         raw,
         error: null,
         attempts,
+        ...extra,
       };
     }
 
     const parseErr = `parse: ${parseRes.error}`;
     if (attempts === 1) {
-      currentPrompt = `${call.prompt}\n\nYour previous answer failed: ${parseErr}. Answer again with ONE fenced json block.`;
+      applyRetry(parseErr);
       continue;
     }
 
@@ -319,6 +397,7 @@ export async function runSeatCall(call, options = {}) {
       raw,
       error: parseErr,
       attempts: 2,
+      ...extra,
     };
   }
 }

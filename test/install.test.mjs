@@ -87,15 +87,10 @@ test('golden target lists per host (relative to fake home)', async () => {
       assert.ok(res.written.length > 0);
       const skillFile = path.join(home, '.agents', 'skills', 'adversarial-review', 'scripts', 'lib', 'version.mjs');
       await fs.access(skillFile);
-      const agentFile = path.join(home, '.config', 'opencode', 'agents', 'adversarial-review-seat.md');
-      const agentContent = await fs.readFile(agentFile, 'utf8');
-      assert.ok(agentContent.includes('permissions:'));
-      assert.ok(agentContent.includes('action: shell'));
-      assert.ok(agentContent.includes('action: edit'));
-      assert.ok(agentContent.includes('action: webfetch'));
-      assert.ok(agentContent.includes('action: websearch'));
-      assert.ok(agentContent.includes('action: subagent'));
-      assert.ok(agentContent.includes('action: question'));
+      // v2 lanes get their permissions from the run sandbox profile, so no global seat
+      // agent is installed and nothing is written under the user's opencode config.
+      assert.ok(!res.written.some((p) => String(p).includes('adversarial-review-seat.md')));
+      await assert.rejects(fs.access(path.join(home, '.config', 'opencode')));
       await assert.rejects(fs.access(path.join(home, '.claude')));
     } finally {
       await cleanup();
@@ -471,9 +466,8 @@ test('project install writes to repo .agents or .claude', async () => {
     const skillPath = path.join(repo.root, '.agents', 'skills', 'adversarial-review', 'scripts', 'lib', 'version.mjs');
     await fs.access(skillPath);
 
-    // opencode agent is in <home>/.config/opencode/agents/adversarial-review-seat.md
-    const agentPath = path.join(home, '.config', 'opencode', 'agents', 'adversarial-review-seat.md');
-    await fs.access(agentPath);
+    // No global seat agent: a v2 lane is bounded by the run sandbox profile instead.
+    await assert.rejects(fs.access(path.join(home, '.config', 'opencode')));
   } finally {
     await envCleanup();
     await repo.cleanup();

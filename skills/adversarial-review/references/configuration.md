@@ -67,10 +67,9 @@ The backend used for swarm execution.
 
 #### swarm.allowFree
 
-Default: `false`
-Settable by: user config.
-Allows free models during route selection.
-Free models can train provider models on prompt contents.
+Removed in schema 2. The route no longer refuses a free model: the sandbox tree is the privacy
+boundary, and a run on the swarm prints a warning that the provider can train on every file in
+that tree. The key is accepted and ignored.
 
 #### swarm.wideFiles
 
@@ -103,9 +102,20 @@ Keys match backend names such as `codex`, `gemini`, or `custom`.
 
 ### maxParallel
 
-Default: `4`
+Default: `null`
 Settable by: user config.
-Maximum parallel seat processes allowed during execution.
+An upper limit on the number of parallel seat processes.
+The default is no limit: the engine sizes the lane count from the machine.
+A value that is not a positive integer gives a warning and counts as no limit.
+
+### lanes
+
+Default: `{ reserveRamMb: 2048, laneRamMb: 400 }`
+Settable by: user config.
+The memory model that sizes the lane count.
+`reserveRamMb` is the free memory that the engine leaves for the operating system.
+`laneRamMb` is the memory that one lane uses. The measured maximum is 380 MB.
+The lane count is also limited by the logical core count and by the provider rate limits.
 
 ### budget
 

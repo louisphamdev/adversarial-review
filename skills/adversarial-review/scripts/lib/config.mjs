@@ -26,7 +26,11 @@ export const DEFAULTS = Object.freeze({
   }),
   stages: Object.freeze({}),
   backends: Object.freeze({}),
-  maxParallel: 4,
+  maxParallel: null,
+  lanes: Object.freeze({
+    reserveRamMb: 2048,
+    laneRamMb: 400,
+  }),
   budget: 20,
   timeouts: Object.freeze({
     find: 1200000,
@@ -82,11 +86,20 @@ export function loadConfig({ env = process.env, repoRoot, flags = {}, stderr } =
       if (userJson.hostBackend !== undefined) config.hostBackend = userJson.hostBackend;
       if (userJson.route !== undefined) config.route = userJson.route;
       if (userJson.routeAsk !== undefined) config.routeAsk = Boolean(userJson.routeAsk);
-      if (typeof userJson.maxParallel === 'number') config.maxParallel = userJson.maxParallel;
+      if (userJson.maxParallel !== undefined) {
+        if (Number.isInteger(userJson.maxParallel) && userJson.maxParallel > 0) {
+          config.maxParallel = userJson.maxParallel;
+        } else {
+          warnings.push(`user config "maxParallel" value ${JSON.stringify(userJson.maxParallel)} is not a positive integer: no parallel limit is applied`);
+        }
+      }
       if (typeof userJson.budget === 'number') config.budget = userJson.budget;
 
       if (userJson.swarm && typeof userJson.swarm === 'object' && !Array.isArray(userJson.swarm)) {
         config.swarm = { ...config.swarm, ...userJson.swarm };
+      }
+      if (userJson.lanes && typeof userJson.lanes === 'object' && !Array.isArray(userJson.lanes)) {
+        config.lanes = { ...config.lanes, ...userJson.lanes };
       }
       if (userJson.timeouts && typeof userJson.timeouts === 'object' && !Array.isArray(userJson.timeouts)) {
         config.timeouts = { ...config.timeouts, ...userJson.timeouts };
@@ -193,8 +206,12 @@ export function loadConfig({ env = process.env, repoRoot, flags = {}, stderr } =
   }
 
   if (flags) {
-    if (flags.model != null && !isValidModel(flags.model)) {
-      throw new ConfigError(`Invalid model in flags.model: "${flags.model}"`);
+    // `run --model` is repeatable, so the flag is a string on one command and an array on the
+    // other. Each element is validated on its own: an array coerced to one string never matches.
+    if (flags.model != null) {
+      for (const m of [].concat(flags.model)) {
+        if (!isValidModel(m)) throw new ConfigError(`Invalid model in flags.model: "${m}"`);
+      }
     }
     for (const [k, v] of Object.entries(flags)) {
       if (k !== 'model' && (k.endsWith('Model') || k.endsWith('model')) && typeof v === 'string') {

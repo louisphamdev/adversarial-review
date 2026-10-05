@@ -1,0 +1,32 @@
+[
+  {
+    "id": "empty-catch-around-write",
+    "lines": [6, 9],
+    "keywords": ["empty catch", "swallow", "catch {}", "saveDraft", "write", "silently", "hidden"]
+  },
+  {
+    "id": "ok-true-after-failure",
+    "lines": [13, 17],
+    "keywords": ["ok: true", "status >= 400", "pushInvoice", "reports success", "caller", "failed"]
+  },
+  {
+    "id": "retry-forever-on-400",
+    "lines": [20, 24],
+    "keywords": ["400", "retry", "forever", "while (true)", "permanent", "pushWithRetry", "infinite"]
+  },
+  {
+    "id": "promise-error-dropped",
+    "lines": [28, 29],
+    "keywords": ["catch(() => {})", "metrics", "dropped", "swallow", "reportMetrics", "unhandled"]
+  },
+  {
+    "id": "health-always-healthy",
+    "lines": [33, 39],
+    "keywords": ["healthy", "health", "ping", "always", "failed", "status", "mislead"]
+  },
+  {
+    "id": "count-does-not-match-rows",
+    "lines": [42, 51],
+    "keywords": ["count", "ids.length", "rows.length", "exportAll", "partial", "skipped", "mismatch"]
+  }
+]

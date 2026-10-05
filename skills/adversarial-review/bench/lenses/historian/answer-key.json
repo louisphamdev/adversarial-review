@@ -1,0 +1,32 @@
+[
+  {
+    "id": "timeout-contradiction",
+    "lines": [15, 15],
+    "keywords": ["timeout", "30", "60", "contradict", "conflict", "sftp", "connect"]
+  },
+  {
+    "id": "retry-count-contradiction",
+    "lines": [16, 16],
+    "keywords": ["retry", "retries", "3", "5", "contradict", "times", "conflict"]
+  },
+  {
+    "id": "field-name-drift",
+    "lines": [22, 23],
+    "keywords": ["partnerId", "partner_ref", "two names", "same field", "mismatch", "column", "rename"]
+  },
+  {
+    "id": "mandatory-field-optional-later",
+    "lines": [38, 39],
+    "keywords": ["currency", "mandatory", "empty", "optional", "contradict", "validation", "exported"]
+  },
+  {
+    "id": "undefined-settlement-window",
+    "lines": [10, 10],
+    "keywords": ["settlement window", "undefined", "never defined", "term", "no definition", "R4"]
+  },
+  {
+    "id": "requirement-without-section",
+    "lines": [11, 11],
+    "keywords": ["R5", "alert", "no section", "uncovered", "not specified", "missing", "requirement"]
+  }
+]

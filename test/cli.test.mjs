@@ -204,6 +204,28 @@ describe('cli unit and command tests', () => {
       }
     });
 
+    it('models list writes the discovery notes to stderr (A2)', async () => {
+      const iso = await makeIsolatedEnv();
+      const io = createMockIO();
+      try {
+        const noPath = Object.fromEntries(
+          Object.entries(iso.env).filter(([k]) => k.toLowerCase() !== 'path')
+        );
+        const code = await modelsCommand({ backend: 'opencode' }, [], {
+          env: { ...noPath, PATH: '', USERPROFILE: iso.home },
+          runChild: async () => {
+            throw new Error('must not run');
+          },
+          ...io,
+        });
+        assert.equal(code, 0, `expected 0, got ${code}. err: ${io.stderr.text}`);
+        assert.ok(io.stdout.text.includes('(no models discovered)'));
+        assert.match(io.stderr.text, /note: opencode executable not found/);
+      } finally {
+        await iso.cleanup();
+      }
+    });
+
     it('models probe runs without crash, iterates entries, and persists store (C2)', async () => {
       const iso = await makeIsolatedEnv();
       const io = createMockIO();
@@ -296,7 +318,7 @@ describe('recommend picks a measured swarm model', () => {
     try {
       const state = join(iso.home, '.adversarial-review');
       await mkdir(state, { recursive: true });
-      await writeFile(join(state, 'config.json'), JSON.stringify({ version: 3, hostBackend: 'claude', swarm: { backend: 'opencode', allowFree: true } }));
+      await writeFile(join(state, 'config.json'), JSON.stringify({ version: 3, hostBackend: 'claude', swarm: { backend: 'opencode', models: ['p/good-model'] } }));
       await writeFile(join(state, 'models.json'), JSON.stringify({
         version: 3,
         'opencode:p/good-model': { backend: 'opencode', model: 'p/good-model', callable: true, contract: true, score: 6, invented: 0, tier: 'top', latencyMs: 100, measuredAt: Date.now() },
@@ -306,6 +328,68 @@ describe('recommend picks a measured swarm model', () => {
       const parsed = JSON.parse(io.stdout.text);
       assert.equal(parsed.signals.swarmModel, 'p/good-model');
       assert.equal(parsed.route, 'swarm');
+    } finally {
+      await bins.cleanup();
+      await iso.cleanup();
+      await repo.cleanup();
+    }
+  });
+
+  it('finds the swarm backend through backends.opencode.exe when PATH has no opencode', async () => {
+    const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
+    const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+    const ocBins = await makeFakeBins({
+      opencode: { version: 'opencode v2.0.9', models: ['p/good-model', 'p/other'] },
+    });
+    iso.env[bins.pathKey] = bins.pathEnv;
+    const exe = path.join(ocBins.dir, process.platform === 'win32' ? 'opencode.cmd' : 'opencode');
+    const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+    const io = createMockIO();
+    try {
+      const state = join(iso.home, '.adversarial-review');
+      await mkdir(state, { recursive: true });
+      await writeFile(join(state, 'config.json'), JSON.stringify({
+        version: 3,
+        hostBackend: 'claude',
+        swarm: { backend: 'opencode', models: ['p/good-model'] },
+        backends: { opencode: { exe } },
+      }));
+      await writeFile(join(state, 'models.json'), JSON.stringify({
+        version: 3,
+        'opencode:p/good-model': { backend: 'opencode', model: 'p/good-model', callable: true, contract: true, score: 6, invented: 0, tier: 'top', latencyMs: 100, measuredAt: Date.now() },
+      }));
+      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      assert.equal(code, 0, io.stderr.text);
+      const parsed = JSON.parse(io.stdout.text);
+      assert.equal(parsed.signals.swarmModel, 'p/good-model');
+      assert.equal(parsed.route, 'swarm');
+    } finally {
+      await ocBins.cleanup();
+      await bins.cleanup();
+      await iso.cleanup();
+      await repo.cleanup();
+    }
+  });
+
+  it('prints a discovery note when the configured swarm executable fails', async () => {
+    const iso = await makeIsolatedEnv({ ADVERSARIAL_REVIEW_QUOTA_PERCENT: '85' });
+    const bins = await makeFakeBins({ claude: '2.1.280 (Claude Code)' });
+    iso.env[bins.pathKey] = bins.pathEnv;
+    const exe = path.join(iso.home, 'nowhere', 'opencode.exe');
+    const repo = await makeTempRepo({ git: true, files: { 'a.js': 'x = 1;\n' } });
+    const io = createMockIO();
+    try {
+      const state = join(iso.home, '.adversarial-review');
+      await mkdir(state, { recursive: true });
+      await writeFile(join(state, 'config.json'), JSON.stringify({
+        version: 3,
+        hostBackend: 'claude',
+        swarm: { backend: 'opencode', models: ['p/good-model'] },
+        backends: { opencode: { exe } },
+      }));
+      const code = await main(['recommend', '--target', 'a.js', '--json'], { env: iso.env, cwd: repo.root, ...io });
+      assert.equal(code, 0);
+      assert.match(io.stderr.text, /note: discovery failed/);
     } finally {
       await bins.cleanup();
       await iso.cleanup();

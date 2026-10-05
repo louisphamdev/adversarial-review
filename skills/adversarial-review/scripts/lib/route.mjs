@@ -78,12 +78,10 @@ export function decideRoute({
   const hostAvailable = host?.available !== false;
   const swarmAvailable = swarm?.available !== false;
   const hasCallableModel = Boolean(swarm?.model);
-  const allowFree = Boolean(config?.swarm?.allowFree);
-  const everyModelFree = Boolean(swarm?.free) && !allowFree;
 
   if (routeChoice === 'auto') {
     // Evaluate rules 1..5 in order (§19.2)
-    const rule1Matches = !swarmAvailable || !hasCallableModel || everyModelFree;
+    const rule1Matches = !swarmAvailable || !hasCallableModel;
     const rule2Matches = !hostAvailable;
 
     if (rule1Matches && rule2Matches) {
@@ -98,7 +96,6 @@ export function decideRoute({
       if (!detail) {
         if (!swarmAvailable) detail = 'backend does not resolve';
         else if (!hasCallableModel) detail = 'no callable model';
-        else if (everyModelFree) detail = 'every callable model is free and swarm.allowFree is not true';
       }
       reason = `swarm-unavailable: ${detail}`;
     } else if (rule2Matches) {

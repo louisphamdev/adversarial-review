@@ -1,10 +1,12 @@
 // CLI recommend command (§19.4).
 import { loadConfig } from '../config.mjs';
 import { resolveMaterial } from '../material.mjs';
+import { resolveSeats } from '../seats.mjs';
 import { readQuota } from '../quota.mjs';
 import { decideRoute } from '../route.mjs';
 import { resolveExecutable } from '../proc.mjs';
-import { pick, discover, readStore, loadPrior } from '../catalog.mjs';
+import { resolveOpencodeExe } from '../backends/opencode.mjs';
+import { cleanNamed, buildPool, assignSeats, discover, readStore, loadPrior } from '../catalog.mjs';
 import { stateDir } from '../paths.mjs';
 
 export async function recommendCommand(
@@ -31,33 +33,52 @@ export async function recommendCommand(
   const swarmBackendName = config.swarm?.backend || 'opencode';
 
   const hostExe = await resolveExecutable(hostBackendName, env);
-  const swarmExe = await resolveExecutable(swarmBackendName, env);
+  // discover() resolves opencode the same way. A plain PATH lookup here would miss a
+  // configured or fixed-path install, skip discovery, and print no note.
+  const swarmExe =
+    swarmBackendName === 'opencode'
+      ? (await resolveOpencodeExe(config, env)).exe
+      : await resolveExecutable(swarmBackendName, env);
 
-  let pickedSwarm = null;
+  const notes = [];
+  let seatModels = {};
+  let pool = [];
   if (swarmExe) {
     try {
-      const { candidates } = await discover(swarmBackendName, { config, env });
+      const { candidates, notes: discNotes } = await discover(swarmBackendName, { config, env, stderr });
+      notes.push(...(discNotes || []));
       const store = await readStore(stateDir(env));
       const prior = await loadPrior({ stateDir: stateDir(env) });
-      pickedSwarm = await pick({
-        candidates,
-        store,
-        prior,
-        route: 'auto',
-        allowFree: config.swarm?.allowFree,
-      });
-    } catch {
-      pickedSwarm = null;
+      const named = cleanNamed(config.swarm?.models || [], candidates);
+      notes.push(...named.notes);
+      // recommend never probes: an unprobed model cannot be proven free, so only the stored
+      // measurements and the named list decide what the pool holds.
+      const built = buildPool({ candidates, prior, store, named: named.named, probeResults: {} });
+      pool = built.pool;
+      notes.push(...built.notes);
+      const { chosen } = resolveSeats({ projectSeats: config.projectSeats });
+      seatModels = assignSeats({ seats: chosen, pool, store });
+    } catch (err) {
+      notes.push(`swarm pool unavailable: ${err.message}`);
+      seatModels = {};
     }
   }
+
+  for (const note of notes) {
+    if (stderr?.write) stderr.write(`note: ${note}\n`);
+  }
+
+  const assigned = Object.values(seatModels);
+  const first = assigned[0] || null;
+  const poolOf = (model) => pool.find((p) => p.model === model) || null;
 
   const host = { available: Boolean(hostExe) };
   const swarm = {
     available: Boolean(swarmExe),
     detail: swarmExe ? '' : 'backend not found on PATH',
-    model: pickedSwarm?.model || null,
-    free: pickedSwarm?.free ?? false,
-    tier: pickedSwarm?.tier ?? 'standard',
+    model: first?.model || null,
+    free: Boolean(poolOf(first?.model)?.free),
+    tier: first?.lensTier || 'unmeasured',
   };
 
   const decision = decideRoute({
@@ -81,15 +102,18 @@ export async function recommendCommand(
     swarmModel: swarm.model,
     swarmModelTier: swarm.tier,
     swarmModelFree: swarm.free,
+    seatModels,
+    notes,
   };
 
   let question;
   if (decision.route === 'swarm') {
     const qPct = quota.percent !== null ? `Quota is at ${quota.percent}%. ` : '';
+    const seatCount = assigned.length;
     if (swarm.free) {
-      question = `${qPct}I recommend swarm: ${swarm.model} (measured ${swarm.tier} tier, free, so its provider can train on the material; slower). Swarm, or spawn?`;
+      question = `${qPct}I recommend swarm: ${swarm.model} (measured ${swarm.tier} tier, free, so its provider can train on the material; slower), ${seatCount} seats assigned. Swarm, or spawn?`;
     } else {
-      question = `${qPct}I recommend swarm: ${swarm.model} (measured ${swarm.tier} tier). Swarm, or spawn?`;
+      question = `${qPct}I recommend swarm: ${swarm.model} (measured ${swarm.tier} tier), ${seatCount} seats assigned. Swarm, or spawn?`;
     }
   } else {
     question = `I recommend spawn (${decision.reason}). Spawn, or swarm?`;

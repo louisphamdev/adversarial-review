@@ -65,50 +65,54 @@ export function system32Path(exe) {
   return path.join(root, 'System32', exe);
 }
 
+// Every file-existence check of resolveExecutable goes through this, so a caller can inject
+// one and keep a test's outcome off the real filesystem.
+export const accessExists = async (p, mode) => {
+  try {
+    await access(p, mode);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 /**
  * Resolve a command name or path to an absolute executable path.
  *
  * @param {string} command
  * @param {object} env
+ * @param {{ platform?: string, exists?: (p: string, mode: number) => Promise<boolean> }} [seam]
  * @returns {Promise<string|null>}
  */
-export async function resolveExecutable(command, env = process.env) {
+export async function resolveExecutable(
+  command,
+  env = process.env,
+  { platform = process.platform, exists = accessExists } = {}
+) {
   if (typeof command !== 'string' || command.length === 0) return null;
 
+  const isWin = platform === 'win32';
+  const p = isWin ? path.win32 : path.posix;
+
   if (command.includes('/') || command.includes('\\')) {
-    try {
-      await access(command, constants.X_OK);
-    } catch {
-      try {
-        await access(command, constants.F_OK);
-      } catch {
-        return null;
-      }
+    if (!(await exists(command, constants.X_OK)) && !(await exists(command, constants.F_OK))) {
+      return null;
     }
-    return path.resolve(command);
+    return p.resolve(command);
   }
 
   const pathValue = getEnvCaseInsensitive(env, 'PATH');
   const pathExtValue = getEnvCaseInsensitive(env, 'PATHEXT');
-  const pathEntries = String(pathValue || '').split(path.delimiter).filter(Boolean);
-  const extensions =
-    process.platform === 'win32'
-      ? String(pathExtValue || '.COM;.EXE;.BAT;.CMD').split(';')
-      : [''];
+  const pathEntries = String(pathValue || '').split(p.delimiter).filter(Boolean);
+  const extensions = isWin
+    ? String(pathExtValue || '.COM;.EXE;.BAT;.CMD').split(';')
+    : [''];
 
-  const accessMode = process.platform === 'win32' ? constants.F_OK : constants.X_OK;
+  const accessMode = isWin ? constants.F_OK : constants.X_OK;
   for (const dir of pathEntries) {
     for (const ext of extensions) {
-      const candidate = path.join(
-        dir,
-        process.platform === 'win32' ? `${command}${ext}` : command
-      );
-      try {
-        await access(candidate, accessMode);
-        return candidate;
-      } catch {
-        continue;
-      }
+      const candidate = p.join(dir, isWin ? `${command}${ext}` : command);
+      if (await exists(candidate, accessMode)) return candidate;
     }
   }
   return null;
@@ -426,6 +430,7 @@ function collectTailStream(child, which, maxBytes = RUN_CHILD_MAX_BYTES) {
  * @param {string|Buffer} [options.stdin]
  * @param {number} [options.timeoutMs]
  * @param {Function} [options.onSpawn]
+ * @param {Function} [options.onStdout]
  * @returns {Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, spawnError: Error|null }>}
  */
 export async function runChild({
@@ -436,6 +441,7 @@ export async function runChild({
   stdin,
   timeoutMs,
   onSpawn,
+  onStdout,
 }) {
   let resolved;
   try {
@@ -499,6 +505,17 @@ export async function runChild({
     } catch {
       // ignore
     }
+  }
+
+  // Attached synchronously before the collector so that no chunk is lost.
+  if (typeof onStdout === 'function' && child.stdout) {
+    child.stdout.on('data', (chunk) => {
+      try {
+        onStdout(chunk);
+      } catch {
+        // a listener error never breaks the child
+      }
+    });
   }
 
   const stdoutPromise = collectTailStream(child, 'stdout', RUN_CHILD_MAX_BYTES);

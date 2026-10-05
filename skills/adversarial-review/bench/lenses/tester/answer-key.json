@@ -1,0 +1,32 @@
+[
+  {
+    "id": "test-asserts-nothing",
+    "lines": [9, 11],
+    "keywords": ["asserts nothing", "no assertion", "assert", "plain order", "passes", "always"]
+  },
+  {
+    "id": "assertion-caught-and-ignored",
+    "lines": [13, 18],
+    "keywords": ["catch", "swallow", "assertion", "try", "console.log", "never fails", "ignored"]
+  },
+  {
+    "id": "asserts-the-mock-not-the-value",
+    "lines": [21, 25],
+    "keywords": ["mock", "written.length", "store", "behavior", "rate", "value", "weak assertion"]
+  },
+  {
+    "id": "assertion-in-un-awaited-callback",
+    "lines": [28, 31],
+    "keywords": ["setTimeout", "callback", "never runs", "await", "formatDiscount", "asynchronous", "not reported"]
+  },
+  {
+    "id": "skipped-test-left-behind",
+    "lines": [34, 36],
+    "keywords": ["skip", "it.skip", "disabled", "Wednesday", "never runs", "weekday"]
+  },
+  {
+    "id": "vip-and-coupon-branches-untested",
+    "lines": [9, 11],
+    "keywords": ["vip", "coupon", "WELCOME", "untested", "no test", "branch", "coverage"]
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "drop-before-copy",
+    "lines": [3, 6],
+    "keywords": ["drop", "address", "before", "copy", "data loss", "split_part", "order"]
+  },
+  {
+    "id": "not-null-without-default",
+    "lines": [8, 8],
+    "keywords": ["not null", "default", "contract_no", "existing rows", "fail", "backfill"]
+  },
+  {
+    "id": "two-tables-no-transaction",
+    "lines": [10, 11],
+    "keywords": ["transaction", "atomic", "begin", "commit", "partner_tiers", "partial", "two tables"]
+  },
+  {
+    "id": "rename-breaks-old-build",
+    "lines": [13, 13],
+    "keywords": ["rename", "tier_code", "7.3", "old build", "compatibility", "downtime", "expand"]
+  },
+  {
+    "id": "index-locks-writes",
+    "lines": [15, 15],
+    "keywords": ["index", "lock", "concurrently", "writes", "blocks", "idx_partners_city"]
+  },
+  {
+    "id": "down-loses-data",
+    "lines": [25, 27],
+    "keywords": ["down", "rollback", "irreversible", "data loss", "address", "restore", "not reversible"]
+  }
+]

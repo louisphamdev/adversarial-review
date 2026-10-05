@@ -1,0 +1,32 @@
+[
+  {
+    "id": "factory-with-one-product",
+    "lines": [11, 14],
+    "keywords": ["factory", "one", "single", "createWriter", "csv", "indirection", "inline"]
+  },
+  {
+    "id": "class-without-state",
+    "lines": [5, 9],
+    "keywords": ["class", "no state", "CsvWriter", "function", "method", "instance", "plain"]
+  },
+  {
+    "id": "options-read-in-one-place",
+    "lines": [16, 20],
+    "keywords": ["options", "header", "one place", "parameter", "buildReport", "indirection", "argument"]
+  },
+  {
+    "id": "cache-for-a-single-read",
+    "lines": [23, 29],
+    "keywords": ["cache", "totalCache", "read once", "module", "state", "stale", "unnecessary"]
+  },
+  {
+    "id": "wrapper-that-only-forwards",
+    "lines": [32, 34],
+    "keywords": ["wrapper", "forwards", "renderReport", "buildReport", "pass-through", "delegate", "remove"]
+  },
+  {
+    "id": "constant-never-configured",
+    "lines": [3, 3],
+    "keywords": ["DEFAULT_SEPARATOR", "constant", "never", "configurable", "inline", "one use", "separator"]
+  }
+]

@@ -40,26 +40,17 @@ test('route module', async (t) => {
     assert.equal(res.stages.find, 'host');
   });
 
-  await t.test('Rule 1: swarm unavailable when swarm model free with allowFree:false', () => {
+  // A free model no longer forces spawn: the sandbox tree is the privacy boundary now, and the
+  // run prints the training warning instead of refusing the route.
+  await t.test('Rule 1 does not match a free model: quota 90% still routes to the swarm', () => {
     const res = decideRoute({
-      config: { swarm: { allowFree: false } },
       host: { available: true },
-      swarm: { available: true, model: 'test/free-model', free: true },
-    });
-    assert.equal(res.route, 'spawn');
-    assert.ok(res.reason.startsWith('swarm-unavailable'));
-    assert.equal(res.stages.find, 'host');
-  });
-
-  await t.test('Rule 1 does not match if model is free but allowFree is true', () => {
-    const res = decideRoute({
-      config: { swarm: { allowFree: true } },
-      host: { available: true },
-      swarm: { available: true, model: 'test/free-model', free: true },
+      swarm: { available: true, model: 'opencode/x', free: true },
       quota: { percent: 90 },
     });
     assert.equal(res.route, 'swarm');
     assert.equal(res.reason, 'quota 90% >= 80%');
+    assert.equal(res.stages.find, 'swarm');
   });
 
   await t.test('Rules 1 and 2: both host and swarm unavailable throws ConfigError naming doctor', () => {

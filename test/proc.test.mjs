@@ -607,6 +607,18 @@ describe('runChild', () => {
     assert.equal(result.timedOut, false);
   });
 
+  it('runChild calls onStdout for each chunk and still returns the full stdout', async () => {
+    const chunks = [];
+    const res = await runChild({
+      cmd: process.execPath,
+      args: ['-e', "process.stdout.write('a'); setTimeout(() => process.stdout.write('b'), 50)"],
+      onStdout: (c) => chunks.push(String(c)),
+    });
+    assert.equal(res.stdout, 'ab');
+    assert.equal(chunks.join(''), 'ab');
+    assert.ok(chunks.length >= 1);
+  });
+
   it('runChild invokes onSpawn callback', async () => {
     let capturedChild = null;
     const result = await runChild({

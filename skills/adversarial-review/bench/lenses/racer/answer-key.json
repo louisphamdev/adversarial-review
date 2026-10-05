@@ -1,0 +1,32 @@
+[
+  {
+    "id": "toctou-write",
+    "lines": [7, 10],
+    "keywords": ["toctou", "check", "race", "exists", "writeOnce", "between", "atomic", "flag"]
+  },
+  {
+    "id": "lost-update-counter",
+    "lines": [14, 17],
+    "keywords": ["lost update", "read-modify-write", "race", "uploads", "concurrent", "atomic", "increment"]
+  },
+  {
+    "id": "interval-never-cleared",
+    "lines": [21, 22],
+    "keywords": ["setInterval", "clearInterval", "leak", "never cleared", "startProgress", "timer"]
+  },
+  {
+    "id": "listener-added-per-call",
+    "lines": [25, 27],
+    "keywords": ["listener", "bus.on", "off", "remove", "leak", "watchSession", "unsubscribe"]
+  },
+  {
+    "id": "cache-stampede",
+    "lines": [30, 33],
+    "keywords": ["stampede", "duplicate", "concurrent", "in-flight", "loadManifest", "cache", "twice"]
+  },
+  {
+    "id": "lock-not-released",
+    "lines": [38, 42],
+    "keywords": ["lock", "release", "finally", "early return", "deadlock", "finishSession", "missing"]
+  }
+]

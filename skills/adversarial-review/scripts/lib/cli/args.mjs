@@ -22,7 +22,9 @@ export const COMMAND_OPTIONS = {
     'allow-drift': { type: 'boolean' },
     json: { type: 'boolean' },
     budget: { type: 'string' },
-    model: { type: 'string' },
+    model: { type: 'string', multiple: true },
+    'keep-sandbox': { type: 'boolean' },
+    'allow-repo-change': { type: 'boolean' },
   },
   status: {
     latest: { type: 'boolean' },
@@ -53,6 +55,8 @@ export const COMMAND_OPTIONS = {
     backend: { type: 'string' },
     model: { type: 'string' },
     limit: { type: 'string' },
+    lenses: { type: 'string' },
+    seats: { type: 'string' },
     json: { type: 'boolean' },
   },
   hook: {

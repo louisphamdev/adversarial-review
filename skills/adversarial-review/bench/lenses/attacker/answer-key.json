@@ -1,0 +1,32 @@
+[
+  {
+    "id": "path-traversal",
+    "lines": [8, 10],
+    "keywords": ["traversal", "path.join", "../", "downloadHandler", "arbitrary file", "sendFile"]
+  },
+  {
+    "id": "sql-injection",
+    "lines": [13, 15],
+    "keywords": ["sql injection", "injection", "concatenat", "parameter", "findPartner", "prepared"]
+  },
+  {
+    "id": "token-logged-and-loose-compare",
+    "lines": [19, 21],
+    "keywords": ["token", "log", "==", "timing", "secret", "authorize", "strict"]
+  },
+  {
+    "id": "admin-flag-from-body",
+    "lines": [25, 28],
+    "keywords": ["isAdmin", "privilege", "escalation", "body", "admin", "role", "updatePartner"]
+  },
+  {
+    "id": "weak-reset-token",
+    "lines": [31, 32],
+    "keywords": ["Math.random", "predictable", "token", "crypto", "entropy", "newResetToken"]
+  },
+  {
+    "id": "command-injection",
+    "lines": [35, 36],
+    "keywords": ["command injection", "exec", "shell", "convertUpload", "source", "injection"]
+  }
+]
