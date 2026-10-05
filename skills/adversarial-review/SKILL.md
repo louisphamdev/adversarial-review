@@ -118,6 +118,7 @@ After the judge delivers the ruling, resolve findings through two gates:
    A later plan change that touches a settled item sends that item back for review.
    A judge demand blocks only when a seat objects to the same item in the same round.
    The loop stops after `patchReview.maxRounds` rounds (default 3) and prints the open items.
+   If the command prints `Not converging`, stop the loop. Cut the scope of the change, then write a smaller plan.
 
 2. Stage VERIFY:
    After you make edits, run `adversarial-review verify <run-dir>`.
@@ -125,6 +126,12 @@ After the judge delivers the ruling, resolve findings through two gates:
    A second `verify` run sends only the items that are not met, with the changes since the last `verify` run.
    When every item is met, each owner seat reads the final diff once more for every item it owns.
    The judge returns a final PASS or BLOCK verdict.
+   If the command prints `Not converging`, stop the loop. Cut the scope of the change before the next run.
+
+Each `patch-review` record and each `verify` record has a `converging` field.
+The field is false when a round has as many blocking items as the round before, or more.
+The command then prints a `Not converging` line.
+A loop that opens one item for each item that it closes does not end, so more rounds do not help.
 
 ## Live Table
 

@@ -961,6 +961,18 @@ describe('pipeline module', () => {
       await assert.rejects(() => runPatchReview({ state, plan: 'free text', runAgent: agent(allSound) }), (e) => e.exitCode === 2);
     });
 
+    it('a round that does not lower the blocking count is not converging', async () => {
+      const objectC1 = (seat) => (seat === 'skeptic' ? [{ id: 'C1', plan: 'breaks-my-lens', reason: 'r' }, { id: 'C2', plan: 'sound', reason: 'ok' }] : allSound());
+      const r1 = await runPatchReview({ state, plan: plan1, runAgent: agent(objectC1) });
+      assert.deepEqual([r1.record.blockingCount, r1.record.converging], [1, true]);
+      assert.ok(!/Not converging/.test(r1.message));
+      const r2 = await runPatchReview({ state, plan: '## C1\nfix auth again\n## C2\nfix limits\n', runAgent: agent(objectC1), records: [r1.record], router: async () => new Map([['C2', 0]]) });
+      assert.deepEqual([r2.record.blockingCount, r2.record.converging], [1, false]);
+      assert.match(r2.message, /Not converging: 1 blocking item this round, 1 in the round before\. Stop the loop and cut the scope of the change\./);
+      const r3 = await runPatchReview({ state, plan: '## C1\nfix auth well\n## C2\nfix limits\n', runAgent: agent(allSound), records: [r1.record], router: async () => new Map([['C2', 0]]) });
+      assert.deepEqual([r3.record.blockingCount, r3.record.converging], [0, true]);
+    });
+
     it('round 2 sends only open and listed items', async () => {
       const r1 = await runPatchReview({
         state,
@@ -1157,6 +1169,16 @@ describe('pipeline module', () => {
       const r2 = await runVerify({ state, diffParts: diffB, runAgent, records: [r1.record] });
       assert.equal(shown, 'C1');
       assert.equal(r2.verdict, 'PASS');
+    });
+
+    it('a verify round that does not lower the blocking count is not converging', async () => {
+      const r1 = await runVerify({ state, diffParts: diffA, runAgent: agent({ seatItems: breakerOpen, regression: holdsAll }) });
+      assert.deepEqual([r1.record.blockingCount, r1.record.converging], [1, true]);
+      const r2 = await runVerify({ state, diffParts: diffB, runAgent: agent({ seatItems: breakerOpen, regression: holdsAll }), records: [r1.record] });
+      assert.deepEqual([r2.record.blockingCount, r2.record.converging], [1, false]);
+      assert.match(r2.message, /Not converging: 1 blocking item this round, 1 in the round before\./);
+      const r3 = await runVerify({ state, diffParts: diffB, runAgent: agent({ seatItems: metAll, regression: holdsAll }), records: [r1.record] });
+      assert.deepEqual([r3.record.blockingCount, r3.record.converging], [0, true]);
     });
 
     it('round 2 counts a finding-id answer of the owner seat', async () => {

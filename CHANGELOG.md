@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Idle failover: `timeouts.idle.find` and `timeouts.idle.other` stop a silent streaming call
   and move it to the next model of the seat.
 - `status` shows the model, the attempt, and the idle time of each call, and a hung owner.
+- `patch-review` and `verify` records carry `converging`. It is false when a round has as many blocking items as the round before, or more. The command then prints a `Not converging` line that tells the host to stop and cut scope.
 
 ### Fixed
 - `run --resume` never takes over a lock whose pid is alive, also when the lock is old.

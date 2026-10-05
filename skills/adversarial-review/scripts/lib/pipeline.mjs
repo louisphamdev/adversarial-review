@@ -665,20 +665,32 @@ export async function runPatchReview({ state = {}, plan = '', runAgent, records 
   fullRecord.blocking = nextLedger.last.blocking;
   fullRecord.advisory = nextLedger.last.advisory;
   fullRecord.itemStates = Object.fromEntries(ids.map((id) => [id, nextLedger.items[id].state]));
+  fullRecord.blockingCount = ids.filter((id) => nextLedger.items[id].state === 'open').length;
+  const conv = convergence(counted.at(-1), fullRecord.blockingCount, (r) => Object.values(r.itemStates || {}).filter((s) => s === 'open').length);
+  fullRecord.converging = conv.converging;
+  const lines = ids.map((id) => {
+    const it = nextLedger.items[id];
+    if (it.state !== 'open') return `${id} ${it.state}`;
+    const why = it.demands.filter((d) => d.status !== 'met').map((d) => d.text);
+    return `${id} open: ${(why.length ? why : it.lastObjections).join(' | ')}`;
+  });
+  if (conv.line) lines.push(conv.line);
   return {
     decision: fullRecord.decision,
     exitCode: fullRecord.decision === 'APPLY' ? 0 : 1,
     record: fullRecord,
     ledger: nextLedger,
-    message: ids
-      .map((id) => {
-        const it = nextLedger.items[id];
-        if (it.state !== 'open') return `${id} ${it.state}`;
-        const why = it.demands.filter((d) => d.status !== 'met').map((d) => d.text);
-        return `${id} open: ${(why.length ? why : it.lastObjections).join(' | ')}`;
-      })
-      .join('\n'),
+    message: lines.join('\n'),
   };
+}
+
+// A loop that opens as many blocking items as it closes never ends, so the host must cut scope.
+function convergence(prev, count, countOf) {
+  if (!prev || count === 0) return { converging: true, line: '' };
+  const before = Number.isInteger(prev.blockingCount) ? prev.blockingCount : countOf(prev);
+  if (count < before) return { converging: true, line: '' };
+  const items = count === 1 ? 'item' : 'items';
+  return { converging: false, line: `Not converging: ${count} blocking ${items} this round, ${before} in the round before. Stop the loop and cut the scope of the change.` };
 }
 
 const VERIFY_DELTA_CAP = 12000;
@@ -901,10 +913,13 @@ export async function runVerify({ state = {}, diffParts, recollect = null, runAg
   const verdict = allMet && accepted.length === 0 && !treeChanged ? 'PASS' : 'BLOCK';
   const lines = ids.map((id) => `${id} ${items[id].status}${items[id].reason ? ` (${items[id].reason})` : ''}`);
   if (treeChanged) lines.push('The tree changed during verify. Run verify again.');
+  const blockingCount = ids.filter((id) => items[id].status !== 'met').length + accepted.length;
+  const conv = convergence(prior, blockingCount, (r) => Object.values(r.items || {}).filter((i) => i?.status !== 'met').length);
+  if (conv.line) lines.push(conv.line);
   return {
     verdict,
     exitCode: verdict === 'PASS' ? 0 : 1,
-    record: { ...record, judge: judgeRes.value, verdict, treeChanged },
+    record: { ...record, judge: judgeRes.value, verdict, treeChanged, blockingCount, converging: conv.converging },
     message: lines.join('\n'),
   };
 }
