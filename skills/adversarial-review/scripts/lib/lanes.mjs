@@ -1,5 +1,7 @@
 // Lane count from the machine and from provider rate limits (spec 3.1-A, A11).
 import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const posInt = (v) => (Number.isInteger(v) && v > 0 ? v : null);
@@ -39,10 +41,40 @@ export function parseVmStat(text) {
 }
 
 const readVmStat = () => execFileSync('/usr/bin/vm_stat', { encoding: 'utf8', timeout: 5000 });
+const readText = (file) => fs.readFileSync(file, 'utf8');
+
+// The lowest cgroup v2 memory limit on the path to the root, minus the memory the cgroup holds and
+// cannot give back. Inactive file cache comes back on demand, so it does not count as used.
+export function cgroupHeadroomMb({ readFile = readText } = {}) {
+  let dir;
+  try {
+    dir = /^0::(\/.*)$/m.exec(readFile('/proc/self/cgroup'))?.[1];
+  } catch {
+    return null;
+  }
+  if (dir === undefined) return null;
+  const bytes = (v) => (v.trim() === 'max' ? Infinity : Number(v));
+  let headroom = null;
+  for (;;) {
+    const at = (file) => readFile(path.posix.join('/sys/fs/cgroup', dir, file));
+    try {
+      const limit = Math.min(bytes(at('memory.max')), bytes(at('memory.high')));
+      if (Number.isFinite(limit)) {
+        const inactive = Number(/^inactive_file (\d+)$/m.exec(at('memory.stat'))?.[1] ?? 0);
+        const free = Math.max(0, Math.floor((limit - (bytes(at('memory.current')) - inactive)) / (1024 * 1024)));
+        headroom = Math.min(headroom ?? Infinity, free);
+      }
+    } catch {}
+    if (dir === '/') return headroom;
+    dir = path.posix.dirname(dir);
+  }
+}
 
 // os.freemem() on macOS counts only free pages; the kernel gives inactive pages back on demand.
-function freeRamMb({ platform, vmStat, freemem }) {
+// On Linux it reads the host, so a container or a systemd memory limit is invisible to it.
+function freeRamMb({ platform, vmStat, freemem, readFile }) {
   const free = Math.floor(freemem() / (1024 * 1024));
+  if (platform === 'linux') return Math.min(free, cgroupHeadroomMb({ readFile }) ?? Infinity);
   if (platform !== 'darwin') return free;
   try {
     return Math.max(free, parseVmStat(vmStat()) ?? 0);
@@ -51,9 +83,9 @@ function freeRamMb({ platform, vmStat, freemem }) {
   }
 }
 
-export function readMachine({ platform = process.platform, vmStat = readVmStat, freemem = os.freemem } = {}) {
+export function readMachine({ platform = process.platform, vmStat = readVmStat, freemem = os.freemem, readFile = readText } = {}) {
   try {
-    return { freeRamMb: freeRamMb({ platform, vmStat, freemem }), logicalCores: os.cpus().length || 4 };
+    return { freeRamMb: freeRamMb({ platform, vmStat, freemem, readFile }), logicalCores: os.cpus().length || 4 };
   } catch {
     return { freeRamMb: 4096, logicalCores: 4 };
   }

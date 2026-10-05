@@ -5,6 +5,7 @@ import {
   createLanePool,
   readMachine,
   parseVmStat,
+  cgroupHeadroomMb,
   laneProvider,
   laneOutcome,
 } from '../skills/adversarial-review/scripts/lib/lanes.mjs';
@@ -167,6 +168,65 @@ test('readMachine on darwin falls back to os.freemem when vm_stat fails', () => 
 });
 
 test('readMachine off darwin never runs vm_stat', () => {
-  const m = readMachine({ platform: 'linux', vmStat: () => { throw new Error('must not run'); }, freemem: () => 5000 * 1048576 });
+  const noCgroup = () => { throw new Error('ENOENT'); };
+  const m = readMachine({ platform: 'linux', vmStat: () => { throw new Error('must not run'); }, freemem: () => 5000 * 1048576, readFile: noCgroup });
   assert.equal(m.freeRamMb, 5000);
+});
+
+const MB = 1048576;
+const cgroupFiles = (files) => (p) => {
+  if (!(p in files)) throw Object.assign(new Error(`ENOENT ${p}`), { code: 'ENOENT' });
+  return files[p];
+};
+// The hermes.service numbers measured on 2026-10-05: os.freemem() read 2215 MB of host memory.
+const SERVICE = {
+  '/proc/self/cgroup': '0::/system.slice/hermes.service\n',
+  '/sys/fs/cgroup/system.slice/hermes.service/memory.max': `${3334 * MB}\n`,
+  '/sys/fs/cgroup/system.slice/hermes.service/memory.high': `${2941 * MB}\n`,
+  '/sys/fs/cgroup/system.slice/hermes.service/memory.current': `${2527 * MB}\n`,
+  '/sys/fs/cgroup/system.slice/hermes.service/memory.stat': `anon ${601 * MB}\ninactive_file ${875 * MB}\n`,
+  '/sys/fs/cgroup/system.slice/memory.max': 'max\n',
+  '/sys/fs/cgroup/system.slice/memory.high': 'max\n',
+};
+
+test('cgroupHeadroomMb gives the lowest limit minus the memory the cgroup cannot give back', () => {
+  assert.equal(cgroupHeadroomMb({ readFile: cgroupFiles(SERVICE) }), 2941 - (2527 - 875));
+});
+
+test('cgroupHeadroomMb takes a tighter limit from a parent cgroup', () => {
+  const files = {
+    ...SERVICE,
+    '/sys/fs/cgroup/system.slice/memory.max': `${1500 * MB}\n`,
+    '/sys/fs/cgroup/system.slice/memory.current': `${1000 * MB}\n`,
+    '/sys/fs/cgroup/system.slice/memory.stat': `inactive_file ${100 * MB}\n`,
+  };
+  assert.equal(cgroupHeadroomMb({ readFile: cgroupFiles(files) }), 1500 - (1000 - 100));
+});
+
+test('cgroupHeadroomMb reads the namespace root of a container', () => {
+  const files = {
+    '/proc/self/cgroup': '0::/\n',
+    '/sys/fs/cgroup/memory.max': `${4096 * MB}\n`,
+    '/sys/fs/cgroup/memory.high': 'max\n',
+    '/sys/fs/cgroup/memory.current': `${1024 * MB}\n`,
+    '/sys/fs/cgroup/memory.stat': `inactive_file 0\n`,
+  };
+  assert.equal(cgroupHeadroomMb({ readFile: cgroupFiles(files) }), 3072);
+});
+
+test('cgroupHeadroomMb returns null without a cgroup v2 memory limit', () => {
+  const files = {
+    '/proc/self/cgroup': '0::/user.slice\n',
+    '/sys/fs/cgroup/user.slice/memory.max': 'max\n',
+    '/sys/fs/cgroup/user.slice/memory.high': 'max\n',
+  };
+  assert.equal(cgroupHeadroomMb({ readFile: cgroupFiles(files) }), null);
+  assert.equal(cgroupHeadroomMb({ readFile: cgroupFiles({}) }), null);
+});
+
+test('readMachine on linux never counts more memory than the cgroup can give', () => {
+  const m = readMachine({ platform: 'linux', freemem: () => 2215 * MB, readFile: cgroupFiles(SERVICE) });
+  assert.equal(m.freeRamMb, 2941 - (2527 - 875));
+  const host = readMachine({ platform: 'linux', freemem: () => 2215 * MB, readFile: cgroupFiles({}) });
+  assert.equal(host.freeRamMb, 2215);
 });

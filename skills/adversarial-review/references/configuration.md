@@ -131,6 +131,9 @@ The lane count is also limited by the logical core count and by the provider rat
 On macOS, the free memory is the sum of the free, inactive, and speculative pages that `vm_stat` shows.
 The kernel gives inactive pages back on demand, but `os.freemem()` does not count them.
 If `vm_stat` fails, the engine uses `os.freemem()`.
+On Linux, `os.freemem()` shows the memory of the host, not the memory of a container or a systemd service.
+If a cgroup v2 memory limit applies, the engine uses the smaller of `os.freemem()` and the free memory under the limit.
+The free memory under the limit is the lowest `memory.max` or `memory.high` on the cgroup path, minus `memory.current`, plus the inactive file cache.
 The `doctor` command shows the lane cap and its parts (`ramCap`, `cpuCap`, `maxParallel`) before a run starts.
 
 ### budget
