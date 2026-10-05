@@ -109,12 +109,21 @@ After the judge delivers the ruling, resolve findings through two gates:
 
 1. Stage PATCH REVIEW:
    Write a plan for your edits without modifying files.
+   Give each closing item one section with the heading `## C<n>`, where `<n>` is the number of the item.
+   Put changes that touch more than one item under `## Cross-cutting`.
+   Send the full plan in every round, with a section for every item.
    Run `adversarial-review patch-review <run-dir> --plan <file>`.
-   Proceed with edits only when the judge approves the plan.
+   Proceed with edits only when the command prints `APPLY`.
+   An item that every asked seat accepts is settled. Later rounds do not send it again.
+   A later plan change that touches a settled item sends that item back for review.
+   A judge demand blocks only when a seat objects to the same item in the same round.
+   The loop stops after `patchReview.maxRounds` rounds (default 3) and prints the open items.
 
 2. Stage VERIFY:
    After you make edits, run `adversarial-review verify <run-dir>`.
-   Seats make sure that the changes meet each `doneWhen` condition.
+   Seats receive only the findings behind the closing items.
+   A second `verify` run sends only the items that are not met, with the changes since the last `verify` run.
+   When every item is met, each owner seat reads the final diff once more for every item it owns.
    The judge returns a final PASS or BLOCK verdict.
 
 ## Live Table

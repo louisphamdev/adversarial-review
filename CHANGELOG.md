@@ -15,7 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `swarm.acknowledgeTraining: true` or the user answers the `privacy` decision.
 - CAUTION: Schema version 2. A 3.0.2 run paused with `--until find` cannot resume under 3.1.
 - A hard timeout moves a seat call to the next model of the seat. One model gets one retry only.
-- Patch-review and verify round records carry the engine version 3.1.0. A record from 3.0.2 does not count as a 3.1 round.
+- Patch review keeps a state for each closing item. A settled item is not sent again. A plan change that touches a settled item sends it back. A judge demand blocks only with a seat objection on the same item in the same round. Patch review stops after `patchReview.maxRounds` rounds (default 3).
+- The patch plan has one `## C<n>` section per closing item and an optional `## Cross-cutting` section. A plan with another shape stops with exit code 2.
+- `verify` sends only the findings behind the closing items. A second `verify` run sends only the items that are not met, with the changes since the last `verify` run. A final pass reads the final diff for every item.
+- The sift sends one Jev request for each finding, with only the cited lines of the reviewed material. A file outside the reviewed material is never sent.
+- Round records of `patch-review` and `verify` carry the engine version 3.1.0. A record from 3.0.2 does not count as a 3.1 round.
+
+### Removed
+- `sift.lowConfidence`. The reading order now comes from the `happens` and `survives` decisions.
+
+### Upgrade note
+- A run with patch-review records from 3.0.2 cannot continue patch review. Start a new run.
 
 ### Added
 - Live seat events in `events.jsonl`: `stage_start`, `call_start` with model and attempt,

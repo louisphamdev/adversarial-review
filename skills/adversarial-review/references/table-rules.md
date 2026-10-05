@@ -173,6 +173,13 @@ Reason:  <one sentence explanation>
 Evidence:<file:line if it breaks an invariant>
 ```
 
+Each closing item has the id `C<n>`. Give one answer for each item that you were asked about.
+An item with no answer counts as an objection.
+For a change under `## Cross-cutting`, use the id `cross` and name the items it touches in `affects`.
+
+In a later round, the lead sends only the open items, the settled items that the change can touch, and the delta.
+Report a new defect only when it cites a line of the delta.
+
 ## Stage VERIFY
 
 After code changes land, the lead returns your original findings.
@@ -190,6 +197,8 @@ Follow these strict constraints:
 - Read only the changed lines and your own findings.
 - Do not raise the standard beyond your original `Done when` condition.
 - Report new defects only if they occur in the new diff lines.
+- Give the file and the line of each new defect. Use the side `new` for an added line and `old` for a removed line.
+- In the final pass, answer `holds` or `broken` for each item in the list. An item with no answer counts as not met.
 
 ## Memory
 
