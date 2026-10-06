@@ -127,6 +127,9 @@ After the judge delivers the ruling, resolve findings through two gates:
 
 2. Stage VERIFY:
    After you make edits, run `adversarial-review verify <run-dir>`.
+   If the run reviewed one file (`--target <file>`), the diff is the file against the text that the seats read.
+   This diff includes a spec in an ignored `temp/` directory. `--base` does not apply to such a run.
+   Do not start a new `run` on a file that already has a ruling. A new run sends the cleared text to the seats again. Use `verify`.
    Seats receive only the findings behind the closing items.
    A second `verify` run sends only the items that are not met, with the changes since the last `verify` run.
    When every item is met, each owner seat reads the final diff once more for every item it owns.

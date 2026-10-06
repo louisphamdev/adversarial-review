@@ -1,10 +1,11 @@
 // CLI patch-review and verify commands (§18.1, §6.1).
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import { assertRunDir, readState, readCheckpoint, writeIndexed, nextRound, appendEvent } from '../rundir.mjs';
 import { runPatchReview, runVerify, countsAsVerify } from '../pipeline.mjs';
 import { closingListHashOf } from '../ledger.mjs';
-import { collectDiff, resolveBase, validateBase } from '../verify-diff.mjs';
+import { collectDiff, collectSnapshotDiff, resolveBase, validateBase } from '../verify-diff.mjs';
 import { runSeatCall } from '../backends/index.mjs';
 import { loadConfig } from '../config.mjs';
 import { runChild } from '../proc.mjs';
@@ -203,9 +204,16 @@ export async function verifyCommand(
     if (prior?.closingListHash && prior.closingListHash !== closingListHashOf(ruling.closingList || [])) {
       throw new ConfigError(`The ruling changed after verify round ${prior.round}. Start a new run with \`adversarial-review run\`.`);
     }
+    const material = state.request?.material;
+    const snapshot = material?.kind === 'file' ? path.join(runDir, 'material.txt') : null;
+    if (snapshot && flags.base) {
+      throw new ConfigError('This run reviewed one file. Verify compares it with the reviewed snapshot, so --base does not apply.');
+    }
     // The base is pinned in round 1, so a commit of the fix between rounds does not change the diff.
     let baseSha;
-    if (prior?.baseSha) {
+    if (snapshot) {
+      baseSha = `snapshot:${crypto.createHash('sha256').update(await fs.readFile(snapshot)).digest('hex')}`;
+    } else if (prior?.baseSha) {
       baseSha = prior.baseSha;
       if (flags.base) {
         const asked = await resolveBase(repoRoot, flags.base, runChild);
@@ -216,7 +224,10 @@ export async function verifyCommand(
     } else {
       baseSha = await resolveBase(repoRoot, flags.base || state.request?.material?.commit || 'HEAD', runChild);
     }
-    const diffParts = { ...(await collectDiff(repoRoot, baseSha, runChild)), baseSha };
+    const collect = snapshot
+      ? () => collectSnapshotDiff({ snapshotPath: snapshot, targetPath: material.targetPath, root: repoRoot, runChild })
+      : () => collectDiff(repoRoot, baseSha, runChild);
+    const diffParts = { ...(await collect()), baseSha };
 
     const { config } = loadConfig({ env, flags, stderr });
     const findCheckpoint = await readCheckpoint(runDir, 'find');
@@ -228,7 +239,7 @@ export async function verifyCommand(
     const res = await runVerify({
       state: { ...state, ruling, findings },
       diffParts,
-      recollect: () => collectDiff(repoRoot, baseSha, runChild),
+      recollect: collect,
       runAgent,
       records,
     });

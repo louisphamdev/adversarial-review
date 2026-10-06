@@ -138,6 +138,59 @@ describe('pipeline-cli e2e tests', () => {
     }
   });
 
+  it('verify on a gitignored spec reads the change since the reviewed snapshot, not the repo diff', async () => {
+    const { iso, repo, cleanup } = await setupEnvAndRepo();
+    try {
+      await fs.writeFile(path.join(repo.root, '.gitignore'), 'temp/\n');
+      await fs.mkdir(path.join(repo.root, 'temp'));
+      const spec = path.join(repo.root, 'temp', 'spec.md');
+      await fs.writeFile(spec, '# Spec\ncleared line one\ncleared line two\n');
+
+      const runRes = spawnSync(
+        process.execPath,
+        [CLI_PATH, 'run', '--target', 'temp/spec.md', '--stage', 'spec', '--seats', 'breaker,skeptic', '--route', 'spawn', '--backend', 'custom', '--json'],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      assert.ok([0, 1].includes(runRes.status), `expected a ruling, got exit ${runRes.status}. stderr: ${runRes.stderr}`);
+
+      await fs.writeFile(spec, '# Spec\ncleared line one\nFIXED LINE\ncleared line two\n');
+      const runDir = await soleRunDir(iso);
+      const verifyRes = spawnSync(process.execPath, [CLI_PATH, 'verify', runDir], { cwd: repo.root, env: iso.env, encoding: 'utf8' });
+      assert.equal(verifyRes.status, 0, `verify should PASS. stderr: ${verifyRes.stderr}`);
+
+      const callsDir = path.join(runDir, 'calls');
+      const names = (await fs.readdir(callsDir)).filter((n) => /^verify_seat-.+\.r1\.prompt\.txt$/.test(n));
+      assert.ok(names.length > 0, 'verify asked no seat');
+      const prompt = await fs.readFile(path.join(callsDir, names[0]), 'utf8');
+      assert.match(prompt, /\+\+\+ b\/temp\/spec\.md/);
+      assert.match(prompt, /\| \+FIXED LINE$/m);
+      // The tracked index.js edit is not part of a spec review, so it must not reach the seat.
+      assert.doesNotMatch(prompt, /hello world/);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('verify on a spec refuses --base, because the base is the reviewed snapshot', async () => {
+    const { iso, repo, cleanup } = await setupEnvAndRepo();
+    try {
+      const spec = path.join(repo.root, 'spec.md');
+      await fs.writeFile(spec, '# Spec\n');
+      spawnSync(
+        process.execPath,
+        [CLI_PATH, 'run', '--target', 'spec.md', '--stage', 'spec', '--route', 'spawn', '--backend', 'custom', '--json'],
+        { cwd: repo.root, env: iso.env, encoding: 'utf8' }
+      );
+      await fs.writeFile(spec, '# Spec\nmore\n');
+      const runDir = await soleRunDir(iso);
+      const res = spawnSync(process.execPath, [CLI_PATH, 'verify', runDir, '--base', 'HEAD'], { cwd: repo.root, env: iso.env, encoding: 'utf8' });
+      assert.equal(res.status, 2, `expected usage exit 2, got ${res.status}. stderr: ${res.stderr}`);
+      assert.match(res.stderr, /snapshot/);
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('e2e run --route spawn --backend custom --json -> exit 1, result.json exists, sift skipped with no-key', async () => {
     const { iso, repo, cleanup } = await setupEnvAndRepo();
     try {

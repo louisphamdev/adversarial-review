@@ -51,6 +51,19 @@ export async function collectDiff(root, baseSha, runChild, { fsImpl = fs } = {})
   return { diff, untracked, diffHash };
 }
 
+// A one-file review is verified against the text the table read. A git diff cannot replace this:
+// a spec under an ignored temp/ never shows in it, and the seats would verify unrelated code instead.
+export async function collectSnapshotDiff({ snapshotPath, targetPath, root, runChild }) {
+  const d = await runChild({ cmd: 'git', args: ['-c', 'core.quotepath=false', 'diff', '--no-index', '--no-color', '--', snapshotPath, targetPath], cwd: root });
+  if (d.code !== 0 && d.code !== 1) throw new ConfigError(`verify cannot compare the reviewed snapshot with ${targetPath}: ${d.stderr || `exit ${d.code}`}`);
+  const hunks = normalizeDiff(d.stdout).replace(/^[\s\S]*?(?=^@@ )/m, '');
+  if (!hunks.trim()) throw new ConfigError('Empty diff: the file is the same as the reviewed snapshot, nothing to verify');
+  const rel = path.relative(root, targetPath).split(path.sep).join('/');
+  const diff = `diff --git a/${rel} b/${rel}\n--- a/${rel}\n+++ b/${rel}\n${hunks}`;
+  const diffHash = crypto.createHash('sha256').update(diff).digest('hex');
+  return { diff, untracked: [], diffHash };
+}
+
 export function unquoteGitPath(p) {
   const s = String(p ?? '');
   if (!(s.startsWith('"') && s.endsWith('"') && s.length >= 2)) return s;
